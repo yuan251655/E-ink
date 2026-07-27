@@ -1,0 +1,26 @@
+idf_component_register(
+    SRCS
+    "imgdecode_app.cpp"
+    "./list_src/list_iterator.c"
+    "./list_src/list_node.c"
+    "./list_src/list.c"
+    "./jpg_src/image_io.c"
+    "./jpg_src/test_decoder.c"
+    PRIV_REQUIRES
+    espressif__esp_new_jpeg 
+    esp_http_client
+    espressif__mdns
+    port_bsp
+    esp_wifi
+    esp_http_server
+    json
+    REQUIRES
+    espressif__libpng
+    INCLUDE_DIRS
+    "./" 
+    "./jpg_src"
+    "./json_inc"
+    "./list_src"
+    EMBED_TXTFILES 
+    "./certs/ark_vol.pem"
+    "./certs/volces_chain.pem")
