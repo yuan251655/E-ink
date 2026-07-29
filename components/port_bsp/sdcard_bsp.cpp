@@ -9,6 +9,7 @@
 CustomSDPort::CustomSDPort(const char *SdName,int clk,int cmd,int d0,int d1,int d2,int d3,int width) :
 SdName_(SdName)
 {
+    clk_ = clk; cmd_ = cmd; d0_ = d0; d1_ = d1; d2_ = d2; d3_ = d3; width_ = width;
     ScanListHandle = list_new();
 
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {};
@@ -212,6 +213,36 @@ list_t* CustomSDPort::SDPort_GetListHost() {
 
 int CustomSDPort::SDPort_GetSdcardInitOK() {
     return is_SdcardInitOK;
+}
+
+int CustomSDPort::SDPort_Remount() {
+    // Recreate the official board mount without a format-on-failure path.
+    if (sdcard_host != NULL) {
+        esp_vfs_fat_sdcard_unmount(SdName_, sdcard_host);
+        sdcard_host = NULL;
+    }
+    is_SdcardInitOK = 0;
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {};
+    mount_config.format_if_mount_failed = false;
+    mount_config.max_files = 5;
+    mount_config.allocation_unit_size = 16 * 1024 * 3;
+    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
+    sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
+    slot_config.width = width_;
+    slot_config.clk = static_cast<gpio_num_t>(clk_);
+    slot_config.cmd = static_cast<gpio_num_t>(cmd_);
+    slot_config.d0 = static_cast<gpio_num_t>(d0_);
+    slot_config.d1 = static_cast<gpio_num_t>(d1_);
+    slot_config.d2 = static_cast<gpio_num_t>(d2_);
+    slot_config.d3 = static_cast<gpio_num_t>(d3_);
+    const esp_err_t result = esp_vfs_fat_sdmmc_mount(SdName_, &host, &slot_config, &mount_config, &sdcard_host);
+    if (result == ESP_OK && sdcard_host != NULL) {
+        is_SdcardInitOK = 1;
+        return ESP_OK;
+    }
+    sdcard_host = NULL;
+    return result == ESP_OK ? ESP_FAIL : result;
 }
 
 void CustomSDPort::SDPort_SetCurrentlyNode(list_node_t *node) {

@@ -16,6 +16,7 @@ class CustomSDPort
 private:
     const char *TAG = "SDPort";
     const char *SdName_;
+    int clk_ = 39, cmd_ = 41, d0_ = 40, d1_ = 1, d2_ = 2, d3_ = 38, width_ = 4;
     int is_SdcardInitOK = 0;
     sdmmc_card_t *sdcard_host = NULL;
     list_t *ScanListHandle = NULL;
@@ -34,6 +35,9 @@ public:
     void SDPort_ScanListDir(const char *path);
     list_t* SDPort_GetListHost();
     int SDPort_GetSdcardInitOK();
+    // Reuses the board's original SDMMC parameters. It never formats the
+    // card; callers must serialize this with all product storage I/O.
+    int SDPort_Remount();
     int SDPort_GetScanListValue(); 
 
     void SDPort_SetCurrentlyNode(list_node_t *node);

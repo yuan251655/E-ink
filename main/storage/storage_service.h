@@ -27,6 +27,9 @@ public:
 
     esp_err_t Initialize(CustomSDPort* sd_port);
     StorageSnapshot GetSnapshot();
+    // Safely remounts using the official board configuration. It refuses while
+    // a storage transaction or another operation owns the service lock.
+    esp_err_t Remount();
 
     // A transaction serializes one product-layer writer. Callers stream files
     // into .staging/<transaction_id>/ and commit only after higher layers have
@@ -70,6 +73,9 @@ public:
 private:
     esp_err_t EnsureReadyLocked();
     esp_err_t RefreshSnapshotLocked();
+    esp_err_t RefreshUsageLocked();
+    esp_err_t MeasureDirectoryTreeLocked(const std::string& absolute_path,
+                                         std::uint64_t* output_bytes) const;
     esp_err_t CreateTransactionDirectoryLocked();
     esp_err_t CleanupInterruptedTransactionsLocked();
     esp_err_t RemoveDirectoryTreeLocked(const std::string& absolute_path);

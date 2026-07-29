@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_vfs_fat.h"
 #include "sdcard_bsp.h"
 
@@ -22,6 +23,20 @@ constexpr std::uint64_t kMinimumReserveBytes = 16ULL * 1024ULL * 1024ULL;
 bool IsDirectory(const std::string& path) {
     struct stat info {};
     return stat(path.c_str(), &info) == 0 && S_ISDIR(info.st_mode);
+}
+
+// FAT VFS does not reliably implement access(path, W_OK). Verify write access
+// with a bounded, self-cleaning probe instead of reporting a writable card as
+// read-only merely because of POSIX permission emulation.
+bool CanWriteProbe(const std::string& mount_point) {
+    const std::string probe_path = mount_point + "/.storage_health_probe";
+    FILE* probe = fopen(probe_path.c_str(), "wb");
+    if (probe == nullptr) return false;
+    const std::uint8_t marker = 0x5A;
+    const bool wrote = fwrite(&marker, 1, 1, probe) == 1 && fflush(probe) == 0;
+    const bool closed = fclose(probe) == 0;
+    const bool removed = unlink(probe_path.c_str()) == 0;
+    return wrote && closed && removed;
 }
 
 }  // namespace
@@ -88,6 +103,36 @@ StorageSnapshot StorageService::GetSnapshot() {
     StorageSnapshot snapshot = snapshot_;
     xSemaphoreGive(mutex_);
     return snapshot;
+}
+
+esp_err_t StorageService::Remount() {
+    if (mutex_ == nullptr) return ESP_ERR_INVALID_STATE;
+    // Re-detection is a maintenance operation. Do not queue it behind a long
+    // upload/display read, and never disrupt an active writer.
+    if (xSemaphoreTake(mutex_, 0) != pdTRUE) return ESP_ERR_INVALID_STATE;
+    if (!active_transaction_id_.empty()) {
+        SetErrorLocked("storage_busy");
+        xSemaphoreGive(mutex_);
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t result = sd_port_ == nullptr ? ESP_ERR_INVALID_STATE : sd_port_->SDPort_Remount();
+    if (result == ESP_OK) {
+        result = EnsureDirectoryTreeLocked(mount_point_ + "/media");
+        if (result == ESP_OK) result = EnsureDirectoryTreeLocked(mount_point_ + "/.staging");
+        if (result == ESP_OK) result = EnsureDirectoryTreeLocked(mount_point_ + "/state");
+        if (result == ESP_OK) result = EnsureDirectoryTreeLocked(mount_point_ + "/system");
+    }
+    if (result == ESP_OK) result = RefreshSnapshotLocked();
+    if (result == ESP_OK) {
+        snapshot_.last_error_code.clear();
+        snapshot_.last_remount_uptime_ms = static_cast<std::uint64_t>(esp_timer_get_time() / 1000);
+        ++snapshot_.revision;
+    } else {
+        snapshot_.state = StorageState::kDegraded;
+        SetErrorLocked("storage_unavailable");
+    }
+    xSemaphoreGive(mutex_);
+    return result;
 }
 
 esp_err_t StorageService::BeginWriteTransaction(const TransactionId& transaction_id,
@@ -443,10 +488,15 @@ esp_err_t StorageService::EnsureReadyLocked() {
         sd_port_->SDPort_GetSdMMCHost() == nullptr ||
         sdmmc_get_status(sd_port_->SDPort_GetSdMMCHost()) != ESP_OK) {
         snapshot_.state = StorageState::kMissing;
+        snapshot_.mounted = false;
+        snapshot_.readable = false;
+        snapshot_.writable = false;
+        snapshot_.checked_at_uptime_ms = static_cast<std::uint64_t>(esp_timer_get_time() / 1000);
         SetErrorLocked("storage_unavailable");
         return ESP_ERR_INVALID_STATE;
     }
     snapshot_.state = StorageState::kReady;
+    snapshot_.mounted = true;
     return ESP_OK;
 }
 
@@ -455,11 +505,81 @@ esp_err_t StorageService::RefreshSnapshotLocked() {
     if (result != ESP_OK) return result;
     result = esp_vfs_fat_info(mount_point_.c_str(), &snapshot_.total_bytes, &snapshot_.free_bytes);
     if (result != ESP_OK) {
+        snapshot_.mounted = false;
+        snapshot_.readable = false;
+        snapshot_.writable = false;
         SetErrorLocked("storage_unavailable");
         return result;
     }
     snapshot_.reserve_bytes = std::max(kMinimumReserveBytes, snapshot_.total_bytes / 20U);
+    snapshot_.readable = access((mount_point_ + "/media").c_str(), R_OK) == 0;
+    snapshot_.writable = CanWriteProbe(mount_point_);
+    result = RefreshUsageLocked();
+    snapshot_.checked_at_uptime_ms = static_cast<std::uint64_t>(esp_timer_get_time() / 1000);
+    if (result != ESP_OK) {
+        snapshot_.state = StorageState::kDegraded;
+        SetErrorLocked("storage_read_failed");
+    }
+    return result;
+}
+
+esp_err_t StorageService::MeasureDirectoryTreeLocked(const std::string& absolute_path,
+                                                      std::uint64_t* output_bytes) const {
+    if (output_bytes == nullptr) return ESP_ERR_INVALID_ARG;
+    DIR* directory = opendir(absolute_path.c_str());
+    if (directory == nullptr) return ESP_FAIL;
+    std::uint64_t bytes = 0;
+    struct dirent* entry = nullptr;
+    while ((entry = readdir(directory)) != nullptr) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        const std::string child = absolute_path + "/" + entry->d_name;
+        struct stat info {};
+        if (stat(child.c_str(), &info) != 0) { closedir(directory); return ESP_FAIL; }
+        if (S_ISDIR(info.st_mode)) {
+            std::uint64_t child_bytes = 0;
+            if (MeasureDirectoryTreeLocked(child, &child_bytes) != ESP_OK) { closedir(directory); return ESP_FAIL; }
+            bytes += child_bytes;
+        } else if (S_ISREG(info.st_mode)) {
+            bytes += static_cast<std::uint64_t>(info.st_size);
+        }
+    }
+    closedir(directory);
+    *output_bytes = bytes;
     return ESP_OK;
+}
+
+esp_err_t StorageService::RefreshUsageLocked() {
+    snapshot_.local_media_count = 0;
+    snapshot_.local_media_bytes = 0;
+    snapshot_.staging_count = 0;
+    snapshot_.staging_bytes = 0;
+    const auto scan = [this](const std::string& root, bool media) -> esp_err_t {
+        DIR* directory = opendir(root.c_str());
+        if (directory == nullptr) return ESP_FAIL;
+        struct dirent* entry = nullptr;
+        while ((entry = readdir(directory)) != nullptr) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+            const std::string child = root + "/" + entry->d_name;
+            if (!IsDirectory(child)) continue;
+            std::uint64_t bytes = 0;
+            if (MeasureDirectoryTreeLocked(child, &bytes) != ESP_OK) { closedir(directory); return ESP_FAIL; }
+            if (media) {
+                // This product currently admits only category=local to media/.
+                // The classification remains private to StorageService; no
+                // raw paths or filenames are published by the health API.
+                ++snapshot_.local_media_count;
+                snapshot_.local_media_bytes += bytes;
+            } else {
+                ++snapshot_.staging_count;
+                snapshot_.staging_bytes += bytes;
+            }
+        }
+        closedir(directory);
+        return ESP_OK;
+    };
+    esp_err_t result = scan(mount_point_ + "/media", true);
+    if (result == ESP_OK) result = scan(mount_point_ + "/.staging", false);
+    return result;
 }
 
 esp_err_t StorageService::CreateTransactionDirectoryLocked() {

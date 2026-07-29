@@ -287,7 +287,9 @@ static void ServerPort_Start(CustomSDPort *SDPort, bool enable_legacy_upload) {
     // Product API currently registers 21 distinct method/path routes. Keep a
     // small reserve for the next product endpoints so a route addition cannot
     // turn into a boot-loop during server start.
-    config.max_uri_handlers = 24;
+    // Storage status/remount keep two short-lived legacy aliases while App
+    // clients migrate to the frozen /api/v1 contract.
+    config.max_uri_handlers = 26;
     // The phone App uses a fresh connection for each API call.  Purge a stale
     // keep-alive socket under memory pressure instead of leaving a completed
     // multipart upload to block the next sequential upload.

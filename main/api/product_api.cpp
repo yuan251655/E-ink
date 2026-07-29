@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "ArduinoJson.h"
+#include "esp_timer.h"
 #include "display_runtime.h"
 #include "display_service.h"
 #include "job_service.h"
@@ -546,6 +547,64 @@ esp_err_t Status(httpd_req_t* req) {
     return SendJson(req, body);
 }
 
+const char* StorageStateName(StorageState state) {
+    switch (state) {
+        case StorageState::kReady: return "READY";
+        case StorageState::kDegraded: return "DEGRADED";
+        case StorageState::kMissing: return "MISSING";
+        case StorageState::kErrorBackoff: return "ERROR_BACKOFF";
+        default: return "DEGRADED";
+    }
+}
+
+void AppendStorageHealth(std::string* body, const StorageSnapshot& storage) {
+    const std::uint64_t now_ms = static_cast<std::uint64_t>(esp_timer_get_time() / 1000);
+    const std::uint64_t check_age = storage.checked_at_uptime_ms == 0 || now_ms < storage.checked_at_uptime_ms ? 0 : (now_ms - storage.checked_at_uptime_ms) / 1000;
+    const std::uint64_t remount_age = storage.last_remount_uptime_ms == 0 || now_ms < storage.last_remount_uptime_ms ? 0 : (now_ms - storage.last_remount_uptime_ms) / 1000;
+    body->append("{\"state\":"); AppendJsonString(body, StorageStateName(storage.state));
+    body->append(",\"mounted\":").append(storage.mounted ? "true" : "false")
+        .append(",\"readable\":").append(storage.readable ? "true" : "false")
+        .append(",\"writable\":").append(storage.writable ? "true" : "false")
+        .append(",\"total_bytes\":"); AppendUInt64(body, storage.total_bytes);
+    body->append(",\"free_bytes\":"); AppendUInt64(body, storage.free_bytes);
+    body->append(",\"usage\":{\"local\":{\"item_count\":").append(std::to_string(storage.local_media_count)).append(",\"bytes\":");
+    AppendUInt64(body, storage.local_media_bytes);
+    body->append("},\"ai\":{\"item_count\":0,\"bytes\":0},\"dashboard\":{\"item_count\":0,\"bytes\":0},\"logs\":{\"item_count\":0,\"bytes\":0},\"staging\":{\"item_count\":").append(std::to_string(storage.staging_count)).append(",\"bytes\":");
+    AppendUInt64(body, storage.staging_bytes);
+    body->append("},\"system\":{\"item_count\":0,\"bytes\":0}},\"active_operation\":");
+    if (storage.active_transaction_id.empty()) body->append("null"); else body->append("\"upload\"");
+    body->append(",\"last_error\":");
+    if (storage.last_error_code.empty()) body->append("null"); else { body->append("{\"code\":"); AppendJsonString(body, storage.last_error_code); body->append("}"); }
+    body->append(",\"index_state\":\"ready\",\"current_media_protected\":false,\"last_check_age_seconds\":"); AppendUInt64(body, check_age);
+    body->append(",\"last_remount_age_seconds\":"); AppendUInt64(body, remount_age);
+    body->append(",\"revision\":"); AppendUInt64(body, storage.revision);
+    body->push_back('}');
+}
+
+esp_err_t StorageStatus(httpd_req_t* req) {
+    std::string body = "{\"ok\":true,\"code\":\"ok\",\"data\":{\"api_version\":\"v1\",\"storage\":";
+    AppendStorageHealth(&body, GetStorageService().GetSnapshot());
+    body.append("}}");
+    return SendJson(req, body.c_str());
+}
+
+esp_err_t RemountStorage(httpd_req_t* req) {
+    if (req->content_len <= 0 || req->content_len > 128) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    char input_body[129]{};
+    int received = 0;
+    while (received < req->content_len) { const int read = httpd_req_recv(req, input_body + received, req->content_len - received); if (read <= 0) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request"); received += read; }
+    JsonDocument input;
+    const std::string request_id = deserializeJson(input, input_body) == DeserializationError::Ok ? (input["request_id"] | "") : "";
+    if (request_id.empty() || request_id.size() > 64) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    const esp_err_t result = GetStorageService().Remount();
+    if (result == ESP_ERR_INVALID_STATE) return SendJson(req, "{\"ok\":false,\"code\":\"storage_busy\"}", "503 Service Unavailable");
+    if (result != ESP_OK) return SendJson(req, "{\"ok\":false,\"code\":\"storage_unavailable\"}", "503 Service Unavailable");
+    std::string body = "{\"ok\":true,\"code\":\"storage_remounted\",\"data\":{\"storage\":";
+    AppendStorageHealth(&body, GetStorageService().GetSnapshot());
+    body.append("}}");
+    return SendJson(req, body.c_str());
+}
+
 esp_err_t DisplayStatus(httpd_req_t* req) {
     const auto display = GetDisplayService().GetSnapshot();
     char body[256];
@@ -689,6 +748,11 @@ esp_err_t RegisterProductApi(httpd_handle_t server) {
         {.uri="/api/v1/health", .method=HTTP_GET, .handler=Health, .user_ctx=nullptr},
         {.uri="/api/v1/device/capabilities", .method=HTTP_GET, .handler=Capabilities, .user_ctx=nullptr},
         {.uri="/api/v1/device/status", .method=HTTP_GET, .handler=Status, .user_ctx=nullptr},
+        {.uri="/api/v1/storage/status", .method=HTTP_GET, .handler=StorageStatus, .user_ctx=nullptr},
+        {.uri="/api/v1/storage/remount", .method=HTTP_POST, .handler=RemountStorage, .user_ctx=nullptr},
+        // Transitional aliases. New App code must use status/remount.
+        {.uri="/api/v1/storage/health", .method=HTTP_GET, .handler=StorageStatus, .user_ctx=nullptr},
+        {.uri="/api/v1/storage/recheck", .method=HTTP_POST, .handler=RemountStorage, .user_ctx=nullptr},
         {.uri="/api/v1/display/status", .method=HTTP_GET, .handler=DisplayStatus, .user_ctx=nullptr},
         {.uri="/api/v1/local-album/playback", .method=HTTP_GET, .handler=GetLocalAlbumPlayback, .user_ctx=nullptr},
         {.uri="/api/v1/local-album/playback", .method=HTTP_POST, .handler=UpdateLocalAlbumPlayback, .user_ctx=nullptr},

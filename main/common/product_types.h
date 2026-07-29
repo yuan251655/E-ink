@@ -132,9 +132,23 @@ struct MediaItem {
 
 struct StorageSnapshot {
     StorageState state = StorageState::kUninitialized;
+    // These flags describe the last controlled health check.  They are kept
+    // separate from state so App clients can distinguish a missing card from
+    // a mounted card that currently cannot be read or written.
+    bool mounted = false;
+    bool readable = false;
+    bool writable = false;
     std::uint64_t total_bytes = 0;
     std::uint64_t free_bytes = 0;
     std::uint64_t reserve_bytes = 0;
+    std::uint32_t local_media_count = 0;
+    std::uint64_t local_media_bytes = 0;
+    std::uint32_t staging_count = 0;
+    std::uint64_t staging_bytes = 0;
+    std::uint64_t last_remount_uptime_ms = 0;
+    // Monotonic device uptime.  It deliberately is not represented as wall
+    // clock time because RTC/NTP calibration is not a storage concern.
+    std::uint64_t checked_at_uptime_ms = 0;
     TransactionId active_transaction_id;
     std::string last_error_code;
     Revision revision = 0;
