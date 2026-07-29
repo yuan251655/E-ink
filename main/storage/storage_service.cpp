@@ -1,0 +1,540 @@
+#include "storage_service.h"
+
+#include <algorithm>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <utility>
+
+#include "esp_log.h"
+#include "esp_vfs_fat.h"
+#include "sdcard_bsp.h"
+
+namespace photopainter::product {
+namespace {
+
+constexpr char kTag[] = "StorageService";
+constexpr std::uint64_t kMinimumReserveBytes = 16ULL * 1024ULL * 1024ULL;
+
+bool IsDirectory(const std::string& path) {
+    struct stat info {};
+    return stat(path.c_str(), &info) == 0 && S_ISDIR(info.st_mode);
+}
+
+}  // namespace
+
+StorageService::StorageService(std::string mount_point) : mount_point_(std::move(mount_point)) {
+    mutex_ = xSemaphoreCreateMutex();
+}
+
+StorageService::~StorageService() {
+    if (mutex_ != nullptr) {
+        vSemaphoreDelete(mutex_);
+    }
+}
+
+esp_err_t StorageService::Initialize(CustomSDPort* sd_port) {
+    if (mutex_ == nullptr || sd_port == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    sd_port_ = sd_port;
+    snapshot_.state = StorageState::kMounting;
+
+    esp_err_t result = EnsureReadyLocked();
+    if (result == ESP_OK) {
+        result = EnsureDirectoryTreeLocked(mount_point_ + "/media");
+    }
+    if (result == ESP_OK) {
+        result = EnsureDirectoryTreeLocked(mount_point_ + "/.staging");
+    }
+    if (result == ESP_OK) {
+        result = EnsureDirectoryTreeLocked(mount_point_ + "/state");
+    }
+    if (result == ESP_OK) {
+        result = EnsureDirectoryTreeLocked(mount_point_ + "/system");
+    }
+    if (result == ESP_OK) {
+        result = CleanupInterruptedTransactionsLocked();
+    }
+    if (result == ESP_OK) {
+        // Fill the cached capacity once during controlled startup. HTTP status
+        // handlers only read this cache and never initiate TF I/O.
+        result = RefreshSnapshotLocked();
+    }
+    if (result == ESP_OK) {
+        snapshot_.state = StorageState::kReady;
+        snapshot_.revision++;
+    }
+    xSemaphoreGive(mutex_);
+    return result;
+}
+
+StorageSnapshot StorageService::GetSnapshot() {
+    if (mutex_ == nullptr) {
+        return snapshot_;
+    }
+    // A status request must never wait indefinitely for TF/SDMMC I/O.  The
+    // cached snapshot is refreshed by controlled storage operations instead.
+    if (xSemaphoreTake(mutex_, pdMS_TO_TICKS(50)) != pdTRUE) {
+        StorageSnapshot unavailable;
+        unavailable.state = StorageState::kDegraded;
+        unavailable.last_error_code = "storage_busy";
+        return unavailable;
+    }
+    StorageSnapshot snapshot = snapshot_;
+    xSemaphoreGive(mutex_);
+    return snapshot;
+}
+
+esp_err_t StorageService::BeginWriteTransaction(const TransactionId& transaction_id,
+                                                std::uint64_t required_bytes) {
+    if (mutex_ == nullptr || !IsSafeTransactionId(transaction_id)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    esp_err_t result = EnsureReadyLocked();
+    if (result != ESP_OK) {
+        xSemaphoreGive(mutex_);
+        return result;
+    }
+    if (!active_transaction_id_.empty()) {
+        SetErrorLocked("storage_busy");
+        xSemaphoreGive(mutex_);
+        return ESP_ERR_INVALID_STATE;
+    }
+    RefreshSnapshotLocked();
+    const std::uint64_t required_with_reserve = required_bytes + snapshot_.reserve_bytes;
+    if (snapshot_.free_bytes < required_with_reserve) {
+        SetErrorLocked("storage_no_space");
+        xSemaphoreGive(mutex_);
+        return ESP_ERR_NO_MEM;
+    }
+    active_transaction_id_ = transaction_id;
+    snapshot_.active_transaction_id = transaction_id;
+    result = CreateTransactionDirectoryLocked();
+    if (result != ESP_OK) {
+        active_transaction_id_.clear();
+        snapshot_.active_transaction_id.clear();
+    }
+    xSemaphoreGive(mutex_);
+    return result;
+}
+
+esp_err_t StorageService::AppendStagedFile(const std::string& relative_path,
+                                           const void* data,
+                                           std::size_t data_len,
+                                           bool truncate) {
+    if (mutex_ == nullptr || data == nullptr || data_len == 0 || !IsSafeRelativePath(relative_path)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    esp_err_t result = EnsureReadyLocked();
+    if (result != ESP_OK || active_transaction_id_.empty()) {
+        if (result == ESP_OK) SetErrorLocked("storage_busy");
+        xSemaphoreGive(mutex_);
+        return result == ESP_OK ? ESP_ERR_INVALID_STATE : result;
+    }
+
+    const std::string path = StagingDirectoryLocked() + "/" + relative_path;
+    const std::size_t separator = path.find_last_of('/');
+    result = EnsureDirectoryTreeLocked(path.substr(0, separator));
+    if (result == ESP_OK) {
+        FILE* file = fopen(path.c_str(), truncate ? "wb" : "ab");
+        if (file == nullptr) {
+            SetErrorLocked("storage_write_failed");
+            result = ESP_FAIL;
+        } else {
+            const std::size_t written = fwrite(data, 1, data_len, file);
+            const int flush_result = fflush(file);
+            fclose(file);
+            // Staging files are intentionally not synced per network chunk.
+            // FinalizeStagedFile performs the single durability sync before a
+            // transaction is eligible for atomic rename into media/.
+            if (written != data_len || flush_result != 0) {
+                SetErrorLocked("storage_write_failed");
+                result = ESP_FAIL;
+            }
+        }
+    }
+    xSemaphoreGive(mutex_);
+    return result;
+}
+
+esp_err_t StorageService::FinalizeStagedFile(const std::string& relative_path,
+                                             std::uint64_t expected_bytes) {
+    if (mutex_ == nullptr || !IsSafeRelativePath(relative_path)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    if (active_transaction_id_.empty()) {
+        SetErrorLocked("storage_busy");
+        xSemaphoreGive(mutex_);
+        return ESP_ERR_INVALID_STATE;
+    }
+    const std::string path = StagingDirectoryLocked() + "/" + relative_path;
+    struct stat info {};
+    const bool valid = stat(path.c_str(), &info) == 0 && S_ISREG(info.st_mode) &&
+                       static_cast<std::uint64_t>(info.st_size) == expected_bytes;
+    if (!valid) {
+        SetErrorLocked("media_incomplete");
+        xSemaphoreGive(mutex_);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    // FatFs only guarantees a durable fsync for a writable file handle.  The
+    // file is still in the private staging directory at this point, so opening
+    // it read/write cannot expose or modify committed media.
+    FILE* file = fopen(path.c_str(), "rb+");
+    const int sync_result = file == nullptr ? -1 : fsync(fileno(file));
+    if (file != nullptr) fclose(file);
+    if (sync_result != 0) {
+        SetErrorLocked("storage_write_failed");
+        xSemaphoreGive(mutex_);
+        return ESP_FAIL;
+    }
+    xSemaphoreGive(mutex_);
+    return ESP_OK;
+}
+
+esp_err_t StorageService::CommitTransaction(const std::string& final_media_directory) {
+    if (mutex_ == nullptr || !IsSafeMediaDirectory(final_media_directory)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    if (active_transaction_id_.empty()) {
+        SetErrorLocked("storage_busy");
+        xSemaphoreGive(mutex_);
+        return ESP_ERR_INVALID_STATE;
+    }
+    const std::string destination = mount_point_ + "/" + final_media_directory;
+    struct stat destination_info {};
+    if (stat(destination.c_str(), &destination_info) == 0) {
+        SetErrorLocked("request_id_conflict");
+        xSemaphoreGive(mutex_);
+        return ESP_ERR_INVALID_STATE;
+    }
+    const std::size_t separator = destination.find_last_of('/');
+    esp_err_t result = EnsureDirectoryTreeLocked(destination.substr(0, separator));
+    if (result == ESP_OK && rename(StagingDirectoryLocked().c_str(), destination.c_str()) != 0) {
+        ESP_LOGE(kTag, "atomic commit failed: %s", strerror(errno));
+        SetErrorLocked("storage_write_failed");
+        result = ESP_FAIL;
+    }
+    if (result == ESP_OK) {
+        active_transaction_id_.clear();
+        snapshot_.active_transaction_id.clear();
+        snapshot_.last_error_code.clear();
+        snapshot_.revision++;
+        // The rename has already committed the media.  Refreshing the cache is
+        // best-effort: reporting a later capacity-query failure as a failed
+        // commit would cause callers to retry an already-visible media item.
+        (void)RefreshSnapshotLocked();
+    }
+    xSemaphoreGive(mutex_);
+    return result;
+}
+
+esp_err_t StorageService::RollbackTransaction() {
+    if (mutex_ == nullptr) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    esp_err_t result = ESP_OK;
+    if (!active_transaction_id_.empty()) {
+        result = RemoveDirectoryTreeLocked(StagingDirectoryLocked());
+        if (result == ESP_OK) {
+            active_transaction_id_.clear();
+            snapshot_.active_transaction_id.clear();
+            (void)RefreshSnapshotLocked();
+        }
+    }
+    xSemaphoreGive(mutex_);
+    return result;
+}
+
+esp_err_t StorageService::CleanupInterruptedTransactions() {
+    if (mutex_ == nullptr) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    const esp_err_t result = CleanupInterruptedTransactionsLocked();
+    xSemaphoreGive(mutex_);
+    return result;
+}
+
+esp_err_t StorageService::CleanupInterruptedTransactionsLocked() {
+    if (active_transaction_id_.empty()) {
+        const std::string staging_root = mount_point_ + "/.staging";
+        DIR* directory = opendir(staging_root.c_str());
+        if (directory == nullptr) return ESP_FAIL;
+        struct dirent* entry = nullptr;
+        while ((entry = readdir(directory)) != nullptr) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+            const std::string candidate = staging_root + "/" + entry->d_name;
+            if (IsDirectory(candidate)) RemoveDirectoryTreeLocked(candidate);
+        }
+        closedir(directory);
+    }
+    return ESP_OK;
+}
+
+esp_err_t StorageService::ReadCommittedFile(const std::string& relative_path,
+                                            void* buffer,
+                                            std::size_t expected_bytes) {
+    if (mutex_ == nullptr || buffer == nullptr || expected_bytes == 0 ||
+        !IsSafeRelativePath(relative_path) || relative_path.rfind("media/", 0) != 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    esp_err_t result = EnsureReadyLocked();
+    if (result != ESP_OK) {
+        xSemaphoreGive(mutex_);
+        return result;
+    }
+    const std::string path = mount_point_ + "/" + relative_path;
+    FILE* file = fopen(path.c_str(), "rb");
+    if (file == nullptr) {
+        SetErrorLocked("storage_read_failed");
+        xSemaphoreGive(mutex_);
+        return ESP_ERR_NOT_FOUND;
+    }
+    const std::size_t read = fread(buffer, 1, expected_bytes, file);
+    const int trailing = fgetc(file);
+    fclose(file);
+    if (read != expected_bytes || trailing != EOF) {
+        SetErrorLocked("media_incomplete");
+        xSemaphoreGive(mutex_);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    xSemaphoreGive(mutex_);
+    return ESP_OK;
+}
+
+esp_err_t StorageService::StreamCommittedFile(
+    const std::string& relative_path,
+    std::uint64_t expected_bytes,
+    const std::function<esp_err_t(const void*, std::size_t)>& consume) {
+    if (mutex_ == nullptr || expected_bytes == 0 || !consume ||
+        !IsSafeRelativePath(relative_path) || relative_path.rfind("media/", 0) != 0) return ESP_ERR_INVALID_ARG;
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    esp_err_t result = EnsureReadyLocked();
+    if (result != ESP_OK) { xSemaphoreGive(mutex_); return result; }
+    const std::string path = mount_point_ + "/" + relative_path;
+    FILE* file = fopen(path.c_str(), "rb");
+    if (file == nullptr) {
+        SetErrorLocked("storage_read_failed");
+        xSemaphoreGive(mutex_);
+        return ESP_ERR_NOT_FOUND;
+    }
+    std::uint64_t size = 0;
+    struct stat info {};
+    if (stat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode)) result = ESP_ERR_INVALID_STATE;
+    else size = static_cast<std::uint64_t>(info.st_size);
+    if (result != ESP_OK || size != expected_bytes) {
+        fclose(file);
+        SetErrorLocked("media_incomplete");
+        xSemaphoreGive(mutex_);
+        return result == ESP_OK ? ESP_ERR_INVALID_SIZE : result;
+    }
+    char buffer[2048];
+    std::uint64_t sent = 0;
+    while (sent < expected_bytes) {
+        const std::size_t wanted = static_cast<std::size_t>(std::min<std::uint64_t>(sizeof(buffer), expected_bytes - sent));
+        const std::size_t read = fread(buffer, 1, wanted, file);
+        if (read != wanted) { result = ESP_FAIL; break; }
+        result = consume(buffer, read);
+        if (result != ESP_OK) break;
+        sent += read;
+    }
+    fclose(file);
+    if (result != ESP_OK) SetErrorLocked("storage_read_failed");
+    xSemaphoreGive(mutex_);
+    return result;
+}
+
+esp_err_t StorageService::ReadCommittedText(const std::string& relative_path,
+                                            std::size_t maximum_bytes,
+                                            std::string* output) {
+    if (output == nullptr || maximum_bytes == 0) return ESP_ERR_INVALID_ARG;
+    std::uint64_t bytes = 0;
+    esp_err_t result = GetCommittedFileSize(relative_path, &bytes);
+    if (result != ESP_OK || bytes > maximum_bytes) return result == ESP_OK ? ESP_ERR_INVALID_SIZE : result;
+    output->assign(static_cast<std::size_t>(bytes), '\0');
+    if (bytes == 0) return ESP_OK;
+    return ReadCommittedFile(relative_path, output->data(), static_cast<std::size_t>(bytes));
+}
+
+esp_err_t StorageService::GetCommittedFileSize(const std::string& relative_path,
+                                               std::uint64_t* output_bytes) {
+    if (mutex_ == nullptr || output_bytes == nullptr || !IsSafeRelativePath(relative_path) ||
+        relative_path.rfind("media/", 0) != 0) return ESP_ERR_INVALID_ARG;
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    esp_err_t result = EnsureReadyLocked();
+    struct stat info {};
+    if (result == ESP_OK && (stat((mount_point_ + "/" + relative_path).c_str(), &info) != 0 || !S_ISREG(info.st_mode))) {
+        SetErrorLocked("storage_read_failed");
+        result = ESP_ERR_NOT_FOUND;
+    }
+    if (result == ESP_OK) *output_bytes = static_cast<std::uint64_t>(info.st_size);
+    xSemaphoreGive(mutex_);
+    return result;
+}
+
+esp_err_t StorageService::ListCommittedMediaIds(std::vector<MediaId>* output_media_ids) {
+    if (mutex_ == nullptr || output_media_ids == nullptr) return ESP_ERR_INVALID_ARG;
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    esp_err_t result = EnsureReadyLocked();
+    if (result == ESP_OK) {
+        output_media_ids->clear();
+        DIR* directory = opendir((mount_point_ + "/media").c_str());
+        if (directory == nullptr) {
+            SetErrorLocked("storage_read_failed");
+            result = ESP_FAIL;
+        } else {
+            struct dirent* entry = nullptr;
+            while ((entry = readdir(directory)) != nullptr) {
+                const std::string id = entry->d_name;
+                if (id == "." || id == ".." || !IsSafeTransactionId(id) ||
+                    !IsDirectory(mount_point_ + "/media/" + id)) continue;
+                output_media_ids->push_back(id);
+            }
+            closedir(directory);
+        }
+    }
+    xSemaphoreGive(mutex_);
+    return result;
+}
+
+esp_err_t StorageService::DeleteCommittedMedia(const MediaId& media_id) {
+    if (mutex_ == nullptr || !IsSafeTransactionId(media_id)) return ESP_ERR_INVALID_ARG;
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    esp_err_t result = EnsureReadyLocked();
+    if (result != ESP_OK) { xSemaphoreGive(mutex_); return result; }
+    if (!active_transaction_id_.empty()) {
+        SetErrorLocked("storage_busy");
+        xSemaphoreGive(mutex_);
+        return ESP_ERR_INVALID_STATE;
+    }
+    const std::string path = mount_point_ + "/media/" + media_id;
+    if (!IsDirectory(path)) {
+        xSemaphoreGive(mutex_);
+        return ESP_ERR_NOT_FOUND;
+    }
+    result = RemoveDirectoryTreeLocked(path);
+    if (result == ESP_OK) {
+        snapshot_.revision++;
+        (void)RefreshSnapshotLocked();
+    } else {
+        SetErrorLocked("storage_delete_failed");
+    }
+    xSemaphoreGive(mutex_);
+    return result;
+}
+
+bool StorageService::IsReady() const {
+    return snapshot_.state == StorageState::kReady;
+}
+
+bool StorageService::HasActiveWriteTransaction() const {
+    return !active_transaction_id_.empty();
+}
+
+esp_err_t StorageService::EnsureReadyLocked() {
+    if (sd_port_ == nullptr || sd_port_->SDPort_GetSdcardInitOK() == 0 ||
+        sd_port_->SDPort_GetSdMMCHost() == nullptr ||
+        sdmmc_get_status(sd_port_->SDPort_GetSdMMCHost()) != ESP_OK) {
+        snapshot_.state = StorageState::kMissing;
+        SetErrorLocked("storage_unavailable");
+        return ESP_ERR_INVALID_STATE;
+    }
+    snapshot_.state = StorageState::kReady;
+    return ESP_OK;
+}
+
+esp_err_t StorageService::RefreshSnapshotLocked() {
+    esp_err_t result = EnsureReadyLocked();
+    if (result != ESP_OK) return result;
+    result = esp_vfs_fat_info(mount_point_.c_str(), &snapshot_.total_bytes, &snapshot_.free_bytes);
+    if (result != ESP_OK) {
+        SetErrorLocked("storage_unavailable");
+        return result;
+    }
+    snapshot_.reserve_bytes = std::max(kMinimumReserveBytes, snapshot_.total_bytes / 20U);
+    return ESP_OK;
+}
+
+esp_err_t StorageService::CreateTransactionDirectoryLocked() {
+    const std::string directory = StagingDirectoryLocked();
+    if (IsDirectory(directory)) {
+        SetErrorLocked("request_id_conflict");
+        return ESP_ERR_INVALID_STATE;
+    }
+    return EnsureDirectoryTreeLocked(directory);
+}
+
+esp_err_t StorageService::RemoveDirectoryTreeLocked(const std::string& absolute_path) {
+    DIR* directory = opendir(absolute_path.c_str());
+    if (directory == nullptr) return errno == ENOENT ? ESP_OK : ESP_FAIL;
+    struct dirent* entry = nullptr;
+    while ((entry = readdir(directory)) != nullptr) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        const std::string child = absolute_path + "/" + entry->d_name;
+        if (IsDirectory(child)) {
+            if (RemoveDirectoryTreeLocked(child) != ESP_OK) {
+                closedir(directory);
+                return ESP_FAIL;
+            }
+        } else if (unlink(child.c_str()) != 0) {
+            closedir(directory);
+            return ESP_FAIL;
+        }
+    }
+    closedir(directory);
+    return rmdir(absolute_path.c_str()) == 0 ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t StorageService::EnsureDirectoryTreeLocked(const std::string& absolute_path) {
+    if (absolute_path.empty() || absolute_path.rfind(mount_point_, 0) != 0) return ESP_ERR_INVALID_ARG;
+    std::string current;
+    std::size_t start = 0;
+    while (start < absolute_path.size()) {
+        const std::size_t end = absolute_path.find('/', start + 1);
+        current = absolute_path.substr(0, end == std::string::npos ? absolute_path.size() : end);
+        if (!current.empty() && !IsDirectory(current) && mkdir(current.c_str(), 0775) != 0 && errno != EEXIST) {
+            SetErrorLocked("storage_write_failed");
+            return ESP_FAIL;
+        }
+        if (end == std::string::npos) break;
+        start = end;
+    }
+    return ESP_OK;
+}
+
+bool StorageService::IsSafeRelativePath(const std::string& path) const {
+    return !path.empty() && path.front() != '/' && path.find("..") == std::string::npos &&
+           path.find('\\') == std::string::npos;
+}
+
+bool StorageService::IsSafeTransactionId(const TransactionId& transaction_id) const {
+    if (transaction_id.empty() || transaction_id.size() > 64) return false;
+    return std::all_of(transaction_id.begin(), transaction_id.end(), [](unsigned char value) {
+        return (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') ||
+               (value >= '0' && value <= '9') || value == '-' || value == '_';
+    });
+}
+
+bool StorageService::IsSafeMediaDirectory(const std::string& final_media_directory) const {
+    constexpr char kMediaPrefix[] = "media/";
+    if (final_media_directory.rfind(kMediaPrefix, 0) != 0) return false;
+    const std::string media_id = final_media_directory.substr(sizeof(kMediaPrefix) - 1);
+    return IsSafeTransactionId(media_id);
+}
+
+std::string StorageService::StagingDirectoryLocked() const {
+    return mount_point_ + "/.staging/" + active_transaction_id_;
+}
+
+void StorageService::SetErrorLocked(const char* code) {
+    snapshot_.last_error_code = code;
+}
+
+}  // namespace photopainter::product

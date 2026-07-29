@@ -73,12 +73,12 @@ class ePaperPort {
     void    Set_DCIOLevel(uint8_t level);
     uint8_t Get_BusyIOLevel();
     void    EPD_Reset(void);
-    void    EPD_LoopBusy(void);
+    bool    EPD_LoopBusy(uint32_t timeout_ms);
     void    SPI_Write(uint8_t data);
     void    EPD_SendCommand(uint8_t Reg);
     void    EPD_SendData(uint8_t Data);
     void    EPD_Sendbuffera(uint8_t *Data, int len);
-    void    EPD_TurnOnDisplay(void);
+    bool    EPD_TurnOnDisplay(uint32_t timeout_ms);
     uint8_t EPD_ColorToePaperColor(uint8_t b,uint8_t g,uint8_t r);
     uint8_t* EPD_ParseBMPImage(const char *path);
     uint8_t EPD_GetPixel4(const uint8_t* buf, int width, int x, int y);
@@ -96,6 +96,7 @@ class ePaperPort {
     void EPD_Init();
     void EPD_DispClear(uint8_t color);
     void EPD_Display();
+    bool EPD_DisplayWithTimeout(uint32_t timeout_ms);
     void EPD_SrcDisplayCopy(uint8_t *buffer,uint32_t len,uint32_t addlen);
     void Set_Rotation(uint8_t rot); // 0:no 1:90 2:180 3:270
     void Set_Mirror(uint8_t mirr_x,uint8_t mirr_y);

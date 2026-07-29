@@ -89,10 +89,15 @@ void ePaperPort::EPD_Reset(void) {
     vTaskDelay(pdMS_TO_TICKS(50));
 }
 
-void ePaperPort::EPD_LoopBusy(void) {
-    while (1) {
+bool ePaperPort::EPD_LoopBusy(uint32_t timeout_ms) {
+    const TickType_t start = xTaskGetTickCount();
+    while (true) {
         if (Get_BusyIOLevel()) {
-            return;
+            return true;
+        }
+        if (pdTICKS_TO_MS(xTaskGetTickCount() - start) >= timeout_ms) {
+            ESP_LOGE(TAG, "EPD BUSY wait timed out after %lu ms", static_cast<unsigned long>(timeout_ms));
+            return false;
         }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
@@ -146,10 +151,10 @@ void ePaperPort::EPD_Sendbuffera(uint8_t *Data, int len) {
     Set_CSIOLevel(1);
 }
 
-void ePaperPort::EPD_TurnOnDisplay(void) {
+bool ePaperPort::EPD_TurnOnDisplay(uint32_t timeout_ms) {
 
     EPD_SendCommand(0x04); // POWER_ON
-    EPD_LoopBusy();
+    if (!EPD_LoopBusy(timeout_ms)) return false;
 
     // Second setting
     EPD_SendCommand(0x06);
@@ -160,11 +165,11 @@ void ePaperPort::EPD_TurnOnDisplay(void) {
 
     EPD_SendCommand(0x12); // DISPLAY_REFRESH
     EPD_SendData(0x00);
-    EPD_LoopBusy();
+    if (!EPD_LoopBusy(timeout_ms)) return false;
 
     EPD_SendCommand(0x02); // POWER_OFF
     EPD_SendData(0X00);
-    EPD_LoopBusy();
+    return EPD_LoopBusy(timeout_ms);
 }
 
 void ePaperPort::Set_Rotation(uint8_t rot) {
@@ -182,7 +187,7 @@ void ePaperPort::EPD_Init() {
         return;
     }
     EPD_Reset();
-    EPD_LoopBusy();
+    if (!EPD_LoopBusy(5000)) return;
     vTaskDelay(pdMS_TO_TICKS(50));
 
     EPD_SendCommand(0xAA);
@@ -247,7 +252,7 @@ void ePaperPort::EPD_Init() {
     EPD_SendData(0x2F);
 
     EPD_SendCommand(0x04);
-    EPD_LoopBusy();
+    if (!EPD_LoopBusy(5000)) return;
     EPD_DispClear(ColorWhite);
     isEPDInit = true;
 }
@@ -260,10 +265,14 @@ void ePaperPort::EPD_DispClear(uint8_t color) {
 }
 
 void ePaperPort::EPD_Display() {
+    EPD_DisplayWithTimeout(40000);
+}
+
+bool ePaperPort::EPD_DisplayWithTimeout(uint32_t timeout_ms) {
     EPD_PixelRotate();
     EPD_SendCommand(0x10);
     EPD_Sendbuffera(RotationBuffer, DisplayLen);
-    EPD_TurnOnDisplay();
+    return EPD_TurnOnDisplay(timeout_ms);
 }
 
 void ePaperPort::EPD_SrcDisplayCopy(uint8_t *buffer,uint32_t len,uint32_t addlen) {

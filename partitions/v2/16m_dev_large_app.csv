@@ -1,0 +1,9 @@
+# ESP-IDF development partition table (16 MB Flash)
+# Keep NVS and official assets at their existing offsets. Development uses a
+# single large app slot; dual-slot OTA is intentionally deferred.
+# Name,    Type, SubType,  Offset,    Size, Flags
+nvs,       data, nvs,      0x9000,    0x4000,
+otadata,   data, ota,      0xd000,    0x2000,
+phy_init,  data, phy,      0xf000,    0x1000,
+factory,   app,  factory,  0x20000,   0x7e0000,
+assets,    data, spiffs,   0x800000,  8M,

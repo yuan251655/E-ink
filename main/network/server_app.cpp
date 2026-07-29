@@ -8,6 +8,8 @@
 #include "button_bsp.h"
 #include "mdns.h"
 #include "user_app.h"
+#include "product_api.h"
+#include "product_network.h"
 
 static const char *TAG = "server_bsp";
 
@@ -276,34 +278,55 @@ uint8_t ServerPort_NetworkSTAInit(wifi_credential_t creden) {
     }
 }
 
-void ServerPort_init(CustomSDPort *SDPort) {
+static void ServerPort_Start(CustomSDPort *SDPort, bool enable_legacy_upload) {
     if(SDPort_ == NULL) {
         SDPort_ = SDPort;
     }
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.uri_match_fn   = httpd_uri_match_wildcard; /*Wildcard enabling*/
+    config.max_uri_handlers = 20;
+    // The phone App uses a fresh connection for each API call.  Purge a stale
+    // keep-alive socket under memory pressure instead of leaving a completed
+    // multipart upload to block the next sequential upload.
+    config.lru_purge_enable = true;
+    // Multipart intake validates JSON and streams media.  Leave enough
+    // headroom for HTTP/lwIP frames; payload buffers themselves stay on heap.
+    config.stack_size = 12288;
+    // Product mode is API-only. Do not enable the official catch-all web
+    // router here: its `/*` wildcard can intercept versioned API routes.
+    config.uri_match_fn = httpd_uri_match_wildcard;
     ESP_ERROR_CHECK(httpd_start(&server, &config));
+    ESP_ERROR_CHECK(photopainter::product::RegisterProductApi(server));
+    ESP_LOGI(TAG, "Product API server listening on port %u", static_cast<unsigned>(config.server_port));
 
-    /*Event callback function*/
-    httpd_uri_t uri_config = {};
-    uri_config.uri         = "/*";
-    uri_config.method      = HTTP_GET;
-    uri_config.handler     = static_resource_unified_handler;
-    uri_config.user_ctx    = NULL;
-    httpd_register_uri_handler(server, &uri_config);
-    
-    uri_config.uri         = "/dataUP";
-    uri_config.method      = HTTP_POST;
-    uri_config.handler     = receive_data_redirect_handler;
-    uri_config.user_ctx    = NULL;
-    httpd_register_uri_handler(server, &uri_config);
-    
-    uri_config.uri         = "/*"; // Match all URLs that have not been handled by other handlers
-    uri_config.method      = (httpd_method_t)(HTTP_GET | HTTP_POST);
-    uri_config.handler     = unknown_uri_handler; // Callback for returning a 404 response
-    uri_config.user_ctx    = NULL;
-    httpd_register_uri_handler(server, &uri_config);
+    if (enable_legacy_upload) {
+        /* The official web UI is only retained for the compatibility entry. */
+        httpd_uri_t uri_config = {};
+        uri_config.uri         = "/*";
+        uri_config.method      = HTTP_GET;
+        uri_config.handler     = static_resource_unified_handler;
+        uri_config.user_ctx    = NULL;
+        httpd_register_uri_handler(server, &uri_config);
+
+        uri_config.uri         = "/dataUP";
+        uri_config.method      = HTTP_POST;
+        uri_config.handler     = receive_data_redirect_handler;
+        uri_config.user_ctx    = NULL;
+        httpd_register_uri_handler(server, &uri_config);
+
+        uri_config.uri         = "/*"; // Match all URLs that have not been handled by other handlers
+        uri_config.method      = (httpd_method_t)(HTTP_GET | HTTP_POST);
+        uri_config.handler     = unknown_uri_handler; // Callback for returning a 404 response
+        uri_config.user_ctx    = NULL;
+        httpd_register_uri_handler(server, &uri_config);
+    }
+}
+
+void ServerPort_init(CustomSDPort *SDPort) { ServerPort_Start(SDPort, true); }
+
+void ServerPort_StartProductLocalApi(CustomSDPort *SDPort) {
+    ESP_ERROR_CHECK(photopainter::product::InitializeProductNetwork());
+    ServerPort_Start(SDPort, false);
 }
 
 void ServerPort_SetNetworkSleep(void) {
