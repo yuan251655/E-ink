@@ -41,7 +41,12 @@ void DisplayService::WorkerLoop() {
         if (result == ESP_OK) {
             snapshot_.state = DisplayState::kRefreshing;
             if (jobs_) (void)jobs_->Update(job_id, JobState::kRunning, "refreshing", 60);
-            display_->Set_Rotation(0);
+            // The 7.3-inch PhotoPainter panel is installed 180 degrees from
+            // the logical 800x480 media frame.  This is the same correction
+            // the official BSP applies to a landscape BMP.  Keep it solely
+            // in the physical display layer: the stored BIN and App preview
+            // remain in their normal user-facing orientation.
+            display_->Set_Rotation(2);
             // The official BSP returns bool here, not esp_err_t.  Mapping it
             // explicitly avoids treating a successful `true` value (1) as an
             // ESP-IDF error code.
