@@ -21,14 +21,14 @@ struct MediaUploadResult {
     JobSnapshot job;
 };
 
-// Receives exactly three multipart parts in this order: metadata (JSON),
-// source, image_bin.  The request body is streamed to TF; no source image or
-// display frame is retained in RAM.  The function is synchronous because the
+// Receives exactly two multipart parts in this order: metadata (JSON),
+// image_bin. The request body is streamed to TF; no phone image or display
+// frame is retained in RAM. The function is synchronous because the
 // HTTP server owns the socket, while the returned JobSnapshot remains the
 // authoritative result for subsequent GET /jobs/{job_id} requests.
-MediaUploadResult ReceiveSourcePlusBinMultipart(httpd_req_t* request,
-                                                 StorageService& storage,
-                                                 MediaLibrary& media_library,
-                                                 JobService& jobs);
+MediaUploadResult ReceiveBinOnlyMultipart(httpd_req_t* request,
+                                           StorageService& storage,
+                                           MediaLibrary& media_library,
+                                           JobService& jobs);
 
 }  // namespace photopainter::product

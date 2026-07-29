@@ -239,9 +239,18 @@ esp_err_t MediaLibrary::LoadManifest(const MediaId& expected_id, MediaItem* outp
     item.display_profile.orientation = orientation == "portrait" ? Orientation::kPortrait : Orientation::kLandscape;
     item.display_profile.fit_mode = fit_mode == "cover" ? FitMode::kCover : FitMode::kContain;
     JsonObjectConst files = root["files"].as<JsonObjectConst>();
-    if (item.manifest_version != 1 || !ReadDescriptor(files["source"].as<JsonObjectConst>(), &item.source) ||
-        !ReadDescriptor(files["preview"].as<JsonObjectConst>(), &item.preview) ||
-        !ReadDescriptor(files["frame"].as<JsonObjectConst>(), &item.frame)) return ESP_ERR_INVALID_ARG;
+    if (item.manifest_version == 1) {
+        if (!ReadDescriptor(files["source"].as<JsonObjectConst>(), &item.source) ||
+            !ReadDescriptor(files["preview"].as<JsonObjectConst>(), &item.preview) ||
+            !ReadDescriptor(files["frame"].as<JsonObjectConst>(), &item.frame)) return ESP_ERR_INVALID_ARG;
+    } else if (item.manifest_version == 2) {
+        if (!ReadDescriptor(files["frame"].as<JsonObjectConst>(), &item.frame) || !item.frame.present ||
+            item.frame.bytes != kDisplayFrameBytes) return ESP_ERR_INVALID_ARG;
+        item.source = {};
+        item.preview = {};
+    } else {
+        return ESP_ERR_INVALID_ARG;
+    }
     *output = std::move(item);
     return ESP_OK;
 }

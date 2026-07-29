@@ -21,8 +21,7 @@ namespace {
 
 constexpr std::size_t kMaxRequestBytes = 6U * 1024U * 1024U;
 constexpr std::size_t kMaxMetadataBytes = 4U * 1024U;
-constexpr std::size_t kMaxSourceBytes = 5U * 1024U * 1024U;
-constexpr std::size_t kMaxParts = 3;
+constexpr std::size_t kMaxParts = 2;
 constexpr std::size_t kReadBufferBytes = 2048;
 constexpr std::size_t kHeaderLineBytes = 512;
 constexpr std::size_t kWriteBufferBytes = 16U * 1024U;
@@ -31,9 +30,6 @@ constexpr char kTag[] = "MediaUpload";
 struct Metadata {
     RequestId request_id;
     std::string display_name;
-    std::string source_mime;
-    std::string source_sha256;
-    std::uint64_t source_bytes = 0;
     std::string frame_sha256;
     DisplayProfile profile;
 };
@@ -191,7 +187,7 @@ bool ParseMetadata(const std::string& json, Metadata* output, std::string* code)
     const std::string category = root["category"] | "";
     const std::string mode = root["upload_mode"] | "";
     if (category != "local") { *code = "unsupported"; return false; }
-    if (mode != "source_plus_bin") { *code = mode == "source_only" ? "unsupported" : "invalid_request"; return false; }
+    if (mode != "bin_only") { *code = "unsupported"; return false; }
 
     Metadata parsed;
     parsed.request_id = root["request_id"] | "";
@@ -201,13 +197,8 @@ bool ParseMetadata(const std::string& json, Metadata* output, std::string* code)
     for (const unsigned char c : parsed.display_name) {
         if (c < 0x20U || c == 0x7fU) { *code = "invalid_request"; return false; }
     }
-    JsonObjectConst source = root["source"].as<JsonObjectConst>();
-    if (source.isNull()) source = root["files"]["source"].as<JsonObjectConst>();
     JsonObjectConst frame = root["image_bin"].as<JsonObjectConst>();
     if (frame.isNull()) frame = root["files"]["frame"].as<JsonObjectConst>();
-    parsed.source_mime = source["mime_type"] | "";
-    parsed.source_bytes = source["bytes"] | 0ULL;
-    parsed.source_sha256 = Lower(source["sha256"] | "");
     const std::uint64_t frame_bytes = frame["bytes"] | 0ULL;
     parsed.frame_sha256 = Lower(frame["sha256"] | "");
     JsonObjectConst profile = root["display_profile"].as<JsonObjectConst>();
@@ -223,9 +214,7 @@ bool ParseMetadata(const std::string& json, Metadata* output, std::string* code)
     if (parsed.profile.converter_version.empty()) {
         parsed.profile.converter_version = root["client_algorithm_version"] | "";
     }
-    if (parsed.source_mime != "image/jpeg" && parsed.source_mime != "image/png") { *code = "invalid_request"; return false; }
-    if (parsed.source_bytes == 0 || parsed.source_bytes > kMaxSourceBytes || !IsHexHash(parsed.source_sha256) ||
-        frame_bytes != kDisplayFrameBytes || !IsHexHash(parsed.frame_sha256) ||
+    if (frame_bytes != kDisplayFrameBytes || !IsHexHash(parsed.frame_sha256) ||
         parsed.profile.width != kDisplayWidth || parsed.profile.height != kDisplayHeight ||
         parsed.profile.frame_bytes != kDisplayFrameBytes || pixel_format != "4bpp" || palette != "six_color_e6" ||
         (orientation != "landscape" && orientation != "portrait") ||
@@ -246,8 +235,8 @@ std::string Fingerprint(const Metadata& metadata) {
     char profile[128]{};
     std::snprintf(profile, sizeof(profile), "%u:%u:%u:%d", metadata.profile.width, metadata.profile.height,
                   static_cast<unsigned>(metadata.profile.frame_bytes), metadata.profile.rotation_degrees);
-    const std::string canonical = metadata.source_sha256 + ":" + std::to_string(metadata.source_bytes) + ":" +
-                                  metadata.frame_sha256 + ":" + profile + ":" + metadata.profile.converter_version + ":" + metadata.display_name;
+    const std::string canonical = std::string("bin_only:") + metadata.frame_sha256 + ":" + profile + ":" +
+                                  metadata.profile.converter_version + ":" + metadata.display_name;
     unsigned char digest[32]{};
     mbedtls_sha256_context hash;
     mbedtls_sha256_init(&hash);
@@ -311,14 +300,12 @@ void FailJob(JobService& jobs, const JobSnapshot& job, const std::string& code) 
     if (!job.job_id.empty()) (void)jobs.Update(job.job_id, JobState::kFailed, "failed", 0, code);
 }
 
-std::string SourceFileName(const Metadata& metadata) { return metadata.source_mime == "image/png" ? "source.png" : "source.jpg"; }
-
 }  // namespace
 
-MediaUploadResult ReceiveSourcePlusBinMultipart(httpd_req_t* request,
-                                                 StorageService& storage,
-                                                 MediaLibrary& media_library,
-                                                 JobService& jobs) {
+MediaUploadResult ReceiveBinOnlyMultipart(httpd_req_t* request,
+                                           StorageService& storage,
+                                           MediaLibrary& media_library,
+                                           JobService& jobs) {
     MediaUploadResult result;
     if (request == nullptr || request->content_len <= 0 || request->content_len > static_cast<int>(kMaxRequestBytes)) {
         result.code = "invalid_request";
@@ -333,7 +320,6 @@ MediaUploadResult ReceiveSourcePlusBinMultipart(httpd_req_t* request,
 
     Metadata metadata;
     bool transaction_started = false;
-    bool source_received = false;
     bool frame_received = false;
     std::size_t part_count = 0;
     std::string failure_code = "invalid_request";
@@ -377,37 +363,11 @@ MediaUploadResult ReceiveSourcePlusBinMultipart(httpd_req_t* request,
                 return result;
             }
             (void)jobs.Update(result.job.job_id, JobState::kRunning, "receiving", 5);
-            const std::uint64_t required = metadata.source_bytes + kDisplayFrameBytes + kMaxMetadataBytes;
+            const std::uint64_t required = kDisplayFrameBytes + kMaxMetadataBytes;
             failure = storage.BeginWriteTransaction(NewSafeId("txn"), required);
             if (failure != ESP_OK) { failure_code = failure == ESP_ERR_NO_MEM ? "storage_no_space" : (failure == ESP_ERR_INVALID_STATE ? "storage_busy" : "storage_unavailable"); break; }
             transaction_started = true;
         } else if (part_count == 2) {
-            if (name != "source" || Trim(content_type) != metadata.source_mime) { failure = ESP_ERR_INVALID_ARG; break; }
-            mbedtls_sha256_context hash;
-            mbedtls_sha256_init(&hash);
-            const bool started = mbedtls_sha256_starts(&hash, false) == 0;
-            std::uint64_t bytes = 0;
-            bool first = true;
-            esp_err_t write_error = ESP_OK;
-            const std::string file_name = SourceFileName(metadata);
-            const bool received = started && ReceivePartBody(&reader, boundary, [&](const char* data, std::size_t size) {
-                if (bytes + size > kMaxSourceBytes || mbedtls_sha256_update(&hash, reinterpret_cast<const unsigned char*>(data), size) != 0) return false;
-                const esp_err_t write = storage.AppendStagedFile(file_name, data, size, first);
-                first = false;
-                if (write != ESP_OK) { write_error = write; return false; }
-                bytes += size;
-                return true;
-            }, &final_boundary);
-            unsigned char digest[32]{};
-            const bool finished = started && mbedtls_sha256_finish(&hash, digest) == 0;
-            mbedtls_sha256_free(&hash);
-            const esp_err_t finalized = storage.FinalizeStagedFile(file_name, bytes);
-            if (!received || final_boundary || !finished || bytes != metadata.source_bytes || HexDigest(digest) != metadata.source_sha256 || finalized != ESP_OK) {
-                ESP_LOGE(kTag, "source rejected recv=%d final=%d hash=%d bytes=%llu/%llu finalize=%s write=%s", received, final_boundary, finished && HexDigest(digest) == metadata.source_sha256, static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(metadata.source_bytes), esp_err_to_name(finalized), esp_err_to_name(write_error));
-                failure_code = write_error == ESP_OK ? ((bytes == metadata.source_bytes && finished && HexDigest(digest) != metadata.source_sha256) ? "checksum_mismatch" : "media_incomplete") : "storage_write_failed"; failure = write_error == ESP_OK ? ESP_ERR_INVALID_SIZE : write_error; break; }
-            source_received = true;
-            (void)jobs.Update(result.job.job_id, JobState::kRunning, "validating", 55);
-        } else if (part_count == 3) {
             if (name != "image_bin" || Trim(content_type) != "application/octet-stream") { failure = ESP_ERR_INVALID_ARG; break; }
             mbedtls_sha256_context hash;
             mbedtls_sha256_init(&hash);
@@ -439,7 +399,7 @@ MediaUploadResult ReceiveSourcePlusBinMultipart(httpd_req_t* request,
         }
     }
 
-    if (transaction_started && source_received && frame_received && part_count == kMaxParts) {
+    if (transaction_started && frame_received && part_count == kMaxParts) {
         (void)jobs.Update(result.job.job_id, JobState::kRunning, "committing", 85);
         const MediaId media_id = NewSafeId("local");
         const EpochMs now = static_cast<EpochMs>(esp_timer_get_time() / 1000);
@@ -449,7 +409,7 @@ MediaUploadResult ReceiveSourcePlusBinMultipart(httpd_req_t* request,
         manifest["category"] = "local";
         manifest["created_at_ms"] = now;
         manifest["updated_at_ms"] = now;
-        manifest["manifest_version"] = 1;
+        manifest["manifest_version"] = 2;
         manifest["revision"] = 1;
         JsonObject profile = manifest.createNestedObject("display_profile");
         profile["width"] = metadata.profile.width; profile["height"] = metadata.profile.height;
@@ -459,9 +419,6 @@ MediaUploadResult ReceiveSourcePlusBinMultipart(httpd_req_t* request,
         profile["fit_mode"] = metadata.profile.fit_mode == FitMode::kCover ? "cover" : "contain";
         profile["converter_version"] = metadata.profile.converter_version;
         JsonObject files = manifest.createNestedObject("files");
-        JsonObject source = files.createNestedObject("source");
-        source["present"] = true; source["mime_type"] = metadata.source_mime; source["bytes"] = metadata.source_bytes; source["sha256"] = metadata.source_sha256;
-        JsonObject preview = files.createNestedObject("preview"); preview["present"] = false;
         JsonObject frame = files.createNestedObject("frame");
         frame["present"] = true; frame["mime_type"] = "application/octet-stream"; frame["bytes"] = kDisplayFrameBytes; frame["sha256"] = metadata.frame_sha256;
         std::string manifest_json;

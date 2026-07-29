@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "ArduinoJson.h"
 #include "display_runtime.h"
@@ -159,11 +160,11 @@ esp_err_t Health(httpd_req_t* req) {
 }
 
 esp_err_t Capabilities(httpd_req_t* req) {
-    return SendJson(req, "{\"ok\":true,\"code\":\"ok\",\"data\":{\"api_version\":\"v1\",\"media_upload_modes\":[\"source_plus_bin\"],\"display_width\":800,\"display_height\":480,\"frame_bytes\":192000}}");
+    return SendJson(req, "{\"ok\":true,\"code\":\"ok\",\"data\":{\"api_version\":\"v1\",\"media_upload_modes\":[\"bin_only\"],\"supports_media_preview\":true,\"preview_format\":\"indexed_4bpp_bin\",\"display_width\":800,\"display_height\":480,\"frame_bytes\":192000}}");
 }
 
 esp_err_t UploadMedia(httpd_req_t* req) {
-    const auto result = ReceiveSourcePlusBinMultipart(req, GetStorageService(), GetMediaLibrary(), GetProductJobService());
+    const auto result = ReceiveBinOnlyMultipart(req, GetStorageService(), GetMediaLibrary(), GetProductJobService());
     char body[320];
     std::snprintf(body, sizeof(body), "{\"ok\":%s,\"code\":\"%s\",\"data\":{\"job_id\":\"%s\",\"state\":%u,\"phase\":\"%s\",\"media_id\":\"%s\"}}", result.error == ESP_OK ? "true" : "false", result.code.c_str(), result.job.job_id.c_str(), static_cast<unsigned>(result.job.state), result.job.phase.c_str(), result.job.media_id.c_str());
     if (result.error == ESP_OK) return SendJson(req, body, "202 Accepted");
@@ -214,6 +215,7 @@ esp_err_t ListMedia(httpd_req_t* req) {
 }
 
 esp_err_t GetMediaSource(httpd_req_t* req, const MediaId& media_id);
+esp_err_t GetMediaPreview(httpd_req_t* req, const MediaId& media_id);
 
 esp_err_t GetMediaDetail(httpd_req_t* req) {
     constexpr char kPrefix[] = "/api/v1/media/";
@@ -221,6 +223,13 @@ esp_err_t GetMediaDetail(httpd_req_t* req) {
     const char* media_id = req->uri + sizeof(kPrefix) - 1;
     const std::size_t uri_length = std::strlen(req->uri);
     constexpr char kSourceSuffix[] = "/source";
+    constexpr char kPreviewSuffix[] = "/preview";
+    if (uri_length > sizeof(kPrefix) + sizeof(kPreviewSuffix) - 2 &&
+        std::strcmp(req->uri + uri_length - (sizeof(kPreviewSuffix) - 1), kPreviewSuffix) == 0) {
+        const MediaId preview_media_id(media_id, uri_length - (sizeof(kPrefix) - 1) - (sizeof(kPreviewSuffix) - 1));
+        if (preview_media_id.empty() || preview_media_id.size() > 64) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+        return GetMediaPreview(req, preview_media_id);
+    }
     if (uri_length > sizeof(kPrefix) + sizeof(kSourceSuffix) - 2 &&
         std::strcmp(req->uri + uri_length - (sizeof(kSourceSuffix) - 1), kSourceSuffix) == 0) {
         const MediaId source_media_id(media_id, uri_length - (sizeof(kPrefix) - 1) - (sizeof(kSourceSuffix) - 1));
@@ -247,6 +256,22 @@ esp_err_t GetMediaSource(httpd_req_t* req, const MediaId& media_id) {
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     const esp_err_t result = GetStorageService().StreamCommittedFile(
         "media/" + item.media_id + "/" + source_file, item.source.bytes,
+        [req](const void* data, std::size_t size) { return httpd_resp_send_chunk(req, static_cast<const char*>(data), size); });
+    if (result != ESP_OK) return result;
+    return httpd_resp_send_chunk(req, nullptr, 0);
+}
+
+// A fixed 192000-byte 4bpp frame is compact enough for gallery thumbnails and
+// avoids streaming multi-megabyte phone originals through the one-slot server.
+esp_err_t GetMediaPreview(httpd_req_t* req, const MediaId& media_id) {
+    MediaItem item;
+    if (!GetMediaLibrary().Find(media_id, &item) || !item.frame.present || item.frame.bytes != kDisplayFrameBytes) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"media_not_found\"}", "404 Not Found");
+    }
+    httpd_resp_set_type(req, "application/octet-stream");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    const esp_err_t result = GetStorageService().StreamCommittedFile(
+        "media/" + item.media_id + "/image.bin", item.frame.bytes,
         [req](const void* data, std::size_t size) { return httpd_resp_send_chunk(req, static_cast<const char*>(data), size); });
     if (result != ESP_OK) return result;
     return httpd_resp_send_chunk(req, nullptr, 0);
@@ -360,9 +385,21 @@ esp_err_t NetworkStatus(httpd_req_t* req) {
     const auto network = GetProductNetworkSnapshot();
     char revision[21];
     FormatUInt64(network.revision, revision);
-    char body[384];
-    std::snprintf(body, sizeof(body), "{\"ok\":true,\"code\":\"ok\",\"data\":{\"ap\":{\"enabled\":%s,\"ssid\":\"esp_network\",\"ip\":\"192.168.4.1\"},\"sta\":{\"configured\":%s,\"connected\":%s,\"ip\":\"%s\"},\"revision\":%s}}", network.ap_enabled ? "true" : "false", network.sta_configured ? "true" : "false", network.sta_connected ? "true" : "false", network.sta_ip.c_str(), revision);
-    return SendJson(req, body);
+    std::string body = "{\"ok\":true,\"code\":\"ok\",\"data\":{\"api_version\":\"v1\",\"device_id\":\"esp32-s3-photopainter\",\"ap\":{\"enabled\":";
+    body.append(network.ap_enabled ? "true" : "false").append(",\"ssid\":");
+    AppendJsonString(&body, network.ap_ssid);
+    body.append(",\"ip\":"); AppendJsonString(&body, network.ap_ip);
+    body.append(",\"channel\":").append(std::to_string(network.ap_channel))
+        .append(",\"connected_clients\":").append(std::to_string(network.ap_connected_clients)).append("},\"sta\":{\"enabled\":true,\"configured\":")
+        .append(network.sta_configured ? "true" : "false").append(",\"state\":\"")
+        .append(network.sta_connected ? "connected" : (network.last_error_code == "sta_testing" ? "connecting" : (network.sta_configured ? "failed" : "disabled"))).append("\",\"ssid\":");
+    AppendJsonString(&body, network.sta_ssid);
+    body.append(",\"ip\":"); AppendJsonString(&body, network.sta_ip);
+    body.append(",\"gateway\":"); AppendJsonString(&body, network.sta_gateway);
+    if (network.sta_connected) body.append(",\"rssi_dbm\":").append(std::to_string(network.sta_rssi_dbm));
+    body.append(",\"last_error_code\":"); AppendJsonString(&body, network.last_error_code);
+    body.append("},\"internet\":{\"state\":\"unknown\"},\"revision\":").append(revision).append("}}");
+    return SendJson(req, body.c_str());
 }
 
 bool DecodeFormValue(const char* input, char* output, std::size_t output_size) {
@@ -390,12 +427,22 @@ esp_err_t ConfigureSta(httpd_req_t* req) {
     char form[197]{};
     const int read = httpd_req_recv(req, form, req->content_len);
     if (read != req->content_len) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\",\"message\":\"incomplete form\"}", "400 Bad Request");
-    char ssid_encoded[100]{}, password_encoded[100]{};
-    const char* ssid_start = std::strstr(form, "ssid=");
-    const char* password_start = std::strstr(form, "password=");
-    if (!ssid_start || !password_start || std::sscanf(ssid_start, "ssid=%99[^&]", ssid_encoded) != 1 || std::sscanf(password_start, "password=%99[^&]", password_encoded) != 1) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\",\"message\":\"ssid and password required\"}", "400 Bad Request");
     char ssid[33]{}, password[65]{};
-    if (!DecodeFormValue(ssid_encoded, ssid, sizeof(ssid)) || !DecodeFormValue(password_encoded, password, sizeof(password)) || std::strlen(ssid) == 0) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\",\"message\":\"invalid Wi-Fi credentials\"}", "400 Bad Request");
+    const bool is_json = std::strstr(form, "\"ssid\"") != nullptr;
+    if (is_json) {
+        JsonDocument input;
+        if (deserializeJson(input, form) != DeserializationError::Ok) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+        const std::string parsed_ssid = input["ssid"] | "";
+        const std::string parsed_password = input["password"] | "";
+        if (parsed_ssid.size() >= sizeof(ssid) || parsed_password.size() >= sizeof(password)) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+        std::strcpy(ssid, parsed_ssid.c_str()); std::strcpy(password, parsed_password.c_str());
+    } else {
+        char ssid_encoded[100]{}, password_encoded[100]{};
+        const char* ssid_start = std::strstr(form, "ssid=");
+        const char* password_start = std::strstr(form, "password=");
+        if (!ssid_start || !password_start || std::sscanf(ssid_start, "ssid=%99[^&]", ssid_encoded) != 1 || std::sscanf(password_start, "password=%99[^&]", password_encoded) != 1 || !DecodeFormValue(ssid_encoded, ssid, sizeof(ssid)) || !DecodeFormValue(password_encoded, password, sizeof(password))) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\",\"message\":\"ssid and password required\"}", "400 Bad Request");
+    }
+    if (std::strlen(ssid) == 0 || std::strlen(password) < 8) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\",\"message\":\"invalid Wi-Fi credentials\"}", "400 Bad Request");
     const esp_err_t result = ConfigureProductSta(ssid, password);
     if (result != ESP_OK) return SendJson(req, "{\"ok\":false,\"code\":\"sta_connect_failed\",\"message\":\"unable to start STA connection\"}", "503 Service Unavailable");
     if (!WaitForProductStaConnection(12000)) return SendJson(req, "{\"ok\":false,\"code\":\"sta_connect_failed\",\"message\":\"connection timed out\"}", "503 Service Unavailable");
@@ -403,6 +450,56 @@ esp_err_t ConfigureSta(httpd_req_t* req) {
     char body[192];
     std::snprintf(body, sizeof(body), "{\"ok\":true,\"code\":\"ok\",\"message\":\"connected\",\"data\":{\"sta_ip\":\"%s\"}}", network.sta_ip.c_str());
     return SendJson(req, body);
+}
+
+esp_err_t ScanWifi(httpd_req_t* req) {
+    if (req->content_len > 2) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    std::vector<ScannedWifiNetwork> networks;
+    const esp_err_t result = ScanProductWifi24Ghz(&networks);
+    if (result != ESP_OK) return SendJson(req, "{\"ok\":false,\"code\":\"network_busy\"}", "503 Service Unavailable");
+    std::string body = "{\"ok\":true,\"code\":\"ok\",\"data\":{\"networks\":[";
+    for (std::size_t index = 0; index < networks.size(); ++index) {
+        if (index != 0) body.push_back(',');
+        body.append("{\"ssid\":"); AppendJsonString(&body, networks[index].ssid);
+        body.append(",\"rssi_dbm\":").append(std::to_string(networks[index].rssi_dbm))
+            .append(",\"channel\":").append(std::to_string(networks[index].channel)).append(",\"security\":");
+        AppendJsonString(&body, networks[index].security); body.push_back('}');
+    }
+    body.append("]}}");
+    return SendJson(req, body.c_str());
+}
+
+bool ParseJsonCredentials(httpd_req_t* req, std::string* ssid, std::string* password) {
+    if (req == nullptr || req->content_len <= 0 || req->content_len > 196) return false;
+    char body[197]{}; int total = 0;
+    while (total < req->content_len) { const int read = httpd_req_recv(req, body + total, req->content_len - total); if (read <= 0) return false; total += read; }
+    JsonDocument input;
+    if (deserializeJson(input, body) != DeserializationError::Ok) return false;
+    *ssid = input["ssid"] | ""; *password = input["password"] | "";
+    return true;
+}
+
+esp_err_t ConfigureAp(httpd_req_t* req) {
+    std::string ssid, password;
+    if (!ParseJsonCredentials(req, &ssid, &password)) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    const esp_err_t result = ConfigureProductAp(ssid, password);
+    if (result == ESP_ERR_INVALID_ARG) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_ap_credentials\"}", "400 Bad Request");
+    if (result != ESP_OK) return SendJson(req, "{\"ok\":false,\"code\":\"ap_save_failed\"}", "500 Internal Server Error");
+    const auto snapshot = GetProductNetworkSnapshot();
+    std::string body = "{\"ok\":true,\"code\":\"ap_saved\",\"data\":{\"ssid\":"; AppendJsonString(&body, snapshot.ap_ssid); body.append(",\"ip\":"); AppendJsonString(&body, snapshot.ap_ip); body.append("}}");
+    return SendJson(req, body.c_str());
+}
+
+esp_err_t RestoreDefaultAp(httpd_req_t* req) {
+    if (req->content_len > 2) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    if (RestoreDefaultProductAp() != ESP_OK) return SendJson(req, "{\"ok\":false,\"code\":\"ap_restore_failed\"}", "500 Internal Server Error");
+    return SendJson(req, "{\"ok\":true,\"code\":\"ap_restored\",\"data\":{\"ssid\":\"esp_network\",\"ip\":\"192.168.4.1\"}}");
+}
+
+esp_err_t ForgetSta(httpd_req_t* req) {
+    if (req->content_len > 2) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    if (ForgetProductSta() != ESP_OK) return SendJson(req, "{\"ok\":false,\"code\":\"network_busy\"}", "503 Service Unavailable");
+    return SendJson(req, "{\"ok\":true,\"code\":\"sta_forgotten\"}");
 }
 
 esp_err_t ProvisionPage(httpd_req_t* req) {
@@ -422,7 +519,11 @@ esp_err_t RegisterProductApi(httpd_handle_t server) {
         {.uri="/api/v1/device/status", .method=HTTP_GET, .handler=Status, .user_ctx=nullptr},
         {.uri="/api/v1/display/status", .method=HTTP_GET, .handler=DisplayStatus, .user_ctx=nullptr},
         {.uri="/api/v1/network/status", .method=HTTP_GET, .handler=NetworkStatus, .user_ctx=nullptr},
+        {.uri="/api/v1/network/scan", .method=HTTP_POST, .handler=ScanWifi, .user_ctx=nullptr},
         {.uri="/api/v1/network/sta", .method=HTTP_POST, .handler=ConfigureSta, .user_ctx=nullptr},
+        {.uri="/api/v1/network/sta", .method=HTTP_DELETE, .handler=ForgetSta, .user_ctx=nullptr},
+        {.uri="/api/v1/network/ap", .method=HTTP_POST, .handler=ConfigureAp, .user_ctx=nullptr},
+        {.uri="/api/v1/network/ap/restore-default", .method=HTTP_POST, .handler=RestoreDefaultAp, .user_ctx=nullptr},
         {.uri="/api/v1/media/upload", .method=HTTP_POST, .handler=UploadMedia, .user_ctx=nullptr},
         {.uri="/api/v1/media", .method=HTTP_GET, .handler=ListMedia, .user_ctx=nullptr},
         {.uri="/api/v1/media/*", .method=HTTP_GET, .handler=GetMediaDetail, .user_ctx=nullptr},
