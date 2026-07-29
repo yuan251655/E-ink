@@ -15,6 +15,7 @@
 #include "storage_runtime.h"
 #include "media_library_runtime.h"
 #include "display_runtime.h"
+#include "indicator_service.h"
 #include "mode_manager.h"
 
 #define TAG "main"
@@ -72,6 +73,10 @@ extern "C" void app_main(void) {
     if (User_Mode_init() == 0) {
         ESP_LOGE("init", "init Failure");
         return;
+    }
+    ret = photopainter::product::InitializeIndicatorService();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "LED indicator service unavailable: %s", esp_err_to_name(ret));
     }
     ret = photopainter::product::InitializeProductStorage(SDPort);
     if (ret != ESP_OK) {
