@@ -12,6 +12,7 @@
 #include "display_service.h"
 #include "job_service.h"
 #include "job_runtime.h"
+#include "local_album_playback_runtime.h"
 #include "media_library.h"
 #include "media_upload_service.h"
 #include "media_library_runtime.h"
@@ -114,6 +115,90 @@ void AppendMediaItemJson(std::string* output, const MediaItem& item) {
     output->append("}");
 }
 
+const char* PlaybackModeName(PlaybackMode mode) {
+    return mode == PlaybackMode::kAuto ? "auto" : "paused";
+}
+
+const char* PlaybackOrderName(PlaybackOrder order) {
+    return order == PlaybackOrder::kRandom ? "random" : "sequential";
+}
+
+void AppendPlaybackSnapshotJson(std::string* output, const PlaybackSnapshot& snapshot) {
+    output->append("{\"mode\":\"").append(PlaybackModeName(snapshot.config.mode))
+        .append("\",\"interval_seconds\":").append(std::to_string(snapshot.config.interval_seconds))
+        .append(",\"order\":\"").append(PlaybackOrderName(snapshot.config.order))
+        .append("\",\"current_media_id\":");
+    AppendJsonString(output, snapshot.config.current_media_id);
+    // `esp_timer` is a boot-local monotonic clock, not Unix time. Exposing
+    // its raw deadline made clients render values such as 00:07. Return a
+    // duration instead; the App can add it to its own system clock for a
+    // human-readable next-switch time.
+    output->append(",\"next_play_in_seconds\":");
+    if (snapshot.has_next_play) output->append(std::to_string(snapshot.next_play_in_seconds));
+    else output->append("null");
+    output->append(",\"refresh_pending\":").append(snapshot.refresh_pending ? "true" : "false")
+        .append(",\"pending_media_id\":");
+    AppendJsonString(output, snapshot.pending_media_id);
+    output->append(",\"last_error_code\":");
+    AppendJsonString(output, snapshot.last_error_code);
+    output->append(",\"revision\":");
+    AppendUInt64(output, snapshot.config.revision);
+    output->append(",\"state_revision\":");
+    AppendUInt64(output, snapshot.state_revision);
+    output->push_back('}');
+}
+
+void AppendPlaybackResponse(std::string* output, bool ok, const char* code, const char* message,
+                            const PlaybackSnapshot& snapshot, const RequestId* request_id) {
+    output->append("{\"ok\":").append(ok ? "true" : "false").append(",\"code\":");
+    AppendJsonString(output, code);
+    output->append(",\"message\":");
+    AppendJsonString(output, message);
+    output->append(",\"data\":");
+    AppendPlaybackSnapshotJson(output, snapshot);
+    output->append(",\"request_id\":");
+    if (request_id == nullptr) output->append("null");
+    else AppendJsonString(output, *request_id);
+    output->push_back('}');
+}
+
+// Playback configuration is synchronous, so it does not get a JobService
+// entry. Keep a small, bounded result cache to preserve request_id retry
+// semantics without exposing service internals or retaining unbounded JSON.
+struct PlaybackRequestRecord {
+    bool occupied = false;
+    RequestId request_id;
+    std::string fingerprint;
+    PlaybackSnapshot snapshot;
+};
+
+constexpr std::size_t kPlaybackRequestRecordCount = 8;
+PlaybackRequestRecord g_playback_request_records[kPlaybackRequestRecordCount];
+std::size_t g_next_playback_request_record = 0;
+
+std::string PlaybackRequestFingerprint(Revision expected_revision, const std::string& mode,
+                                       std::uint32_t interval_seconds, const std::string& order) {
+    return std::to_string(expected_revision) + ":" + mode + ":" +
+           std::to_string(interval_seconds) + ":" + order;
+}
+
+const PlaybackRequestRecord* FindPlaybackRequestRecord(const RequestId& request_id) {
+    for (const auto& record : g_playback_request_records) {
+        if (record.occupied && record.request_id == request_id) return &record;
+    }
+    return nullptr;
+}
+
+void RememberPlaybackRequest(const RequestId& request_id, const std::string& fingerprint,
+                             const PlaybackSnapshot& snapshot) {
+    auto& record = g_playback_request_records[g_next_playback_request_record];
+    record.occupied = true;
+    record.request_id = request_id;
+    record.fingerprint = fingerprint;
+    record.snapshot = snapshot;
+    g_next_playback_request_record = (g_next_playback_request_record + 1U) % kPlaybackRequestRecordCount;
+}
+
 bool ParseDisplayRequest(httpd_req_t* req, RequestId* request_id, Revision* expected_revision,
                          std::string* after_display) {
     if (req == nullptr || request_id == nullptr || expected_revision == nullptr || after_display == nullptr ||
@@ -153,6 +238,92 @@ esp_err_t SubmitLocalDisplay(httpd_req_t* req, const MediaId& media_id, const Re
     char response[256];
     std::snprintf(response, sizeof(response), "{\"ok\":true,\"code\":\"ok\",\"data\":{\"job_id\":\"%s\",\"state\":%u,\"phase\":\"%s\",\"media_id\":\"%s\"}}", job.job_id.c_str(), static_cast<unsigned>(job.state), job.phase.c_str(), media_id.c_str());
     return SendJson(req, response, "202 Accepted");
+}
+
+esp_err_t GetLocalAlbumPlayback(httpd_req_t* req) {
+    std::string response;
+    AppendPlaybackResponse(&response, true, "ok", "playback configuration loaded",
+                           GetLocalAlbumPlaybackService().GetSnapshot(), nullptr);
+    return SendJson(req, response.c_str());
+}
+
+esp_err_t UpdateLocalAlbumPlayback(httpd_req_t* req) {
+    const PlaybackSnapshot current = GetLocalAlbumPlaybackService().GetSnapshot();
+    if (req == nullptr || req->content_len <= 0 || req->content_len > 512) {
+        std::string response;
+        AppendPlaybackResponse(&response, false, "invalid_request", "invalid playback request", current, nullptr);
+        return SendJson(req, response.c_str(), "400 Bad Request");
+    }
+    char body[513]{};
+    int received_total = 0;
+    while (received_total < req->content_len) {
+        const int received = httpd_req_recv(req, body + received_total, req->content_len - received_total);
+        if (received <= 0) {
+            std::string response;
+            AppendPlaybackResponse(&response, false, "invalid_request", "incomplete playback request", current, nullptr);
+            return SendJson(req, response.c_str(), "400 Bad Request");
+        }
+        received_total += received;
+    }
+    JsonDocument input;
+    if (deserializeJson(input, body) != DeserializationError::Ok) {
+        std::string response;
+        AppendPlaybackResponse(&response, false, "invalid_request", "invalid playback JSON", current, nullptr);
+        return SendJson(req, response.c_str(), "400 Bad Request");
+    }
+
+    const RequestId request_id = input["request_id"] | "";
+    const std::string mode_text = input["mode"] | "";
+    const std::string order_text = input["order"] | "";
+    const Revision expected_revision = input["expected_revision"] | 0ULL;
+    const std::uint32_t interval_seconds = input["interval_seconds"] | 0U;
+    const bool valid = !request_id.empty() && request_id.size() <= 64 &&
+                       !input["expected_revision"].isNull() && !input["interval_seconds"].isNull() &&
+                       (mode_text == "auto" || mode_text == "paused") &&
+                       (order_text == "sequential" || order_text == "random") &&
+                       LocalAlbumPlaybackService::IsAllowedInterval(interval_seconds);
+    if (!valid) {
+        std::string response;
+        AppendPlaybackResponse(&response, false, "invalid_request", "invalid playback configuration", current, &request_id);
+        return SendJson(req, response.c_str(), "400 Bad Request");
+    }
+
+    const std::string fingerprint = PlaybackRequestFingerprint(expected_revision, mode_text, interval_seconds, order_text);
+    if (const auto* existing = FindPlaybackRequestRecord(request_id); existing != nullptr) {
+        if (existing->fingerprint != fingerprint) {
+            std::string response;
+            AppendPlaybackResponse(&response, false, "request_id_conflict", "request_id was already used for a different playback configuration", current, &request_id);
+            return SendJson(req, response.c_str(), "409 Conflict");
+        }
+        std::string response;
+        // Preserve idempotent configuration semantics, but do not replay a
+        // stale countdown from the bounded request cache.
+        const PlaybackSnapshot replay =
+            current.config.revision == existing->snapshot.config.revision ? current : existing->snapshot;
+        AppendPlaybackResponse(&response, true, "playback_saved", "playback configuration already saved", replay, &request_id);
+        return SendJson(req, response.c_str());
+    }
+
+    PlaybackSnapshot updated;
+    const esp_err_t result = GetLocalAlbumPlaybackService().UpdateConfig(
+        mode_text == "auto" ? PlaybackMode::kAuto : PlaybackMode::kPaused,
+        interval_seconds,
+        order_text == "random" ? PlaybackOrder::kRandom : PlaybackOrder::kSequential,
+        expected_revision, &updated);
+    if (result == ESP_ERR_INVALID_STATE) {
+        std::string response;
+        AppendPlaybackResponse(&response, false, "revision_conflict", "playback configuration changed on device", updated, &request_id);
+        return SendJson(req, response.c_str(), "409 Conflict");
+    }
+    if (result != ESP_OK) {
+        std::string response;
+        AppendPlaybackResponse(&response, false, "playback_update_failed", "unable to save playback configuration", updated, &request_id);
+        return SendJson(req, response.c_str(), "503 Service Unavailable");
+    }
+    RememberPlaybackRequest(request_id, fingerprint, updated);
+    std::string response;
+    AppendPlaybackResponse(&response, true, "playback_saved", "playback configuration saved", updated, &request_id);
+    return SendJson(req, response.c_str());
 }
 
 esp_err_t Health(httpd_req_t* req) {
@@ -355,6 +526,7 @@ esp_err_t DeleteMedia(httpd_req_t* req) {
     if (!GetMediaLibrary().RemoveCommitted(item.media_id, expected_revision)) {
         return SendJson(req, "{\"ok\":false,\"code\":\"media_index_update_failed\"}", "500 Internal Server Error");
     }
+    GetLocalAlbumPlaybackService().NotifyMediaDeleted(item.media_id);
     std::string response = "{\"ok\":true,\"code\":\"media_deleted\",\"data\":{\"media_id\":\"" + item.media_id + "\",\"revision\":";
     AppendUInt64(&response, GetMediaLibrary().revision());
     response.append("}}");
@@ -518,6 +690,8 @@ esp_err_t RegisterProductApi(httpd_handle_t server) {
         {.uri="/api/v1/device/capabilities", .method=HTTP_GET, .handler=Capabilities, .user_ctx=nullptr},
         {.uri="/api/v1/device/status", .method=HTTP_GET, .handler=Status, .user_ctx=nullptr},
         {.uri="/api/v1/display/status", .method=HTTP_GET, .handler=DisplayStatus, .user_ctx=nullptr},
+        {.uri="/api/v1/local-album/playback", .method=HTTP_GET, .handler=GetLocalAlbumPlayback, .user_ctx=nullptr},
+        {.uri="/api/v1/local-album/playback", .method=HTTP_POST, .handler=UpdateLocalAlbumPlayback, .user_ctx=nullptr},
         {.uri="/api/v1/network/status", .method=HTTP_GET, .handler=NetworkStatus, .user_ctx=nullptr},
         {.uri="/api/v1/network/scan", .method=HTTP_POST, .handler=ScanWifi, .user_ctx=nullptr},
         {.uri="/api/v1/network/sta", .method=HTTP_POST, .handler=ConfigureSta, .user_ctx=nullptr},

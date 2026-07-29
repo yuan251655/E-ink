@@ -14,6 +14,7 @@
 #include "user_app.h"
 #include "storage_runtime.h"
 #include "media_library_runtime.h"
+#include "local_album_playback_runtime.h"
 #include "display_runtime.h"
 #include "indicator_service.h"
 #include "mode_manager.h"
@@ -78,6 +79,7 @@ extern "C" void app_main(void) {
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "LED indicator service unavailable: %s", esp_err_to_name(ret));
     }
+    bool product_display_ready = false;
     ret = photopainter::product::InitializeProductStorage(SDPort);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Product storage unavailable; continuing official compatibility flow");
@@ -88,7 +90,11 @@ extern "C" void app_main(void) {
         } else {
             photopainter::product::GetModeManager().Initialize(photopainter::product::Feature::kLocalAlbum);
             ret = photopainter::product::InitializeDisplayService();
-            if (ret != ESP_OK) ESP_LOGW(TAG, "Display service unavailable; continuing official compatibility flow");
+            if (ret != ESP_OK) {
+                ESP_LOGW(TAG, "Display service unavailable; continuing official compatibility flow");
+            } else {
+                product_display_ready = true;
+            }
         }
     }
 
@@ -98,6 +104,10 @@ extern "C" void app_main(void) {
         app.Start();
     } else if (read_value == 0x01) {
         ESP_LOGW("main","Enter local album product mode");
+        if (product_display_ready) {
+            ret = photopainter::product::InitializeLocalAlbumPlaybackService();
+            if (ret != ESP_OK) ESP_LOGW(TAG, "Local album playback unavailable; continuing without auto playback");
+        }
         ServerPort_StartProductLocalApi(SDPort);
     } else if (read_value == 0x02) {
         ESP_LOGW("main","Enter Network mode");
