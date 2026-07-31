@@ -11,6 +11,7 @@
 #include "esp_timer.h"
 #include "display_runtime.h"
 #include "display_service.h"
+#include "device_log_service.h"
 #include "job_service.h"
 #include "job_runtime.h"
 #include "local_album_playback_runtime.h"
@@ -331,12 +332,42 @@ esp_err_t Health(httpd_req_t* req) {
     return SendJson(req, "{\"ok\":true,\"code\":\"ok\",\"message\":\"ready\",\"data\":{\"api_version\":\"v1\"}}");
 }
 
+esp_err_t Logs(httpd_req_t* req) {
+    std::size_t limit = 30;
+    char query[48]{};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char value[8]{};
+        if (httpd_query_key_value(query, "limit", value, sizeof(value)) == ESP_OK) {
+            const long parsed = std::strtol(value, nullptr, 10);
+            if (parsed > 0) limit = static_cast<std::size_t>(parsed > 100 ? 100 : parsed);
+        }
+    }
+    const auto entries = GetDeviceLogService().Recent(limit);
+    std::string body = "{\"ok\":true,\"code\":\"ok\",\"data\":{\"entries\":[";
+    for (std::size_t index = 0; index < entries.size(); ++index) {
+        if (index != 0) body.push_back(',');
+        const auto& entry = entries[index];
+        body.append("{\"uptime_ms\":"); AppendUInt64(&body, entry.uptime_ms);
+        body.append(",\"severity\":"); AppendJsonString(&body, DeviceLogSeverityName(entry.severity));
+        body.append(",\"component\":"); AppendJsonString(&body, entry.component);
+        body.append(",\"code\":"); AppendJsonString(&body, entry.code);
+        body.append(",\"message\":"); AppendJsonString(&body, entry.message);
+        body.push_back('}');
+    }
+    body.append("],\"next_cursor\":null}}");
+    return SendJson(req, body.c_str());
+}
+
 esp_err_t Capabilities(httpd_req_t* req) {
     return SendJson(req, "{\"ok\":true,\"code\":\"ok\",\"data\":{\"api_version\":\"v1\",\"media_upload_modes\":[\"bin_only\"],\"supports_media_preview\":true,\"preview_format\":\"indexed_4bpp_bin\",\"display_width\":800,\"display_height\":480,\"frame_bytes\":192000}}");
 }
 
 esp_err_t UploadMedia(httpd_req_t* req) {
     const auto result = ReceiveBinOnlyMultipart(req, GetStorageService(), GetMediaLibrary(), GetProductJobService());
+    GetDeviceLogService().Add(
+        result.error == ESP_OK ? DeviceLogSeverity::kInfo : DeviceLogSeverity::kWarning,
+        "media", result.error == ESP_OK ? "upload_accepted" : "upload_rejected",
+        result.error == ESP_OK ? "图片已保存到相册" : "图片保存未完成");
     char body[320];
     std::snprintf(body, sizeof(body), "{\"ok\":%s,\"code\":\"%s\",\"data\":{\"job_id\":\"%s\",\"state\":%u,\"phase\":\"%s\",\"media_id\":\"%s\"}}", result.error == ESP_OK ? "true" : "false", result.code.c_str(), result.job.job_id.c_str(), static_cast<unsigned>(result.job.state), result.job.phase.c_str(), result.job.media_id.c_str());
     if (result.error == ESP_OK) return SendJson(req, body, "202 Accepted");
@@ -597,8 +628,15 @@ esp_err_t RemountStorage(httpd_req_t* req) {
     const std::string request_id = deserializeJson(input, input_body) == DeserializationError::Ok ? (input["request_id"] | "") : "";
     if (request_id.empty() || request_id.size() > 64) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
     const esp_err_t result = GetStorageService().Remount();
-    if (result == ESP_ERR_INVALID_STATE) return SendJson(req, "{\"ok\":false,\"code\":\"storage_busy\"}", "503 Service Unavailable");
-    if (result != ESP_OK) return SendJson(req, "{\"ok\":false,\"code\":\"storage_unavailable\"}", "503 Service Unavailable");
+    if (result == ESP_ERR_INVALID_STATE) {
+        GetDeviceLogService().Add(DeviceLogSeverity::kWarning, "storage", "remount_busy", "TF 卡正在使用中，未执行重新检测");
+        return SendJson(req, "{\"ok\":false,\"code\":\"storage_busy\"}", "503 Service Unavailable");
+    }
+    if (result != ESP_OK) {
+        GetDeviceLogService().Add(DeviceLogSeverity::kError, "storage", "remount_failed", "TF 卡重新检测失败");
+        return SendJson(req, "{\"ok\":false,\"code\":\"storage_unavailable\"}", "503 Service Unavailable");
+    }
+    GetDeviceLogService().Add(DeviceLogSeverity::kInfo, "storage", "remounted", "TF 卡重新检测完成");
     std::string body = "{\"ok\":true,\"code\":\"storage_remounted\",\"data\":{\"storage\":";
     AppendStorageHealth(&body, GetStorageService().GetSnapshot());
     body.append("}}");
@@ -748,6 +786,7 @@ esp_err_t RegisterProductApi(httpd_handle_t server) {
         {.uri="/api/v1/health", .method=HTTP_GET, .handler=Health, .user_ctx=nullptr},
         {.uri="/api/v1/device/capabilities", .method=HTTP_GET, .handler=Capabilities, .user_ctx=nullptr},
         {.uri="/api/v1/device/status", .method=HTTP_GET, .handler=Status, .user_ctx=nullptr},
+        {.uri="/api/v1/logs", .method=HTTP_GET, .handler=Logs, .user_ctx=nullptr},
         {.uri="/api/v1/storage/status", .method=HTTP_GET, .handler=StorageStatus, .user_ctx=nullptr},
         {.uri="/api/v1/storage/remount", .method=HTTP_POST, .handler=RemountStorage, .user_ctx=nullptr},
         // Transitional aliases. New App code must use status/remount.

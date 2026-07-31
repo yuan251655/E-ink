@@ -17,11 +17,14 @@
 #include "local_album_playback_runtime.h"
 #include "display_runtime.h"
 #include "indicator_service.h"
+#include "device_log_service.h"
 #include "mode_manager.h"
 
 #define TAG "main"
 
 extern "C" void app_main(void) {
+    photopainter::product::GetDeviceLogService().Add(
+        photopainter::product::DeviceLogSeverity::kInfo, "system", "boot", "设备启动");
     // Initialize the default event loop
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
