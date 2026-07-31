@@ -15,6 +15,17 @@ class CustomSDPort;
 
 namespace photopainter::product {
 
+enum class DeleteMutationState : std::uint8_t {
+    kNotStarted,
+    kMayHaveMutated,
+    kRemoved,
+};
+
+struct DeleteCommittedMediaResult {
+    esp_err_t error = ESP_FAIL;
+    DeleteMutationState mutation = DeleteMutationState::kNotStarted;
+};
+
 // Product-layer TF adapter. It borrows the already-mounted official SDMMC BSP;
 // it never owns the card lifecycle or changes board pin configuration.
 class StorageService {
@@ -62,10 +73,13 @@ public:
                                 std::string* output);
     esp_err_t GetCommittedFileSize(const std::string& relative_path,
                                    std::uint64_t* output_bytes);
-    esp_err_t ListCommittedMediaIds(std::vector<MediaId>* output_media_ids);
+    // Enumerates categorized media plus legacy flat media/<id> entries. New
+    // writes use media/local/<id> or media/ai/<id>; legacy entries are exposed
+    // as local without moving or rewriting user data.
+    esp_err_t ListCommittedMedia(std::vector<CommittedMediaLocation>* output_locations);
     // Permanently removes one committed media directory. It never accepts a
     // caller-provided TF path and refuses while an upload transaction is live.
-    esp_err_t DeleteCommittedMedia(const MediaId& media_id);
+    DeleteCommittedMediaResult DeleteCommittedMedia(const std::string& relative_directory);
 
     bool IsReady() const;
     bool HasActiveWriteTransaction() const;
@@ -83,6 +97,9 @@ private:
     bool IsSafeRelativePath(const std::string& path) const;
     bool IsSafeTransactionId(const TransactionId& transaction_id) const;
     bool IsSafeMediaDirectory(const std::string& final_media_directory) const;
+    bool IsSafeCommittedMediaDirectory(const std::string& relative_directory) const;
+    bool CommittedMediaIdExistsLocked(const MediaId& media_id) const;
+    MediaId MediaIdFromCategorizedDirectory(const std::string& relative_directory) const;
     std::string StagingDirectoryLocked() const;
     void SetErrorLocked(const char* code);
 

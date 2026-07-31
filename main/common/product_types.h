@@ -119,6 +119,7 @@ struct MediaItem {
     // User-facing file label supplied at admission time.  It is metadata only:
     // callers never use it to construct a TF path.
     std::string display_name;
+    Feature feature = Feature::kLocalAlbum;
     MediaCategory category = MediaCategory::kLocal;
     DisplayProfile display_profile;
     EpochMs created_at_ms = 0;
@@ -128,6 +129,15 @@ struct MediaItem {
     FileDescriptor frame;
     std::uint32_t manifest_version = 1;
     Revision revision = 0;
+    // Product-internal committed directory (for example media/ai/<id> or a
+    // legacy media/<id>). It is never serialized by the public API.
+    std::string storage_relative_directory;
+};
+
+struct CommittedMediaLocation {
+    MediaCategory category = MediaCategory::kLocal;
+    MediaId media_id;
+    std::string relative_directory;
 };
 
 struct StorageSnapshot {
@@ -143,6 +153,8 @@ struct StorageSnapshot {
     std::uint64_t reserve_bytes = 0;
     std::uint32_t local_media_count = 0;
     std::uint64_t local_media_bytes = 0;
+    std::uint32_t ai_media_count = 0;
+    std::uint64_t ai_media_bytes = 0;
     std::uint32_t staging_count = 0;
     std::uint64_t staging_bytes = 0;
     std::uint64_t last_remount_uptime_ms = 0;

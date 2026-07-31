@@ -17,6 +17,8 @@ public:
     esp_err_t Initialize(StorageService* storage, MediaLibrary* library, ePaperPort* display, SemaphoreHandle_t legacy_mutex);
     // A display request never writes TF. It runs the validated frame through
     // the sole e-paper worker and records its lifecycle in the shared job.
+    esp_err_t SubmitMedia(Feature feature, MediaCategory category, const MediaId& media_id,
+                          const JobId& job_id, JobService* jobs);
     esp_err_t SubmitLocal(const MediaId& media_id, const JobId& job_id, JobService* jobs);
     // ModeManager is the only caller allowed to submit a system mode cover.
     // The worker reports completion back to ModeManager, which commits the
@@ -24,10 +26,11 @@ public:
     esp_err_t SubmitModeCover(Feature feature, const JobId& job_id, JobService* jobs);
     DisplaySnapshot GetSnapshot() const;
 private:
-    enum class WorkKind : std::uint8_t { kLocalMedia, kModeCover };
+    enum class WorkKind : std::uint8_t { kMedia, kModeCover };
     struct WorkItem {
-        WorkKind kind = WorkKind::kLocalMedia;
+        WorkKind kind = WorkKind::kMedia;
         Feature feature = Feature::kLocalAlbum;
+        MediaCategory category = MediaCategory::kLocal;
         char media_id[65];
         char job_id[65];
     };

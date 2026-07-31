@@ -30,10 +30,16 @@ public:
     bool FindAdjacent(MediaCategory category, const MediaId& current_media_id,
                       int direction, MediaItem* output) const;
 
-    // Admit one already atomically committed /media/<media_id> directory.
+    // Admit one already atomically committed categorized media directory.
     // The item becomes visible only after its manifest and 192000-byte frame
     // have both been validated.  It is safe to call after a successful retry.
-    esp_err_t RegisterCommitted(const MediaId& media_id);
+    esp_err_t RegisterCommitted(MediaCategory category, const MediaId& media_id);
+    // Re-admits the exact categorized or legacy directory after a reversible
+    // delete attempt failed before storage removal completed.
+    esp_err_t RestoreCommitted(const MediaItem& removed_item);
+    // Restores a previously indexed and validated snapshot without touching
+    // TF. Only use when StorageService confirms deletion never started.
+    esp_err_t RestoreSnapshot(const MediaItem& removed_item);
     // Removes an item from the in-memory index only when the caller still
     // holds the revision observed before destructive storage work.
     bool RemoveCommitted(const MediaId& media_id, Revision expected_item_revision);
@@ -42,8 +48,10 @@ public:
     Revision revision() const;
 
 private:
-    esp_err_t LoadManifest(const MediaId& expected_id, MediaItem* output) const;
+    esp_err_t LoadManifest(const CommittedMediaLocation& location, MediaItem* output) const;
     esp_err_t ValidateFrameForDisplay(const MediaItem& item) const;
+    esp_err_t ValidateCommittedItem(const MediaItem& item) const;
+    bool IsValidSnapshotLocation(const MediaItem& item) const;
     void SortItemsLocked();
 
     StorageService* storage_ = nullptr;

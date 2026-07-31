@@ -163,10 +163,22 @@ void AppendMediaItemJson(std::string* output, const MediaItem& item) {
     AppendJsonString(output, item.source.mime_type);
     output->append(",\"bytes\":");
     AppendUInt64(output, item.source.bytes);
+    output->append(",\"sha256\":");
+    AppendJsonString(output, item.source.sha256);
     output->append("},\"preview\":{\"present\":").append(item.preview.present ? "true" : "false")
-        .append("},\"frame\":{\"present\":").append(item.frame.present ? "true" : "false")
-        .append(",\"bytes\":");
+        .append(",\"mime_type\":");
+    AppendJsonString(output, item.preview.mime_type);
+    output->append(",\"bytes\":");
+    AppendUInt64(output, item.preview.bytes);
+    output->append(",\"sha256\":");
+    AppendJsonString(output, item.preview.sha256);
+    output->append("},\"frame\":{\"present\":").append(item.frame.present ? "true" : "false")
+        .append(",\"mime_type\":");
+    AppendJsonString(output, item.frame.mime_type);
+    output->append(",\"bytes\":");
     AppendUInt64(output, item.frame.bytes);
+    output->append(",\"sha256\":");
+    AppendJsonString(output, item.frame.sha256);
     output->append("},\"manifest_version\":").append(std::to_string(item.manifest_version))
         .append(",\"revision\":");
     AppendUInt64(output, item.revision);
@@ -273,23 +285,27 @@ bool ParseDisplayRequest(httpd_req_t* req, RequestId* request_id, Revision* expe
            (*after_display == "continue" || *after_display == "hold");
 }
 
-esp_err_t SubmitLocalDisplay(httpd_req_t* req, const MediaId& media_id, const RequestId& request_id,
+esp_err_t SubmitMediaDisplay(httpd_req_t* req, const MediaId& media_id, const RequestId& request_id,
                              Revision expected_revision, const std::string& after_display) {
-    const ModeSnapshot mode = GetModeManager().GetSnapshot();
-    if (mode.active_feature != Feature::kLocalAlbum) return SendJson(req, "{\"ok\":false,\"code\":\"mode_changed\"}", "409 Conflict");
-    if (mode.state != ModeSnapshot::State::kIdle) return SendJson(req, "{\"ok\":false,\"code\":\"mode_switch_busy\"}", "409 Conflict");
-    if (expected_revision != mode.revision) return SendJson(req, "{\"ok\":false,\"code\":\"revision_conflict\"}", "409 Conflict");
     MediaItem item;
-    if (!GetMediaLibrary().Find(media_id, &item) || item.category != MediaCategory::kLocal ||
+    if (!GetMediaLibrary().Find(media_id, &item) ||
+        (item.category != MediaCategory::kLocal && item.category != MediaCategory::kAi) ||
         GetMediaLibrary().ValidateFrameForDisplay(media_id) != ESP_OK) {
         return SendJson(req, "{\"ok\":false,\"code\":\"media_invalid\"}", "422 Unprocessable Entity");
     }
+    const Feature owner = item.category == MediaCategory::kAi ? Feature::kAiAlbum : Feature::kLocalAlbum;
+    const ModeSnapshot mode = GetModeManager().GetSnapshot();
+    if (mode.active_feature != owner) return SendJson(req, "{\"ok\":false,\"code\":\"mode_changed\"}", "409 Conflict");
+    if (mode.state != ModeSnapshot::State::kIdle) return SendJson(req, "{\"ok\":false,\"code\":\"mode_switch_busy\"}", "409 Conflict");
+    if (expected_revision != mode.revision) return SendJson(req, "{\"ok\":false,\"code\":\"revision_conflict\"}", "409 Conflict");
     JobSnapshot job;
-    const std::string fingerprint = "display:" + media_id + ":" + std::to_string(mode.revision) + ":" + after_display;
+    const std::string fingerprint = "display:" + std::string(CategoryName(item.category)) + ":" + media_id +
+                                    ":" + std::to_string(mode.revision) + ":" + after_display;
     const JobRegistrationResult registration = GetProductJobService().CreateOrFind(JobKind::kDisplay, request_id, fingerprint, &job);
     if (registration == JobRegistrationResult::kRequestIdConflict) return SendJson(req, "{\"ok\":false,\"code\":\"request_id_conflict\"}", "409 Conflict");
     if (registration != JobRegistrationResult::kCreated && registration != JobRegistrationResult::kExisting) return SendJson(req, "{\"ok\":false,\"code\":\"display_busy\"}", "503 Service Unavailable");
-    if (registration == JobRegistrationResult::kCreated && GetDisplayService().SubmitLocal(media_id, job.job_id, &GetProductJobService()) != ESP_OK) {
+    if (registration == JobRegistrationResult::kCreated &&
+        GetDisplayService().SubmitMedia(owner, item.category, media_id, job.job_id, &GetProductJobService()) != ESP_OK) {
         (void)GetProductJobService().Update(job.job_id, JobState::kFailed, "failed", 0, "display_busy");
         return SendJson(req, "{\"ok\":false,\"code\":\"display_busy\"}", "503 Service Unavailable");
     }
@@ -556,15 +572,20 @@ esp_err_t ListMedia(httpd_req_t* req) {
         (void)httpd_query_key_value(query, "cursor", cursor, sizeof(cursor));
         (void)httpd_query_key_value(query, "limit", limit_text, sizeof(limit_text));
     }
-    if (category[0] != '\0' && std::strcmp(category, "local") != 0) return SendJson(req, "{\"ok\":false,\"code\":\"unsupported\"}", "400 Bad Request");
+    MediaCategory requested_category = MediaCategory::kLocal;
+    if (category[0] != '\0') {
+        if (std::strcmp(category, "local") == 0) requested_category = MediaCategory::kLocal;
+        else if (std::strcmp(category, "ai") == 0) requested_category = MediaCategory::kAi;
+        else return SendJson(req, "{\"ok\":false,\"code\":\"unsupported\"}", "400 Bad Request");
+    }
     char* end = nullptr;
     const std::size_t offset = cursor[0] == '\0' ? 0 : static_cast<std::size_t>(std::strtoul(cursor, &end, 10));
     if (cursor[0] != '\0' && (end == cursor || *end != '\0')) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
     end = nullptr;
     const std::size_t limit = limit_text[0] == '\0' ? 20 : static_cast<std::size_t>(std::strtoul(limit_text, &end, 10));
     if (limit == 0 || limit > 30 || (limit_text[0] != '\0' && (end == limit_text || *end != '\0'))) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
-    const auto items = GetMediaLibrary().List(MediaCategory::kLocal, offset, limit);
-    const std::size_t total = GetMediaLibrary().Count(MediaCategory::kLocal);
+    const auto items = GetMediaLibrary().List(requested_category, offset, limit);
+    const std::size_t total = GetMediaLibrary().Count(requested_category);
     std::string body = "{\"ok\":true,\"code\":\"ok\",\"data\":{\"items\":[";
     for (std::size_t index = 0; index < items.size(); ++index) { if (index > 0) body.push_back(','); AppendMediaItemJson(&body, items[index]); }
     body.append("],\"next_cursor\":\"");
@@ -616,7 +637,7 @@ esp_err_t GetMediaSource(httpd_req_t* req, const MediaId& media_id) {
     httpd_resp_set_type(req, item.source.mime_type.c_str());
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     const esp_err_t result = GetStorageService().StreamCommittedFile(
-        "media/" + item.media_id + "/" + source_file, item.source.bytes,
+        item.storage_relative_directory + "/" + source_file, item.source.bytes,
         [req](const void* data, std::size_t size) { return httpd_resp_send_chunk(req, static_cast<const char*>(data), size); });
     if (result != ESP_OK) return result;
     return httpd_resp_send_chunk(req, nullptr, 0);
@@ -632,7 +653,7 @@ esp_err_t GetMediaPreview(httpd_req_t* req, const MediaId& media_id) {
     httpd_resp_set_type(req, "application/octet-stream");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     const esp_err_t result = GetStorageService().StreamCommittedFile(
-        "media/" + item.media_id + "/image.bin", item.frame.bytes,
+        item.storage_relative_directory + "/image.bin", item.frame.bytes,
         [req](const void* data, std::size_t size) { return httpd_resp_send_chunk(req, static_cast<const char*>(data), size); });
     if (result != ESP_OK) return result;
     return httpd_resp_send_chunk(req, nullptr, 0);
@@ -658,7 +679,7 @@ esp_err_t StepMedia(httpd_req_t* req) {
                                         direction == "next" ? 1 : -1, &target)) {
         return SendJson(req, "{\"ok\":false,\"code\":\"media_not_found\"}", "404 Not Found");
     }
-    return SubmitLocalDisplay(req, target.media_id, request_id, expected_revision, after_display);
+    return SubmitMediaDisplay(req, target.media_id, request_id, expected_revision, after_display);
 }
 
 esp_err_t DisplayMedia(httpd_req_t* req) {
@@ -673,7 +694,7 @@ esp_err_t DisplayMedia(httpd_req_t* req) {
     Revision expected_revision = 0;
     std::string after_display;
     if (!ParseDisplayRequest(req, &request_id, &expected_revision, &after_display)) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
-    return SubmitLocalDisplay(req, media_id, request_id, expected_revision, after_display);
+    return SubmitMediaDisplay(req, media_id, request_id, expected_revision, after_display);
 }
 
 bool IsRefreshInProgress(DisplayState state) {
@@ -709,14 +730,29 @@ esp_err_t DeleteMedia(httpd_req_t* req) {
         return SendJson(req, "{\"ok\":false,\"code\":\"current_media_protected\"}", "409 Conflict");
     }
     if (IsRefreshInProgress(display.state)) return SendJson(req, "{\"ok\":false,\"code\":\"display_busy\"}", "409 Conflict");
-    const esp_err_t removed = GetStorageService().DeleteCommittedMedia(item.media_id);
-    if (removed == ESP_ERR_NOT_FOUND) return SendJson(req, "{\"ok\":false,\"code\":\"media_not_found\"}", "404 Not Found");
-    if (removed == ESP_ERR_INVALID_STATE) return SendJson(req, "{\"ok\":false,\"code\":\"storage_busy\"}", "503 Service Unavailable");
-    if (removed != ESP_OK) return SendJson(req, "{\"ok\":false,\"code\":\"storage_delete_failed\"}", "500 Internal Server Error");
     if (!GetMediaLibrary().RemoveCommitted(item.media_id, expected_revision)) {
-        return SendJson(req, "{\"ok\":false,\"code\":\"media_index_update_failed\"}", "500 Internal Server Error");
+        return SendJson(req, "{\"ok\":false,\"code\":\"revision_conflict\"}", "409 Conflict");
     }
-    GetLocalAlbumPlaybackService().NotifyMediaDeleted(item.media_id);
+    const DeleteCommittedMediaResult deletion = GetStorageService().DeleteCommittedMedia(item.storage_relative_directory);
+    if (deletion.error != ESP_OK) {
+        // If the directory was already absent, keeping the index entry would
+        // recreate a ghost media item. The index removal is the consistent,
+        // recoverable result in that specific case.
+        if (deletion.error == ESP_ERR_NOT_FOUND) {
+            return SendJson(req, "{\"ok\":false,\"code\":\"media_not_found\"}", "404 Not Found");
+        }
+        const esp_err_t restored = deletion.mutation == DeleteMutationState::kNotStarted
+            ? GetMediaLibrary().RestoreSnapshot(item)
+            : GetMediaLibrary().RestoreCommitted(item);
+        if (restored != ESP_OK) {
+            return SendJson(req, "{\"ok\":false,\"code\":\"media_delete_incomplete\"}", "500 Internal Server Error");
+        }
+        if (deletion.error == ESP_ERR_INVALID_STATE) return SendJson(req, "{\"ok\":false,\"code\":\"storage_busy\"}", "503 Service Unavailable");
+        return SendJson(req, "{\"ok\":false,\"code\":\"storage_delete_failed\"}", "500 Internal Server Error");
+    }
+    if (item.category == MediaCategory::kLocal) {
+        GetLocalAlbumPlaybackService().NotifyMediaDeleted(item.media_id);
+    }
     std::string response = "{\"ok\":true,\"code\":\"media_deleted\",\"data\":{\"media_id\":\"" + item.media_id + "\",\"revision\":";
     AppendUInt64(&response, GetMediaLibrary().revision());
     response.append("}}");
@@ -758,7 +794,9 @@ void AppendStorageHealth(std::string* body, const StorageSnapshot& storage) {
     body->append(",\"free_bytes\":"); AppendUInt64(body, storage.free_bytes);
     body->append(",\"usage\":{\"local\":{\"item_count\":").append(std::to_string(storage.local_media_count)).append(",\"bytes\":");
     AppendUInt64(body, storage.local_media_bytes);
-    body->append("},\"ai\":{\"item_count\":0,\"bytes\":0},\"dashboard\":{\"item_count\":0,\"bytes\":0},\"logs\":{\"item_count\":0,\"bytes\":0},\"staging\":{\"item_count\":").append(std::to_string(storage.staging_count)).append(",\"bytes\":");
+    body->append("},\"ai\":{\"item_count\":").append(std::to_string(storage.ai_media_count)).append(",\"bytes\":");
+    AppendUInt64(body, storage.ai_media_bytes);
+    body->append("},\"dashboard\":{\"item_count\":0,\"bytes\":0},\"logs\":{\"item_count\":0,\"bytes\":0},\"staging\":{\"item_count\":").append(std::to_string(storage.staging_count)).append(",\"bytes\":");
     AppendUInt64(body, storage.staging_bytes);
     body->append("},\"system\":{\"item_count\":0,\"bytes\":0}},\"active_operation\":");
     if (storage.active_transaction_id.empty()) body->append("null"); else body->append("\"upload\"");

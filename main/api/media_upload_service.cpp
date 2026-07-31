@@ -427,11 +427,11 @@ MediaUploadResult ReceiveBinOnlyMultipart(httpd_req_t* request,
         failure = storage.AppendStagedFile("manifest.json", manifest_json.data(), manifest_json.size(), true);
         if (failure == ESP_OK) failure = storage.FinalizeStagedFile("manifest.json", manifest_json.size());
         if (failure == ESP_OK) {
-            failure = storage.CommitTransaction("media/" + media_id);
+            failure = storage.CommitTransaction("media/local/" + media_id);
             if (failure != ESP_OK) ESP_LOGE(kTag, "media commit failed: %s", esp_err_to_name(failure));
         }
         if (failure == ESP_OK) {
-            failure = media_library.RegisterCommitted(media_id);
+            failure = media_library.RegisterCommitted(MediaCategory::kLocal, media_id);
             if (failure != ESP_OK) ESP_LOGE(kTag, "media register failed: %s", esp_err_to_name(failure));
         }
         if (failure == ESP_OK && jobs.CompleteSuccess(result.job.job_id, media_id)) {

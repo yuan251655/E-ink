@@ -19,6 +19,14 @@ esp_err_t DisplayService::Initialize(StorageService* storage, MediaLibrary* libr
     return xTaskCreate(WorkerEntry, "display_service", 6144, this, 4, &worker_) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }
 esp_err_t DisplayService::SubmitLocal(const MediaId& media_id, const JobId& job_id, JobService* jobs) {
+    return SubmitMedia(Feature::kLocalAlbum, MediaCategory::kLocal, media_id, job_id, jobs);
+}
+
+esp_err_t DisplayService::SubmitMedia(Feature feature, MediaCategory category, const MediaId& media_id,
+                                      const JobId& job_id, JobService* jobs) {
+    const bool valid_owner = (feature == Feature::kLocalAlbum && category == MediaCategory::kLocal) ||
+                             (feature == Feature::kAiAlbum && category == MediaCategory::kAi);
+    if (!valid_owner) return ESP_ERR_INVALID_ARG;
     if (!queue_ || !state_mutex_ || !jobs || media_id.empty() || job_id.empty() || media_id.size() >= 65 || job_id.size() >= 65) return ESP_ERR_INVALID_ARG;
     xSemaphoreTake(state_mutex_, portMAX_DELAY);
     if (snapshot_.state == DisplayState::kQueued || snapshot_.state == DisplayState::kLoading ||
@@ -26,7 +34,7 @@ esp_err_t DisplayService::SubmitLocal(const MediaId& media_id, const JobId& job_
         xSemaphoreGive(state_mutex_);
         return ESP_ERR_INVALID_STATE;
     }
-    WorkItem item{}; item.kind = WorkKind::kLocalMedia; item.feature = Feature::kLocalAlbum;
+    WorkItem item{}; item.kind = WorkKind::kMedia; item.feature = feature; item.category = category;
     std::strncpy(item.media_id, media_id.c_str(), sizeof(item.media_id) - 1); std::strncpy(item.job_id, job_id.c_str(), sizeof(item.job_id) - 1);
     jobs_ = jobs;
     snapshot_.state = DisplayState::kQueued; snapshot_.queued_target_media_id = media_id; snapshot_.active_job_id = job_id;
@@ -74,8 +82,12 @@ void DisplayService::WorkerLoop() {
         if (jobs_) (void)jobs_->Update(job_id, JobState::kRunning, mode_cover ? "preparing" : "loading", 15);
         ModeCoverAsset asset;
         const esp_err_t asset_result = mode_cover ? GetModeCoverAsset(item.feature, &asset) : ESP_OK;
-        if ((!mode_cover && library_->ValidateFrameForDisplay(media_id) != ESP_OK) ||
-            (mode_cover && asset_result != ESP_OK) || xSemaphoreTake(legacy_mutex_, portMAX_DELAY) != pdTRUE) {
+        MediaItem media;
+        const bool media_valid = mode_cover ||
+            (library_->Find(media_id, &media) && media.feature == item.feature && media.category == item.category &&
+             library_->ValidateFrameForDisplay(media_id) == ESP_OK);
+        if (!media_valid || (mode_cover && asset_result != ESP_OK) ||
+            xSemaphoreTake(legacy_mutex_, portMAX_DELAY) != pdTRUE) {
             const std::string error = mode_cover ? "mode_cover_unavailable" : "media_invalid";
             xSemaphoreTake(state_mutex_, portMAX_DELAY);
             snapshot_.state = DisplayState::kFailed; snapshot_.last_error_code = error;
@@ -92,7 +104,8 @@ void DisplayService::WorkerLoop() {
         display_->EPD_Init();
         esp_err_t result = ESP_OK;
         if (mode_cover) std::memcpy(display_->EPD_GetIMGBuffer(), asset.data, asset.size);
-        else result = storage_->ReadCommittedFile("media/" + media_id + "/image.bin", display_->EPD_GetIMGBuffer(), kDisplayFrameBytes);
+        else result = storage_->ReadCommittedFile(media.storage_relative_directory + "/image.bin",
+                                                  display_->EPD_GetIMGBuffer(), kDisplayFrameBytes);
         bool refresh_indicator_active = false;
         if (result == ESP_OK) {
             xSemaphoreTake(state_mutex_, portMAX_DELAY); snapshot_.state = DisplayState::kRefreshing; xSemaphoreGive(state_mutex_);
@@ -128,7 +141,7 @@ void DisplayService::WorkerLoop() {
             xSemaphoreGive(state_mutex_);
             if (mode_cover) GetModeManager().CompleteSwitch(job_id, item.feature, asset.system_asset_id);
             else {
-                GetModeManager().RecordDisplayedMedia(Feature::kLocalAlbum, MediaCategory::kLocal, media_id);
+                GetModeManager().RecordDisplayedMedia(media.feature, media.category, media_id);
                 if (jobs_) (void)jobs_->CompleteSuccess(job_id, media_id);
             }
             xSemaphoreTake(state_mutex_, portMAX_DELAY); snapshot_.state = DisplayState::kSuccess; xSemaphoreGive(state_mutex_);

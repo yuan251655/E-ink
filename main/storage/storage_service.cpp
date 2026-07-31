@@ -64,6 +64,12 @@ esp_err_t StorageService::Initialize(CustomSDPort* sd_port) {
         result = EnsureDirectoryTreeLocked(mount_point_ + "/media");
     }
     if (result == ESP_OK) {
+        result = EnsureDirectoryTreeLocked(mount_point_ + "/media/local");
+    }
+    if (result == ESP_OK) {
+        result = EnsureDirectoryTreeLocked(mount_point_ + "/media/ai");
+    }
+    if (result == ESP_OK) {
         result = EnsureDirectoryTreeLocked(mount_point_ + "/.staging");
     }
     if (result == ESP_OK) {
@@ -118,6 +124,8 @@ esp_err_t StorageService::Remount() {
     esp_err_t result = sd_port_ == nullptr ? ESP_ERR_INVALID_STATE : sd_port_->SDPort_Remount();
     if (result == ESP_OK) {
         result = EnsureDirectoryTreeLocked(mount_point_ + "/media");
+        if (result == ESP_OK) result = EnsureDirectoryTreeLocked(mount_point_ + "/media/local");
+        if (result == ESP_OK) result = EnsureDirectoryTreeLocked(mount_point_ + "/media/ai");
         if (result == ESP_OK) result = EnsureDirectoryTreeLocked(mount_point_ + "/.staging");
         if (result == ESP_OK) result = EnsureDirectoryTreeLocked(mount_point_ + "/state");
         if (result == ESP_OK) result = EnsureDirectoryTreeLocked(mount_point_ + "/system");
@@ -251,6 +259,13 @@ esp_err_t StorageService::CommitTransaction(const std::string& final_media_direc
     xSemaphoreTake(mutex_, portMAX_DELAY);
     if (active_transaction_id_.empty()) {
         SetErrorLocked("storage_busy");
+        xSemaphoreGive(mutex_);
+        return ESP_ERR_INVALID_STATE;
+    }
+    const MediaId media_id = MediaIdFromCategorizedDirectory(final_media_directory);
+    if (media_id.empty() || CommittedMediaIdExistsLocked(media_id)) {
+        ESP_LOGW(kTag, "rejecting globally duplicated media id: %s", media_id.c_str());
+        SetErrorLocked("media_id_conflict");
         xSemaphoreGive(mutex_);
         return ESP_ERR_INVALID_STATE;
     }
@@ -424,55 +439,91 @@ esp_err_t StorageService::GetCommittedFileSize(const std::string& relative_path,
     return result;
 }
 
-esp_err_t StorageService::ListCommittedMediaIds(std::vector<MediaId>* output_media_ids) {
-    if (mutex_ == nullptr || output_media_ids == nullptr) return ESP_ERR_INVALID_ARG;
+esp_err_t StorageService::ListCommittedMedia(std::vector<CommittedMediaLocation>* output_locations) {
+    if (mutex_ == nullptr || output_locations == nullptr) return ESP_ERR_INVALID_ARG;
     xSemaphoreTake(mutex_, portMAX_DELAY);
     esp_err_t result = EnsureReadyLocked();
     if (result == ESP_OK) {
-        output_media_ids->clear();
-        DIR* directory = opendir((mount_point_ + "/media").c_str());
-        if (directory == nullptr) {
-            SetErrorLocked("storage_read_failed");
-            result = ESP_FAIL;
-        } else {
+        output_locations->clear();
+        const auto scan_category = [this, output_locations](MediaCategory category,
+                                                            const char* name) -> esp_err_t {
+            const std::string relative_root = std::string("media/") + name;
+            DIR* directory = opendir((mount_point_ + "/" + relative_root).c_str());
+            if (directory == nullptr) return ESP_FAIL;
             struct dirent* entry = nullptr;
             while ((entry = readdir(directory)) != nullptr) {
                 const std::string id = entry->d_name;
                 if (id == "." || id == ".." || !IsSafeTransactionId(id) ||
-                    !IsDirectory(mount_point_ + "/media/" + id)) continue;
-                output_media_ids->push_back(id);
+                    !IsDirectory(mount_point_ + "/" + relative_root + "/" + id)) continue;
+                output_locations->push_back({category, id, relative_root + "/" + id});
             }
             closedir(directory);
+            return ESP_OK;
+        };
+        result = scan_category(MediaCategory::kLocal, "local");
+        if (result == ESP_OK) result = scan_category(MediaCategory::kAi, "ai");
+        if (result == ESP_OK) {
+            // Legacy product builds stored local items directly below media/.
+            // Keep them readable in place; new writes never use this layout.
+            DIR* directory = opendir((mount_point_ + "/media").c_str());
+            if (directory == nullptr) {
+                result = ESP_FAIL;
+            } else {
+                struct dirent* entry = nullptr;
+                while ((entry = readdir(directory)) != nullptr) {
+                    const std::string id = entry->d_name;
+                    if (id == "." || id == ".." || id == "local" || id == "ai" ||
+                        !IsSafeTransactionId(id) || !IsDirectory(mount_point_ + "/media/" + id)) continue;
+                    output_locations->push_back({MediaCategory::kLocal, id, "media/" + id});
+                }
+                closedir(directory);
+            }
+        }
+        if (result != ESP_OK) {
+            SetErrorLocked("storage_read_failed");
         }
     }
     xSemaphoreGive(mutex_);
     return result;
 }
 
-esp_err_t StorageService::DeleteCommittedMedia(const MediaId& media_id) {
-    if (mutex_ == nullptr || !IsSafeTransactionId(media_id)) return ESP_ERR_INVALID_ARG;
+DeleteCommittedMediaResult StorageService::DeleteCommittedMedia(const std::string& relative_directory) {
+    DeleteCommittedMediaResult outcome;
+    if (mutex_ == nullptr || !IsSafeCommittedMediaDirectory(relative_directory)) {
+        outcome.error = ESP_ERR_INVALID_ARG;
+        return outcome;
+    }
     xSemaphoreTake(mutex_, portMAX_DELAY);
     esp_err_t result = EnsureReadyLocked();
-    if (result != ESP_OK) { xSemaphoreGive(mutex_); return result; }
+    if (result != ESP_OK) {
+        outcome.error = result;
+        xSemaphoreGive(mutex_);
+        return outcome;
+    }
     if (!active_transaction_id_.empty()) {
         SetErrorLocked("storage_busy");
+        outcome.error = ESP_ERR_INVALID_STATE;
         xSemaphoreGive(mutex_);
-        return ESP_ERR_INVALID_STATE;
+        return outcome;
     }
-    const std::string path = mount_point_ + "/media/" + media_id;
+    const std::string path = mount_point_ + "/" + relative_directory;
     if (!IsDirectory(path)) {
+        outcome.error = ESP_ERR_NOT_FOUND;
         xSemaphoreGive(mutex_);
-        return ESP_ERR_NOT_FOUND;
+        return outcome;
     }
+    outcome.mutation = DeleteMutationState::kMayHaveMutated;
     result = RemoveDirectoryTreeLocked(path);
     if (result == ESP_OK) {
+        outcome.mutation = DeleteMutationState::kRemoved;
         snapshot_.revision++;
         (void)RefreshSnapshotLocked();
     } else {
         SetErrorLocked("storage_delete_failed");
     }
+    outcome.error = result;
     xSemaphoreGive(mutex_);
-    return result;
+    return outcome;
 }
 
 bool StorageService::IsReady() const {
@@ -551,34 +602,71 @@ esp_err_t StorageService::MeasureDirectoryTreeLocked(const std::string& absolute
 esp_err_t StorageService::RefreshUsageLocked() {
     snapshot_.local_media_count = 0;
     snapshot_.local_media_bytes = 0;
+    snapshot_.ai_media_count = 0;
+    snapshot_.ai_media_bytes = 0;
     snapshot_.staging_count = 0;
     snapshot_.staging_bytes = 0;
-    const auto scan = [this](const std::string& root, bool media) -> esp_err_t {
+    const auto scan_media = [this](const std::string& root, MediaCategory category) -> esp_err_t {
         DIR* directory = opendir(root.c_str());
         if (directory == nullptr) return ESP_FAIL;
         struct dirent* entry = nullptr;
         while ((entry = readdir(directory)) != nullptr) {
             if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+            if (!IsSafeTransactionId(entry->d_name)) continue;
             const std::string child = root + "/" + entry->d_name;
             if (!IsDirectory(child)) continue;
             std::uint64_t bytes = 0;
             if (MeasureDirectoryTreeLocked(child, &bytes) != ESP_OK) { closedir(directory); return ESP_FAIL; }
-            if (media) {
-                // This product currently admits only category=local to media/.
-                // The classification remains private to StorageService; no
-                // raw paths or filenames are published by the health API.
+            if (category == MediaCategory::kLocal) {
                 ++snapshot_.local_media_count;
                 snapshot_.local_media_bytes += bytes;
             } else {
-                ++snapshot_.staging_count;
-                snapshot_.staging_bytes += bytes;
+                ++snapshot_.ai_media_count;
+                snapshot_.ai_media_bytes += bytes;
             }
         }
         closedir(directory);
         return ESP_OK;
     };
-    esp_err_t result = scan(mount_point_ + "/media", true);
-    if (result == ESP_OK) result = scan(mount_point_ + "/.staging", false);
+    esp_err_t result = scan_media(mount_point_ + "/media/local", MediaCategory::kLocal);
+    if (result == ESP_OK) result = scan_media(mount_point_ + "/media/ai", MediaCategory::kAi);
+    if (result == ESP_OK) {
+        // Count legacy flat directories as local without counting the new
+        // category roots themselves.
+        DIR* directory = opendir((mount_point_ + "/media").c_str());
+        if (directory == nullptr) {
+            result = ESP_FAIL;
+        } else {
+            struct dirent* entry = nullptr;
+            while ((entry = readdir(directory)) != nullptr) {
+                const std::string id = entry->d_name;
+                if (id == "." || id == ".." || id == "local" || id == "ai" ||
+                    !IsSafeTransactionId(id)) continue;
+                const std::string child = mount_point_ + "/media/" + id;
+                if (!IsDirectory(child)) continue;
+                std::uint64_t bytes = 0;
+                if (MeasureDirectoryTreeLocked(child, &bytes) != ESP_OK) { result = ESP_FAIL; break; }
+                ++snapshot_.local_media_count;
+                snapshot_.local_media_bytes += bytes;
+            }
+            closedir(directory);
+        }
+    }
+    if (result == ESP_OK) {
+        DIR* directory = opendir((mount_point_ + "/.staging").c_str());
+        if (directory == nullptr) return ESP_FAIL;
+        struct dirent* entry = nullptr;
+        while ((entry = readdir(directory)) != nullptr) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+            const std::string child = mount_point_ + "/.staging/" + entry->d_name;
+            if (!IsDirectory(child)) continue;
+            std::uint64_t bytes = 0;
+            if (MeasureDirectoryTreeLocked(child, &bytes) != ESP_OK) { result = ESP_FAIL; break; }
+            ++snapshot_.staging_count;
+            snapshot_.staging_bytes += bytes;
+        }
+        closedir(directory);
+    }
     return result;
 }
 
@@ -643,10 +731,39 @@ bool StorageService::IsSafeTransactionId(const TransactionId& transaction_id) co
 }
 
 bool StorageService::IsSafeMediaDirectory(const std::string& final_media_directory) const {
-    constexpr char kMediaPrefix[] = "media/";
-    if (final_media_directory.rfind(kMediaPrefix, 0) != 0) return false;
-    const std::string media_id = final_media_directory.substr(sizeof(kMediaPrefix) - 1);
-    return IsSafeTransactionId(media_id);
+    constexpr char kLocalPrefix[] = "media/local/";
+    constexpr char kAiPrefix[] = "media/ai/";
+    const char* prefix = final_media_directory.rfind(kLocalPrefix, 0) == 0 ? kLocalPrefix :
+        (final_media_directory.rfind(kAiPrefix, 0) == 0 ? kAiPrefix : nullptr);
+    if (prefix == nullptr) return false;
+    return IsSafeTransactionId(final_media_directory.substr(std::strlen(prefix)));
+}
+
+bool StorageService::IsSafeCommittedMediaDirectory(const std::string& relative_directory) const {
+    if (IsSafeMediaDirectory(relative_directory)) return true;
+    constexpr char kLegacyPrefix[] = "media/";
+    if (relative_directory.rfind(kLegacyPrefix, 0) != 0) return false;
+    const std::string media_id = relative_directory.substr(sizeof(kLegacyPrefix) - 1);
+    return media_id != "local" && media_id != "ai" && IsSafeTransactionId(media_id);
+}
+
+MediaId StorageService::MediaIdFromCategorizedDirectory(const std::string& relative_directory) const {
+    constexpr char kLocalPrefix[] = "media/local/";
+    constexpr char kAiPrefix[] = "media/ai/";
+    if (relative_directory.rfind(kLocalPrefix, 0) == 0) {
+        return relative_directory.substr(sizeof(kLocalPrefix) - 1U);
+    }
+    if (relative_directory.rfind(kAiPrefix, 0) == 0) {
+        return relative_directory.substr(sizeof(kAiPrefix) - 1U);
+    }
+    return {};
+}
+
+bool StorageService::CommittedMediaIdExistsLocked(const MediaId& media_id) const {
+    if (!IsSafeTransactionId(media_id)) return true;
+    return IsDirectory(mount_point_ + "/media/local/" + media_id) ||
+           IsDirectory(mount_point_ + "/media/ai/" + media_id) ||
+           IsDirectory(mount_point_ + "/media/" + media_id);
 }
 
 std::string StorageService::StagingDirectoryLocked() const {
