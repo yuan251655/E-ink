@@ -58,6 +58,34 @@ const char* CategoryName(MediaCategory category) {
     return "unknown";
 }
 
+const char* FeatureName(Feature feature) {
+    switch (feature) {
+        case Feature::kLocalAlbum: return "local_album";
+        case Feature::kAiAlbum: return "ai_album";
+        case Feature::kInfoDashboard: return "info_dashboard";
+    }
+    return "local_album";
+}
+
+bool ParseFeature(const std::string& value, Feature* output) {
+    if (output == nullptr) return false;
+    if (value == "local_album") *output = Feature::kLocalAlbum;
+    else if (value == "ai_album") *output = Feature::kAiAlbum;
+    else if (value == "info_dashboard") *output = Feature::kInfoDashboard;
+    else return false;
+    return true;
+}
+
+const char* ModeContentKindName(ModeSnapshot::ContentKind kind) {
+    switch (kind) {
+        case ModeSnapshot::ContentKind::kMedia: return "media";
+        case ModeSnapshot::ContentKind::kModeCover: return "mode_cover";
+        case ModeSnapshot::ContentKind::kDashboard: return "dashboard";
+        case ModeSnapshot::ContentKind::kUnknown: return "unknown";
+    }
+    return "unknown";
+}
+
 void AppendUInt64(std::string* output, std::uint64_t value) {
     char text[21];
     FormatUInt64(value, text);
@@ -85,6 +113,34 @@ void AppendJsonString(std::string* output, const std::string& value) {
         }
     }
     output->push_back('"');
+}
+
+void AppendModeSnapshotJson(std::string* output, const ModeSnapshot& snapshot) {
+    output->append("{\"active_feature\":");
+    AppendJsonString(output, FeatureName(snapshot.active_feature));
+    output->append(",\"pending_feature\":");
+    if (snapshot.has_pending_feature) AppendJsonString(output, FeatureName(snapshot.pending_feature));
+    else output->append("null");
+    output->append(",\"state\":");
+    AppendJsonString(output, snapshot.state == ModeSnapshot::State::kSwitching ? "switching" : "idle");
+    output->append(",\"revision\":");
+    AppendUInt64(output, snapshot.revision);
+    output->append(",\"switch_job_id\":");
+    if (snapshot.switch_job_id.empty()) output->append("null");
+    else AppendJsonString(output, snapshot.switch_job_id);
+    output->append(",\"current_content\":{\"kind\":");
+    AppendJsonString(output, ModeContentKindName(snapshot.current_content_kind));
+    output->append(",\"owner_feature\":");
+    AppendJsonString(output, FeatureName(snapshot.current_content_owner));
+    output->append(",\"category\":");
+    AppendJsonString(output, CategoryName(snapshot.current_content_category));
+    output->append(",\"media_id\":");
+    if (snapshot.current_media_id.empty()) output->append("null");
+    else AppendJsonString(output, snapshot.current_media_id);
+    output->append(",\"system_asset_id\":");
+    if (snapshot.current_system_asset_id.empty()) output->append("null");
+    else AppendJsonString(output, snapshot.current_system_asset_id);
+    output->append("}}");
 }
 
 void AppendMediaItemJson(std::string* output, const MediaItem& item) {
@@ -221,6 +277,7 @@ esp_err_t SubmitLocalDisplay(httpd_req_t* req, const MediaId& media_id, const Re
                              Revision expected_revision, const std::string& after_display) {
     const ModeSnapshot mode = GetModeManager().GetSnapshot();
     if (mode.active_feature != Feature::kLocalAlbum) return SendJson(req, "{\"ok\":false,\"code\":\"mode_changed\"}", "409 Conflict");
+    if (mode.state != ModeSnapshot::State::kIdle) return SendJson(req, "{\"ok\":false,\"code\":\"mode_switch_busy\"}", "409 Conflict");
     if (expected_revision != mode.revision) return SendJson(req, "{\"ok\":false,\"code\":\"revision_conflict\"}", "409 Conflict");
     MediaItem item;
     if (!GetMediaLibrary().Find(media_id, &item) || item.category != MediaCategory::kLocal ||
@@ -332,6 +389,107 @@ esp_err_t Health(httpd_req_t* req) {
     return SendJson(req, "{\"ok\":true,\"code\":\"ok\",\"message\":\"ready\",\"data\":{\"api_version\":\"v1\"}}");
 }
 
+esp_err_t GetMode(httpd_req_t* req) {
+    std::string body = "{\"ok\":true,\"code\":\"ok\",\"message\":\"mode snapshot loaded\",\"data\":";
+    AppendModeSnapshotJson(&body, GetModeManager().GetSnapshot());
+    body.append(",\"request_id\":null}");
+    return SendJson(req, body.c_str());
+}
+
+esp_err_t SetMode(httpd_req_t* req) {
+    if (req == nullptr || req->content_len <= 0 || req->content_len > 384) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\",\"message\":\"invalid mode request\",\"data\":null,\"request_id\":null}", "400 Bad Request");
+    }
+    char body[385]{};
+    int received = 0;
+    while (received < req->content_len) {
+        const int read = httpd_req_recv(req, body + received, req->content_len - received);
+        if (read <= 0) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+        received += read;
+    }
+    JsonDocument input;
+    if (deserializeJson(input, body) != DeserializationError::Ok) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\",\"message\":\"invalid mode JSON\",\"data\":null,\"request_id\":null}", "400 Bad Request");
+    }
+    const RequestId request_id = input["request_id"] | "";
+    const std::string target_text = input["target_feature"] | "";
+    const Revision expected_revision = input["expected_revision"] | 0ULL;
+    Feature target;
+    if (request_id.empty() || request_id.size() > 64 || input["expected_revision"].isNull() ||
+        !ParseFeature(target_text, &target)) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\",\"message\":\"request_id, expected_revision and target_feature are required\",\"data\":null,\"request_id\":null}", "400 Bad Request");
+    }
+
+    JobSnapshot job;
+    const std::string fingerprint = "mode:" + target_text + ":" + std::to_string(expected_revision);
+    const JobRegistrationResult registration =
+        GetProductJobService().CreateOrFind(JobKind::kMode, request_id, fingerprint, &job);
+    if (registration == JobRegistrationResult::kRequestIdConflict) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"request_id_conflict\",\"message\":\"request_id was already used\",\"data\":null}", "409 Conflict");
+    }
+    if (registration == JobRegistrationResult::kCapacityFull || registration == JobRegistrationResult::kInvalidArgument) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"mode_switch_busy\",\"message\":\"mode switch cannot be queued\",\"data\":null}", "503 Service Unavailable");
+    }
+    ModeSnapshot mode = GetModeManager().GetSnapshot();
+    if (registration == JobRegistrationResult::kExisting) {
+        const bool terminal = job.state == JobState::kSuccess || job.state == JobState::kFailed ||
+                              job.state == JobState::kCancelled || job.state == JobState::kTimeout;
+        const bool succeeded = job.state == JobState::kSuccess;
+        const bool failed = job.state == JobState::kFailed || job.state == JobState::kCancelled || job.state == JobState::kTimeout;
+        std::string response = "{\"ok\":";
+        response.append(failed ? "false" : "true").append(",\"code\":");
+        AppendJsonString(&response, failed ? (job.error_code.empty() ? "mode_switch_failed" : job.error_code) :
+                         (succeeded ? "mode_switch_completed" : "mode_switch_replayed"));
+        response.append(",\"message\":\"returning original mode switch job\",\"data\":{\"job_id\":");
+        AppendJsonString(&response, job.job_id);
+        response.append(",\"phase\":"); AppendJsonString(&response, job.phase);
+        response.append(",\"target_feature\":"); AppendJsonString(&response, target_text);
+        response.append("},\"request_id\":"); AppendJsonString(&response, request_id); response.push_back('}');
+        return SendJson(req, response.c_str(), failed ? "503 Service Unavailable" : (terminal ? nullptr : "202 Accepted"));
+    }
+    if (expected_revision != mode.revision) {
+        (void)GetProductJobService().Update(job.job_id, JobState::kFailed, "failed", 0, "revision_conflict");
+        std::string response = "{\"ok\":false,\"code\":\"revision_conflict\",\"message\":\"mode changed on device\",\"data\":";
+        AppendModeSnapshotJson(&response, mode);
+        response.append(",\"request_id\":"); AppendJsonString(&response, request_id); response.push_back('}');
+        return SendJson(req, response.c_str(), "409 Conflict");
+    }
+    if (mode.state == ModeSnapshot::State::kIdle && mode.active_feature == target) {
+        (void)GetProductJobService().CompleteSuccess(job.job_id);
+        std::string response = "{\"ok\":true,\"code\":\"already_active\",\"message\":\"target feature is already active\",\"data\":{\"job_id\":";
+        AppendJsonString(&response, job.job_id);
+        response.append(",\"phase\":\"completed\",\"target_feature\":");
+        AppendJsonString(&response, target_text);
+        response.append(",\"mode\":");
+        AppendModeSnapshotJson(&response, mode);
+        response.push_back('}');
+        response.append(",\"request_id\":"); AppendJsonString(&response, request_id); response.push_back('}');
+        return SendJson(req, response.c_str());
+    }
+    if (registration == JobRegistrationResult::kCreated) {
+        const esp_err_t result = GetModeManager().BeginSwitch(
+            target, expected_revision, job.job_id, &GetProductJobService(), &GetDisplayService());
+        if (result != ESP_OK) {
+            mode = GetModeManager().GetSnapshot();
+            const char* code = result == ESP_ERR_NOT_FOUND ? "mode_cover_unavailable" :
+                (mode.revision != expected_revision ? "revision_conflict" : "mode_switch_busy");
+            (void)GetProductJobService().Update(job.job_id, JobState::kFailed, "failed", 0, code);
+            std::string response = "{\"ok\":false,\"code\":"; AppendJsonString(&response, code);
+            response.append(",\"message\":\"mode switch was not started\",\"data\":");
+            AppendModeSnapshotJson(&response, mode);
+            response.append(",\"request_id\":"); AppendJsonString(&response, request_id); response.push_back('}');
+            return SendJson(req, response.c_str(), result == ESP_ERR_NOT_FOUND ? "503 Service Unavailable" : "409 Conflict");
+        }
+    }
+    (void)GetProductJobService().Get(job.job_id, &job);
+    std::string response = "{\"ok\":true,\"code\":\"mode_switch_accepted\",\"message\":\"mode switch queued\",\"data\":{\"job_id\":";
+    AppendJsonString(&response, job.job_id);
+    response.append(",\"phase\":"); AppendJsonString(&response, job.phase);
+    response.append(",\"target_feature\":"); AppendJsonString(&response, target_text);
+    response.append("},\"request_id\":"); AppendJsonString(&response, request_id); response.push_back('}');
+    return SendJson(req, response.c_str(), "202 Accepted");
+}
+
 esp_err_t Logs(httpd_req_t* req) {
     std::size_t limit = 30;
     char query[48]{};
@@ -359,7 +517,7 @@ esp_err_t Logs(httpd_req_t* req) {
 }
 
 esp_err_t Capabilities(httpd_req_t* req) {
-    return SendJson(req, "{\"ok\":true,\"code\":\"ok\",\"data\":{\"api_version\":\"v1\",\"media_upload_modes\":[\"bin_only\"],\"supports_media_preview\":true,\"preview_format\":\"indexed_4bpp_bin\",\"display_width\":800,\"display_height\":480,\"frame_bytes\":192000}}");
+    return SendJson(req, "{\"ok\":true,\"code\":\"ok\",\"data\":{\"api_version\":\"v1\",\"media_upload_modes\":[\"bin_only\"],\"supports_media_preview\":true,\"supports_mode_switch\":true,\"mode_features\":[\"local_album\",\"ai_album\",\"info_dashboard\"],\"preview_format\":\"indexed_4bpp_bin\",\"display_width\":800,\"display_height\":480,\"frame_bytes\":192000}}");
 }
 
 esp_err_t UploadMedia(httpd_req_t* req) {
@@ -786,6 +944,8 @@ esp_err_t RegisterProductApi(httpd_handle_t server) {
         {.uri="/api/v1/health", .method=HTTP_GET, .handler=Health, .user_ctx=nullptr},
         {.uri="/api/v1/device/capabilities", .method=HTTP_GET, .handler=Capabilities, .user_ctx=nullptr},
         {.uri="/api/v1/device/status", .method=HTTP_GET, .handler=Status, .user_ctx=nullptr},
+        {.uri="/api/v1/mode", .method=HTTP_GET, .handler=GetMode, .user_ctx=nullptr},
+        {.uri="/api/v1/mode", .method=HTTP_POST, .handler=SetMode, .user_ctx=nullptr},
         {.uri="/api/v1/logs", .method=HTTP_GET, .handler=Logs, .user_ctx=nullptr},
         {.uri="/api/v1/storage/status", .method=HTTP_GET, .handler=StorageStatus, .user_ctx=nullptr},
         {.uri="/api/v1/storage/remount", .method=HTTP_POST, .handler=RemountStorage, .user_ctx=nullptr},

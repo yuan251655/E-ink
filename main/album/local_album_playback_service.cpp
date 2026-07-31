@@ -171,9 +171,23 @@ void LocalAlbumPlaybackService::Tick() {
     xSemaphoreTake(mutex_, portMAX_DELAY);
     HandlePendingCompletionLocked();
     ObserveExternalDisplayLocked();
-    if (GetModeManager().GetSnapshot().active_feature != Feature::kLocalAlbum) {
+    const ModeSnapshot mode = GetModeManager().GetSnapshot();
+    const bool local_mode_active = mode.active_feature == Feature::kLocalAlbum &&
+                                   mode.state == ModeSnapshot::State::kIdle;
+    if (!local_mode_active) {
+        local_mode_was_active_ = false;
         xSemaphoreGive(mutex_);
         return;
+    }
+    if (!local_mode_was_active_) {
+        // A mode cover must remain visible for one complete configured
+        // interval after switching back to local album. Do not immediately
+        // replace it merely because the old countdown expired while another
+        // feature was active.
+        local_mode_was_active_ = true;
+        snapshot_.next_play_at_ms = snapshot_.config.mode == PlaybackMode::kAuto
+            ? NowMs() + static_cast<EpochMs>(snapshot_.config.interval_seconds) * 1000 : 0;
+        ++snapshot_.state_revision;
     }
     if (snapshot_.refresh_pending || snapshot_.config.mode != PlaybackMode::kAuto || NowMs() < snapshot_.next_play_at_ms) {
         xSemaphoreGive(mutex_);

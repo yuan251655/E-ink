@@ -98,6 +98,7 @@ private:
     JobId pending_job_id_;
     std::vector<MediaId> random_queue_;
     std::uint32_t request_sequence_ = 1;
+    bool local_mode_was_active_ = true;
 };
 
 }  // namespace photopainter::product

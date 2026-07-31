@@ -1,0 +1,20 @@
+{
+  "manifest_version": 1,
+  "system_asset_id": "mode_cover_local_album",
+  "category": "system",
+  "owner_feature": "local_album",
+  "display_name": "本地相册模式提示画面",
+  "display_profile": {
+    "width": 800,
+    "height": 480,
+    "frame_bytes": 192000,
+    "pixel_format": "4bpp",
+    "palette": "six_color_e6",
+    "rotation_degrees": 0,
+    "converter_version": "official-photopainter-floyd-steinberg-rgb888-v1"
+  },
+  "image_bin": {
+    "size_bytes": 192000,
+    "sha256": "67737c02bcd72765228795059a8527ffb19b719811bd24b18fa78ef75e1be64e"
+  }
+}

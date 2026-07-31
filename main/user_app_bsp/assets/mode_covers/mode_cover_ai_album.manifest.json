@@ -1,0 +1,20 @@
+{
+  "manifest_version": 1,
+  "system_asset_id": "mode_cover_ai_album",
+  "category": "system",
+  "owner_feature": "ai_album",
+  "display_name": "AI相册模式提示画面",
+  "display_profile": {
+    "width": 800,
+    "height": 480,
+    "frame_bytes": 192000,
+    "pixel_format": "4bpp",
+    "palette": "six_color_e6",
+    "rotation_degrees": 0,
+    "converter_version": "official-photopainter-floyd-steinberg-rgb888-v1"
+  },
+  "image_bin": {
+    "size_bytes": 192000,
+    "sha256": "506515cf075d9d75e2eb778486a7348c1fa848783d45b0f6c8ae4ec6c0466d0c"
+  }
+}

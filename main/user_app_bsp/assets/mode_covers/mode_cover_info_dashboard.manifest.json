@@ -1,0 +1,20 @@
+{
+  "manifest_version": 1,
+  "system_asset_id": "mode_cover_info_dashboard",
+  "category": "system",
+  "owner_feature": "info_dashboard",
+  "display_name": "信息看板模式提示画面",
+  "display_profile": {
+    "width": 800,
+    "height": 480,
+    "frame_bytes": 192000,
+    "pixel_format": "4bpp",
+    "palette": "six_color_e6",
+    "rotation_degrees": 0,
+    "converter_version": "official-photopainter-floyd-steinberg-rgb888-v1"
+  },
+  "image_bin": {
+    "size_bytes": 192000,
+    "sha256": "9ab6fef3b9fe28104d753cfd9f063d27c9e9df8f6edeb77d2af6f42dbe0a0260"
+  }
+}

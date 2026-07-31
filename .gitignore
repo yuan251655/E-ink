@@ -14,4 +14,7 @@ main/mmap_generate_emoji.h
 .cache
 *.pyc
 *.bin
+!main/user_app_bsp/assets/mode_covers/mode_cover_local_album.bin
+!main/user_app_bsp/assets/mode_covers/mode_cover_ai_album.bin
+!main/user_app_bsp/assets/mode_covers/mode_cover_info_dashboard.bin
 mmap_generate_*.h

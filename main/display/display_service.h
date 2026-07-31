@@ -18,14 +18,25 @@ public:
     // A display request never writes TF. It runs the validated frame through
     // the sole e-paper worker and records its lifecycle in the shared job.
     esp_err_t SubmitLocal(const MediaId& media_id, const JobId& job_id, JobService* jobs);
-    DisplaySnapshot GetSnapshot() const { return snapshot_; }
+    // ModeManager is the only caller allowed to submit a system mode cover.
+    // The worker reports completion back to ModeManager, which commits the
+    // new active feature only after the physical refresh succeeds.
+    esp_err_t SubmitModeCover(Feature feature, const JobId& job_id, JobService* jobs);
+    DisplaySnapshot GetSnapshot() const;
 private:
-    struct WorkItem { char media_id[65]; char job_id[65]; };
+    enum class WorkKind : std::uint8_t { kLocalMedia, kModeCover };
+    struct WorkItem {
+        WorkKind kind = WorkKind::kLocalMedia;
+        Feature feature = Feature::kLocalAlbum;
+        char media_id[65];
+        char job_id[65];
+    };
     static void WorkerEntry(void* context);
     void WorkerLoop();
     StorageService* storage_ = nullptr; MediaLibrary* library_ = nullptr; ePaperPort* display_ = nullptr;
     JobService* jobs_ = nullptr;
-    SemaphoreHandle_t legacy_mutex_ = nullptr; QueueHandle_t queue_ = nullptr; TaskHandle_t worker_ = nullptr;
+    SemaphoreHandle_t legacy_mutex_ = nullptr; SemaphoreHandle_t state_mutex_ = nullptr;
+    QueueHandle_t queue_ = nullptr; TaskHandle_t worker_ = nullptr;
     DisplaySnapshot snapshot_;
 };
 }  // namespace photopainter::product

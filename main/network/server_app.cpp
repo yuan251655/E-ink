@@ -284,12 +284,12 @@ static void ServerPort_Start(CustomSDPort *SDPort, bool enable_legacy_upload) {
     }
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    // Product API currently registers 21 distinct method/path routes. Keep a
-    // small reserve for the next product endpoints so a route addition cannot
-    // turn into a boot-loop during server start.
+    // Product API currently registers 28 distinct method/path routes. Keep a
+    // reserve for the next product endpoints so a route addition cannot turn
+    // into a boot-loop during server start.
     // Storage status/remount keep two short-lived legacy aliases while App
     // clients migrate to the frozen /api/v1 contract.
-    config.max_uri_handlers = 26;
+    config.max_uri_handlers = 36;
     // The phone App uses a fresh connection for each API call.  Purge a stale
     // keep-alive socket under memory pressure instead of leaving a completed
     // multipart upload to block the next sequential upload.

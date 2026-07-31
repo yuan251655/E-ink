@@ -88,6 +88,7 @@ set(SOURCES "xiaozhi/audio/audio_codec.cc"
             "storage/storage_runtime.cpp"
             "user_app_bsp/user_app.cpp"
             "user_app_bsp/mode_manager.cpp"
+            "user_app_bsp/mode_cover_assets.cpp"
             "user_app_bsp/mode_src/Basic_mode.cpp"
             "user_app_bsp/mode_src/Network_mode.cpp"
             "user_app_bsp/mode_src/xiaozhi_mode.cpp"
@@ -640,6 +641,9 @@ endif()
 
 idf_component_register(SRCS ${SOURCES}
                     EMBED_FILES ${LANG_SOUNDS} ${COMMON_SOUNDS}
+                                "user_app_bsp/assets/mode_covers/mode_cover_local_album.bin"
+                                "user_app_bsp/assets/mode_covers/mode_cover_ai_album.bin"
+                                "user_app_bsp/assets/mode_covers/mode_cover_info_dashboard.bin"
                     INCLUDE_DIRS ${INCLUDE_DIRS}
                     PRIV_REQUIRES app_bsp port_bsp codec_board pmicpower
                     esp_http_client esp_http_server esp_wifi json espressif__mdns

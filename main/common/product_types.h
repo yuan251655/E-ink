@@ -156,6 +156,15 @@ struct StorageSnapshot {
 
 struct ModeSnapshot {
     Feature active_feature = Feature::kLocalAlbum;
+    bool has_pending_feature = false;
+    Feature pending_feature = Feature::kLocalAlbum;
+    JobId switch_job_id;
+    enum class State : std::uint8_t { kIdle, kSwitching } state = State::kIdle;
+    enum class ContentKind : std::uint8_t { kUnknown, kMedia, kModeCover, kDashboard } current_content_kind = ContentKind::kUnknown;
+    Feature current_content_owner = Feature::kLocalAlbum;
+    MediaCategory current_content_category = MediaCategory::kLocal;
+    MediaId current_media_id;
+    std::string current_system_asset_id;
     Revision revision = 0;
     EpochMs updated_at_ms = 0;
 };
