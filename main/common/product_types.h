@@ -62,6 +62,7 @@ enum class AfterDisplay : std::uint8_t {
 
 enum class JobKind : std::uint8_t {
     kUpload,
+    kAiGeneration,
     kDisplay,
     kMode,
 };

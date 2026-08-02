@@ -1,6 +1,7 @@
 #include "display_service.h"
 #include <cstring>
 #include "display_bsp.h"
+#include "device_log_service.h"
 #include "job_service.h"
 #include "indicator_service.h"
 #include "media_library.h"
@@ -79,6 +80,10 @@ void DisplayService::WorkerLoop() {
         const MediaId media_id(item.media_id); const JobId job_id(item.job_id);
         xSemaphoreTake(state_mutex_, portMAX_DELAY); snapshot_.state = DisplayState::kLoading; xSemaphoreGive(state_mutex_);
         const bool mode_cover = item.kind == WorkKind::kModeCover;
+        if (mode_cover) {
+            GetDeviceLogService().Add(DeviceLogSeverity::kInfo, "display", "mode_cover_loading",
+                                      "Mode cover is being prepared for refresh");
+        }
         if (jobs_) (void)jobs_->Update(job_id, JobState::kRunning, mode_cover ? "preparing" : "loading", 15);
         ModeCoverAsset asset;
         const esp_err_t asset_result = mode_cover ? GetModeCoverAsset(item.feature, &asset) : ESP_OK;
@@ -147,6 +152,11 @@ void DisplayService::WorkerLoop() {
             xSemaphoreTake(state_mutex_, portMAX_DELAY); snapshot_.state = DisplayState::kSuccess; xSemaphoreGive(state_mutex_);
         } else {
             const std::string error = result == ESP_ERR_TIMEOUT ? "display_timeout" : "display_failed";
+            if (mode_cover) {
+                GetDeviceLogService().Add(result == ESP_ERR_TIMEOUT ? DeviceLogSeverity::kWarning : DeviceLogSeverity::kError,
+                                          "display", result == ESP_ERR_TIMEOUT ? "mode_cover_timeout" : "mode_cover_failed",
+                                          result == ESP_ERR_TIMEOUT ? "Mode cover refresh timed out" : "Mode cover refresh failed");
+            }
             xSemaphoreTake(state_mutex_, portMAX_DELAY);
             snapshot_.state = DisplayState::kFailed;
             snapshot_.last_error_code = error;

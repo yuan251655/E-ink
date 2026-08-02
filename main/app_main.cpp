@@ -2,6 +2,7 @@
 #include <esp_err.h>
 #include <esp_event.h>
 #include <esp_log.h>
+#include <esp_system.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <nvs.h>
@@ -19,10 +20,31 @@
 #include "indicator_service.h"
 #include "device_log_service.h"
 #include "mode_manager.h"
+#include "xiaozhi_runtime.h"
 
 #define TAG "main"
 
+namespace {
+const char* ResetReasonCode() {
+    switch (esp_reset_reason()) {
+        case ESP_RST_POWERON: return "power_on";
+        case ESP_RST_EXT: return "external";
+        case ESP_RST_SW: return "software";
+        case ESP_RST_PANIC: return "panic";
+        case ESP_RST_INT_WDT: return "interrupt_watchdog";
+        case ESP_RST_TASK_WDT: return "task_watchdog";
+        case ESP_RST_WDT: return "other_watchdog";
+        case ESP_RST_BROWNOUT: return "brownout";
+        case ESP_RST_SDIO: return "sdio";
+        default: return "unknown";
+    }
+}
+}  // namespace
+
 extern "C" void app_main(void) {
+    photopainter::product::GetDeviceLogService().Add(
+        photopainter::product::DeviceLogSeverity::kInfo, "system", ResetReasonCode(),
+        "Reset reason recorded");
     photopainter::product::GetDeviceLogService().Add(
         photopainter::product::DeviceLogSeverity::kInfo, "system", "boot", "设备启动");
     // Initialize the default event loop
@@ -101,22 +123,23 @@ extern "C" void app_main(void) {
         }
     }
 
-    if (read_value == 0x03) {
-        ESP_LOGW("main","Enter xiaozhi mode");
-        auto &app = Application::GetInstance();
-        app.Start();
-    } else if (read_value == 0x01) {
-        ESP_LOGW("main","Enter local album product mode");
-        if (product_display_ready) {
-            ret = photopainter::product::InitializeLocalAlbumPlaybackService();
-            if (ret != ESP_OK) ESP_LOGW(TAG, "Local album playback unavailable; continuing without auto playback");
+    // Product firmware never starts the legacy exclusive Mode-3 Xiaozhi or
+    // Mode-2 network applications. Keep one product boot path so the local
+    // API, AP+STA service and XiaozhiRuntime share the same device state.
+    if (read_value != 0x01) {
+        ESP_LOGW(TAG, "Migrating legacy startup mode %u to product mode", static_cast<unsigned>(read_value));
+        nvs_handle_t handle;
+        if (nvs_open("PhotoPainter", NVS_READWRITE, &handle) == ESP_OK) {
+            (void)nvs_set_u8(handle, "PhotPainterMode", 0x01);
+            (void)nvs_commit(handle);
+            nvs_close(handle);
         }
-        ServerPort_StartProductLocalApi(SDPort);
-    } else if (read_value == 0x02) {
-        ESP_LOGW("main","Enter Network mode");
-        User_Network_mode_app_init();
-    } else if (read_value == 0x04) {
-        ESP_LOGW("main","Enter Mode Selection");
-        Mode_Selection_Init();
     }
+    ESP_LOGW(TAG, "Enter product local-album mode");
+    if (product_display_ready) {
+        ret = photopainter::product::InitializeLocalAlbumPlaybackService();
+        if (ret != ESP_OK) ESP_LOGW(TAG, "Local album playback unavailable; continuing without auto playback");
+    }
+    ServerPort_StartProductLocalApi(SDPort);
+    photopainter::product::InitializeXiaozhiRuntime();
 }

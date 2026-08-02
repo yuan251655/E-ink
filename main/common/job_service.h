@@ -23,9 +23,12 @@ enum class JobRegistrationResult : std::uint8_t {
 };
 
 // A small in-memory registry for device operations. It deliberately has a
-// fixed capacity: active jobs are never evicted and completed jobs are only
-// retained until a later admission needs their slot. Callers must persist any
-// durable domain state (for example a committed MediaItem) separately.
+// fixed capacity: active jobs are never evicted. Completed jobs are retained
+// long enough for an App that is polling a slow e-paper refresh to observe
+// the terminal result. If all slots are protected, admission fails explicitly
+// instead of silently making an existing job disappear from GET /jobs/{id}.
+// Callers must persist any durable domain state (for example a committed
+// MediaItem) separately.
 class JobService {
 public:
     static constexpr std::size_t kCapacity = 12;
@@ -75,6 +78,7 @@ private:
     static constexpr std::size_t kMaxPhaseLength = 48;
     static constexpr std::size_t kMaxErrorCodeLength = 64;
     static constexpr std::size_t kMaxMediaIdLength = 64;
+    static constexpr EpochMs kTerminalRetentionMs = 10ULL * 60ULL * 1000ULL;
 
     mutable SemaphoreHandle_t mutex_ = nullptr;
     std::array<Entry, kCapacity> entries_{};

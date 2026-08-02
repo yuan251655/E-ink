@@ -11,6 +11,9 @@
 #include <esp_log.h>
 
 #include "mcp_server.h"
+#include "product_network.h"
+#include "system_info.h"
+#include <font_awesome.h>
 
 #define TAG "esp-s3-PhotoPainter"
 
@@ -98,9 +101,34 @@ class waveshare_PhotoPainter : public WifiBoard {
     waveshare_PhotoPainter()
         : boot_button_(BOOT_BUTTON_GPIO) {
         InitializeCodecI2c();
-        User_xiaozhi_app_init();
+        // The old Mode-3 helper creates legacy key handlers, direct e-paper
+        // tasks and old TF paths. Product Xiaozhi uses Application/AudioService
+        // through XiaozhiRuntime instead, so do not start that helper here.
         InitializeButtons();
-        InitializeTools();
+    }
+
+    void StartNetwork() override {
+        // product_network already owns AP+STA. Do not call WifiBoard here,
+        // otherwise WifiStation/SsidManager would initialize a second flow.
+        const auto network = photopainter::product::GetProductNetworkSnapshot();
+        ESP_LOGI(TAG, "Reusing product network: sta=%d ssid=%s", network.sta_connected,
+                 network.sta_ssid.c_str());
+    }
+
+    const char* GetNetworkStateIcon() override {
+        return photopainter::product::GetProductNetworkSnapshot().sta_connected ?
+            FONT_AWESOME_WIFI : FONT_AWESOME_WIFI_SLASH;
+    }
+
+    std::string GetBoardJson() override {
+        const auto network = photopainter::product::GetProductNetworkSnapshot();
+        std::string json = std::string("{\"type\":\"") + BOARD_TYPE + "\",\"name\":\"" + BOARD_NAME +
+                           "\",\"mac\":\"" + SystemInfo::GetMacAddress() + "\"";
+        if (network.sta_connected) {
+            json += ",\"ssid\":\"" + network.sta_ssid + "\",\"rssi\":" +
+                    std::to_string(network.sta_rssi_dbm) + ",\"ip\":\"" + network.sta_ip + "\"";
+        }
+        return json + "}";
     }
 
     virtual AudioCodec *GetAudioCodec() override {

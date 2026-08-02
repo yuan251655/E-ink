@@ -173,10 +173,16 @@ std::size_t JobService::FindAvailableSlotLocked() const {
         if (!entries_[index].occupied) return index;
     }
 
+    // Keep every completed job visible for a bounded period. In particular a
+    // mode-cover refresh may take tens of seconds, so replacing its terminal
+    // record immediately makes a client see a misleading "not found" while
+    // it is still polling the request it just submitted.
+    const EpochMs now = NowMs();
     std::size_t oldest_terminal = kNoSlot;
     for (std::size_t index = 0; index < entries_.size(); ++index) {
         const JobSnapshot& candidate = entries_[index].snapshot;
-        if (!IsTerminal(candidate.state)) continue;
+        if (!IsTerminal(candidate.state) || candidate.finished_at_ms == 0 ||
+            now - candidate.finished_at_ms < kTerminalRetentionMs) continue;
         if (oldest_terminal == kNoSlot ||
             candidate.finished_at_ms < entries_[oldest_terminal].snapshot.finished_at_ms) {
             oldest_terminal = index;

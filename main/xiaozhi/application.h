@@ -44,7 +44,9 @@ public:
     Application(const Application&) = delete;
     Application& operator=(const Application&) = delete;
 
-    void Start();
+    // Product firmware owns AP+STA through product_network. The optional
+    // product path reuses that active network instead of starting WifiStation.
+    void Start(bool reuse_existing_network = false);
     void MainEventLoop();
     DeviceState GetDeviceState() const { return device_state_; }
     bool IsVoiceDetected() const { return audio_service_.IsVoiceDetected(); }
@@ -63,6 +65,10 @@ public:
     void SendMcpMessage(const std::string& payload);
     void SetAecMode(AecMode mode);
     AecMode GetAecMode() const { return aec_mode_; }
+    void SetWakeWordEnabled(bool enabled);
+    bool IsWakeWordEnabled() const { return wake_word_enabled_; }
+    bool IsStarted() const { return started_; }
+    std::string GetActivationCode() const;
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
 
@@ -83,6 +89,10 @@ private:
 
     bool has_server_time_ = false;
     bool aborted_ = false;
+    bool started_ = false;
+    bool wake_word_enabled_ = false;
+    bool reuse_existing_network_ = false;
+    std::string activation_code_;
     int clock_ticks_ = 0;
     TaskHandle_t check_new_version_task_handle_ = nullptr;
     TaskHandle_t main_event_loop_task_handle_ = nullptr;

@@ -18,6 +18,7 @@
 #include <font_awesome.h>
 
 #include "user_app.h"
+#include "device_log_service.h"
 
 #define TAG "Application"
 
@@ -165,7 +166,7 @@ void Application::CheckNewVersion(Ota& ota) {
         retry_count = 0;
         retry_delay = 10; // 重置重试延迟时间
 
-        if (ota.HasNewVersion()) {
+        if (ota.HasNewVersion() && !reuse_existing_network_) {
             if (UpgradeFirmware(ota)) {
                 return; // This line will never be reached after reboot
             }
@@ -183,6 +184,7 @@ void Application::CheckNewVersion(Ota& ota) {
         display->SetStatus(Lang::Strings::ACTIVATION);
         // Activation code is shown to the user and waiting for the user to input
         if (ota.HasActivationCode()) {
+            activation_code_ = ota.GetActivationCode();
             ShowActivationCode(ota.GetActivationCode(), ota.GetActivationMessage());
         }
 
@@ -191,6 +193,7 @@ void Application::CheckNewVersion(Ota& ota) {
             ESP_LOGI(TAG, "Activating... %d/%d", i + 1, 10);
             esp_err_t err = ota.Activate();
             if (err == ESP_OK) {
+                activation_code_.clear();
                 xEventGroupSetBits(event_group_, MAIN_EVENT_CHECK_NEW_VERSION_DONE);
                 break;
             } else if (err == ESP_ERR_TIMEOUT) {
@@ -355,7 +358,13 @@ void Application::StopListening() {
     });
 }
 
-void Application::Start() {
+void Application::Start(bool reuse_existing_network) {
+    if (started_) {
+        ESP_LOGW(TAG, "Application already started");
+        return;
+    }
+    started_ = true;
+    reuse_existing_network_ = reuse_existing_network;
     auto& board = Board::GetInstance();
     SetDeviceState(kDeviceStateStarting);
 
@@ -382,13 +391,17 @@ void Application::Start() {
     /* Start the clock timer to update the status bar */
     esp_timer_start_periodic(clock_timer_handle_, 1000000);
 
-    /* Wait for the network to be ready */
-    board.StartNetwork();
+    /* Product AP+STA is already initialized by product_network. */
+    if (!reuse_existing_network_) board.StartNetwork();
 
     // Update the status bar immediately to show the network state
     display->UpdateStatusBar(true);
 
-    // Check for new assets version
+    // The product firmware owns firmware OTA, but Xiaozhi voice recognition
+    // still requires its official assets partition (wake-word model, fonts,
+    // and language resources).  These assets are independent from the
+    // application firmware and the TF-card media library, so always ensure
+    // they are present even when we reuse product AP+STA networking.
     CheckAssetsVersion();
 
     // Check for new firmware version or get the MQTT broker address
@@ -620,17 +633,27 @@ void Application::MainEventLoop() {
 }
 
 void Application::OnWakeWordDetected() {
+    if (!wake_word_enabled_) return;
     if (!protocol_) {
+        photopainter::product::GetDeviceLogService().Add(
+            photopainter::product::DeviceLogSeverity::kWarning, "xiaozhi", "wake_protocol_unavailable",
+            "Wake word was ignored because the voice protocol is unavailable");
         return;
     }
 
     if (device_state_ == kDeviceStateIdle) {
+        photopainter::product::GetDeviceLogService().Add(
+            photopainter::product::DeviceLogSeverity::kInfo, "xiaozhi", "wake_detected",
+            "Wake word detected; opening the voice session");
         audio_service_.EncodeWakeWord();
 
         if (!protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
             if (!protocol_->OpenAudioChannel()) {
-                audio_service_.EnableWakeWordDetection(true);
+                photopainter::product::GetDeviceLogService().Add(
+                    photopainter::product::DeviceLogSeverity::kWarning, "xiaozhi", "wake_channel_open_failed",
+                    "Voice session could not be opened after wake word detection");
+                audio_service_.EnableWakeWordDetection(wake_word_enabled_);
                 return;
             }
         }
@@ -694,7 +717,7 @@ void Application::SetDeviceState(DeviceState state) {
             display->SetStatus(Lang::Strings::STANDBY);
             display->SetEmotion("neutral");
             audio_service_.EnableVoiceProcessing(false);
-            audio_service_.EnableWakeWordDetection(true);
+            audio_service_.EnableWakeWordDetection(wake_word_enabled_);
             break;
         case kDeviceStateConnecting:
             display->SetStatus(Lang::Strings::CONNECTING);
@@ -720,7 +743,7 @@ void Application::SetDeviceState(DeviceState state) {
                 audio_service_.EnableVoiceProcessing(false);
                 // Only AFE wake word can be detected in speaking mode
 #if CONFIG_USE_AFE_WAKE_WORD
-                audio_service_.EnableWakeWordDetection(true);
+                audio_service_.EnableWakeWordDetection(wake_word_enabled_);
 #else
                 audio_service_.EnableWakeWordDetection(false);
 #endif
@@ -731,6 +754,17 @@ void Application::SetDeviceState(DeviceState state) {
             // Do nothing
             break;
     }
+}
+
+void Application::SetWakeWordEnabled(bool enabled) {
+    wake_word_enabled_ = enabled;
+    if (started_ && device_state_ == kDeviceStateIdle) {
+        audio_service_.EnableWakeWordDetection(enabled);
+    }
+}
+
+std::string Application::GetActivationCode() const {
+    return activation_code_;
 }
 
 void Application::Reboot() {

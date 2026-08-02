@@ -17,6 +17,10 @@
 #include "local_album_playback_runtime.h"
 #include "media_library.h"
 #include "media_upload_service.h"
+#include "ai_runtime.h"
+#include "ai_config_service.h"
+#include "ai_generation_service.h"
+#include "xiaozhi_runtime.h"
 #include "media_library_runtime.h"
 #include "mode_manager.h"
 #include "product_network.h"
@@ -554,7 +558,9 @@ esp_err_t JobStatus(httpd_req_t* req) {
     const char* marker = std::strstr(req->uri, "/api/v1/jobs/");
     if (marker == nullptr || std::strlen(marker + 13) == 0 || std::strlen(marker + 13) > 63) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
     JobSnapshot job;
-    if (!GetProductJobService().Get(marker + 13, &job)) return SendJson(req, "{\"ok\":false,\"code\":\"media_not_found\"}", "404 Not Found");
+    if (!GetProductJobService().Get(marker + 13, &job)) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"job_not_found\",\"message\":\"job result is unavailable\"}", "404 Not Found");
+    }
     char body[384];
     std::snprintf(body, sizeof(body), "{\"ok\":true,\"code\":\"ok\",\"data\":{\"job_id\":\"%s\",\"state\":%u,\"phase\":\"%s\",\"progress_percent\":%u,\"error_code\":\"%s\",\"media_id\":\"%s\"}}", job.job_id.c_str(), static_cast<unsigned>(job.state), job.phase.c_str(), static_cast<unsigned>(job.progress_percent), job.error_code.c_str(), job.media_id.c_str());
     return SendJson(req, body);
@@ -961,10 +967,91 @@ esp_err_t RestoreDefaultAp(httpd_req_t* req) {
     return SendJson(req, "{\"ok\":true,\"code\":\"ap_restored\",\"data\":{\"ssid\":\"esp_network\",\"ip\":\"192.168.4.1\"}}");
 }
 
+bool ReadBoundedJson(httpd_req_t* req, JsonDocument* output, std::size_t max_bytes = 2048) {
+    if (req == nullptr || output == nullptr || req->content_len <= 0 || static_cast<std::size_t>(req->content_len) > max_bytes) return false;
+    std::string body(static_cast<std::size_t>(req->content_len), '\0');
+    std::size_t received = 0;
+    while (received < body.size()) {
+        const int read = httpd_req_recv(req, body.data() + received, body.size() - received);
+        if (read <= 0) return false;
+        received += static_cast<std::size_t>(read);
+    }
+    return deserializeJson(*output, body) == DeserializationError::Ok;
+}
+
+esp_err_t GetAiConfig(httpd_req_t* req) {
+    const auto config = GetAiConfigService().GetPublicConfig();
+    std::string body = "{\"ok\":true,\"code\":\"ok\",\"data\":{\"configured\":";
+    body.append(config.configured ? "true" : "false").append(",\"endpoint\":"); AppendJsonString(&body, config.endpoint);
+    body.append(",\"model\":"); AppendJsonString(&body, config.model);
+    body.append(",\"key_last4\":"); AppendJsonString(&body, config.key_last4); body.append("}}");
+    return SendJson(req, body.c_str());
+}
+
+esp_err_t SaveAiConfig(httpd_req_t* req) {
+    JsonDocument input;
+    if (!ReadBoundedJson(req, &input, 1024)) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    const std::string endpoint = input["endpoint"] | "";
+    const std::string model = input["model"] | "";
+    const std::string key = input["api_key"] | "";
+    const esp_err_t result = GetAiConfigService().Save(endpoint, model, key);
+    if (result != ESP_OK) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_ai_config\"}", "400 Bad Request");
+    return GetAiConfig(req);
+}
+
+esp_err_t DeleteAiConfig(httpd_req_t* req) {
+    if (req->content_len > 2) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    if (GetAiConfigService().Clear() != ESP_OK) return SendJson(req, "{\"ok\":false,\"code\":\"ai_config_delete_failed\"}", "500 Internal Server Error");
+    return SendJson(req, "{\"ok\":true,\"code\":\"ai_config_deleted\"}");
+}
+
+esp_err_t TestAiConfig(httpd_req_t* req) {
+    if (req->content_len > 2) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    AiConfigTestResult result;
+    const esp_err_t test = GetAiConfigService().TestConnection(&result);
+    std::string body = "{\"ok\":";
+    body.append(test == ESP_OK ? "true" : "false").append(",\"code\":");
+    AppendJsonString(&body, result.code);
+    body.append(",\"data\":{\"configured\":").append(result.configured ? "true" : "false")
+        .append(",\"endpoint_reachable\":").append(result.endpoint_reachable ? "true" : "false")
+        .append(",\"authenticated\":").append(result.authenticated ? "true" : "false")
+        .append(",\"model_available\":").append(result.model_available ? "true" : "false")
+        .append(",\"http_status\":").append(std::to_string(result.http_status)).append("}}");
+    return SendJson(req, body.c_str(), test == ESP_OK ? "200 OK" : "422 Unprocessable Entity");
+}
+
+esp_err_t CreateAiGeneration(httpd_req_t* req) {
+    JsonDocument input;
+    if (!ReadBoundedJson(req, &input)) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    const std::string request_id = input["request_id"] | "";
+    const std::string prompt = input["prompt"] | "";
+    const bool display_when_active = input["display_when_active"] | true;
+    JobSnapshot job; std::string code;
+    const esp_err_t result = GetAiGenerationService().Create(request_id, prompt, display_when_active, &job, &code);
+    if (result != ESP_OK) { std::string body="{\"ok\":false,\"code\":"; AppendJsonString(&body, code); body.append("}"); return SendJson(req, body.c_str(), code=="ai_not_configured" ? "409 Conflict" : "503 Service Unavailable"); }
+    std::string body = "{\"ok\":true,\"code\":"; AppendJsonString(&body, code); body.append(",\"data\":{\"job_id\":"); AppendJsonString(&body, job.job_id); body.append("}}");
+    return SendJson(req, body.c_str(), "202 Accepted");
+}
+
 esp_err_t ForgetSta(httpd_req_t* req) {
     if (req->content_len > 2) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
     if (ForgetProductSta() != ESP_OK) return SendJson(req, "{\"ok\":false,\"code\":\"network_busy\"}", "503 Service Unavailable");
     return SendJson(req, "{\"ok\":true,\"code\":\"sta_forgotten\"}");
+}
+
+esp_err_t XiaozhiStatus(httpd_req_t* req) {
+    const auto status = GetXiaozhiRuntimeSnapshot();
+    std::string body = "{\"ok\":true,\"code\":\"ok\",\"data\":{\"state\":";
+    AppendJsonString(&body, status.state);
+    body.append(",\"started\":").append(status.started ? "true" : "false")
+        .append(",\"wake_word_enabled\":").append(status.wake_word_enabled ? "true" : "false")
+        .append(",\"active_only\":").append(status.active_only ? "true" : "false")
+        .append(",\"activation_code\":");
+    if (status.activation_code.empty()) body.append("null"); else AppendJsonString(&body, status.activation_code);
+    body.append(",\"last_error_code\":");
+    if (status.last_error_code.empty()) body.append("null"); else AppendJsonString(&body, status.last_error_code);
+    body.append("}}");
+    return SendJson(req, body.c_str());
 }
 
 esp_err_t ProvisionPage(httpd_req_t* req) {
@@ -999,6 +1086,12 @@ esp_err_t RegisterProductApi(httpd_handle_t server) {
         {.uri="/api/v1/network/sta", .method=HTTP_DELETE, .handler=ForgetSta, .user_ctx=nullptr},
         {.uri="/api/v1/network/ap", .method=HTTP_POST, .handler=ConfigureAp, .user_ctx=nullptr},
         {.uri="/api/v1/network/ap/restore-default", .method=HTTP_POST, .handler=RestoreDefaultAp, .user_ctx=nullptr},
+        {.uri="/api/v1/xiaozhi/status", .method=HTTP_GET, .handler=XiaozhiStatus, .user_ctx=nullptr},
+        {.uri="/api/v1/ai/config", .method=HTTP_GET, .handler=GetAiConfig, .user_ctx=nullptr},
+        {.uri="/api/v1/ai/config", .method=HTTP_POST, .handler=SaveAiConfig, .user_ctx=nullptr},
+        {.uri="/api/v1/ai/config", .method=HTTP_DELETE, .handler=DeleteAiConfig, .user_ctx=nullptr},
+        {.uri="/api/v1/ai/config/test", .method=HTTP_POST, .handler=TestAiConfig, .user_ctx=nullptr},
+        {.uri="/api/v1/ai/generation/jobs", .method=HTTP_POST, .handler=CreateAiGeneration, .user_ctx=nullptr},
         {.uri="/api/v1/media/upload", .method=HTTP_POST, .handler=UploadMedia, .user_ctx=nullptr},
         {.uri="/api/v1/media", .method=HTTP_GET, .handler=ListMedia, .user_ctx=nullptr},
         {.uri="/api/v1/media/*", .method=HTTP_GET, .handler=GetMediaDetail, .user_ctx=nullptr},

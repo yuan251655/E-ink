@@ -80,6 +80,15 @@ void xiaozhi_application_received(const char *str) {
 
 void xiaozhi_ai_Message(const char *arg1, const char *arg2) //ai chat
 {
+    // Product Xiaozhi deliberately does not start the legacy Mode-3 helper
+    // that allocates str_ai_chat_buff and owns the old e-paper chat UI. The
+    // base official Display still broadcasts text events to this compatibility
+    // callback, including STT immediately after the wake word. Treat the
+    // legacy buffer as optional so a voice conversation cannot dereference a
+    // null pointer or take over the product DisplayService.
+    if (arg1 == NULL || arg2 == NULL || str_ai_chat_buff == NULL) {
+        return;
+    }
     if (!strcmp(arg1, "user")) {
         strcpy(str_ai_chat_buff, arg2);
     }

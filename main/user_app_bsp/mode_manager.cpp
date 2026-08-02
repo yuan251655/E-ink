@@ -1,6 +1,7 @@
 #include "mode_manager.h"
 #include "esp_timer.h"
 #include "display_service.h"
+#include "device_log_service.h"
 #include "job_service.h"
 namespace photopainter::product {
 ModeManager::ModeManager() { mutex_ = xSemaphoreCreateMutex(); }
@@ -52,6 +53,8 @@ esp_err_t ModeManager::BeginSwitch(Feature target, Revision expected_revision, c
     jobs_ = jobs;
     xSemaphoreGive(mutex_);
 
+    GetDeviceLogService().Add(DeviceLogSeverity::kInfo, "mode", "switch_queued",
+                              "Mode cover refresh has been queued");
     (void)jobs->Update(job_id, JobState::kRunning, "preparing", 10);
     const esp_err_t submit = display->SubmitModeCover(target, job_id, jobs);
     if (submit != ESP_OK) {
@@ -83,7 +86,11 @@ void ModeManager::CompleteSwitch(const JobId& job_id, Feature target, const std:
         jobs_ = nullptr;
     }
     xSemaphoreGive(mutex_);
-    if (jobs != nullptr) (void)jobs->CompleteSuccess(job_id);
+    if (jobs != nullptr) {
+        GetDeviceLogService().Add(DeviceLogSeverity::kInfo, "mode", "switch_completed",
+                                  "Mode cover was refreshed and the new mode is active");
+        (void)jobs->CompleteSuccess(job_id);
+    }
 }
 
 void ModeManager::FailSwitch(const JobId& job_id, Feature target, const std::string& error_code, bool timeout) {
@@ -101,6 +108,9 @@ void ModeManager::FailSwitch(const JobId& job_id, Feature target, const std::str
     }
     xSemaphoreGive(mutex_);
     if (jobs != nullptr) {
+        GetDeviceLogService().Add(timeout ? DeviceLogSeverity::kWarning : DeviceLogSeverity::kError,
+                                  "mode", timeout ? "switch_display_timeout" : "switch_failed",
+                                  timeout ? "Mode cover refresh timed out" : "Mode cover refresh failed");
         (void)jobs->Update(job_id, timeout ? JobState::kTimeout : JobState::kFailed,
                            timeout ? "timeout" : "failed", 0, error_code);
     }
