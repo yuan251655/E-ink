@@ -1006,18 +1006,23 @@ esp_err_t DeleteAiConfig(httpd_req_t* req) {
 }
 
 esp_err_t TestAiConfig(httpd_req_t* req) {
-    if (req->content_len > 2) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    JsonDocument input;
+    if (!ReadBoundedJson(req, &input, 128)) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    const bool allow_billable_test = input["allow_billable_test"] | false;
     AiConfigTestResult result;
-    const esp_err_t test = GetAiConfigService().TestConnection(&result);
-    std::string body = "{\"ok\":";
-    body.append(test == ESP_OK ? "true" : "false").append(",\"code\":");
+    (void)GetAiConfigService().TestConnection(allow_billable_test, &result);
+    std::string body = "{\"ok\":true,\"code\":";
     AppendJsonString(&body, result.code);
     body.append(",\"data\":{\"configured\":").append(result.configured ? "true" : "false")
+        .append(",\"network_reachable\":").append(result.network_reachable ? "true" : "false")
         .append(",\"endpoint_reachable\":").append(result.endpoint_reachable ? "true" : "false")
         .append(",\"authenticated\":").append(result.authenticated ? "true" : "false")
         .append(",\"model_available\":").append(result.model_available ? "true" : "false")
-        .append(",\"http_status\":").append(std::to_string(result.http_status)).append("}}");
-    return SendJson(req, body.c_str(), test == ESP_OK ? "200 OK" : "422 Unprocessable Entity");
+        .append(",\"http_status\":").append(std::to_string(result.http_status))
+        .append(",\"provider_message\":");
+    AppendJsonString(&body, result.provider_message);
+    body.append(",\"billable_test\":").append(allow_billable_test ? "true" : "false").append("}}");
+    return SendJson(req, body.c_str());
 }
 
 esp_err_t CreateAiGeneration(httpd_req_t* req) {

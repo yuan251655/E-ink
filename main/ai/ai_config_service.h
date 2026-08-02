@@ -20,11 +20,13 @@ struct AiProviderConfig {
 // starts image generation, writes TF, or refreshes the panel.
 struct AiConfigTestResult {
     bool configured = false;
+    bool network_reachable = false;
     bool endpoint_reachable = false;
     bool authenticated = false;
     bool model_available = false;
     int http_status = 0;
     std::string code;
+    std::string provider_message;
 };
 
 class AiConfigService {
@@ -32,7 +34,7 @@ public:
     AiProviderConfig GetPublicConfig() const;
     bool GetSecret(std::string* endpoint, std::string* model, std::string* key) const;
     esp_err_t Save(const std::string& endpoint, const std::string& model, const std::string& api_key);
-    esp_err_t TestConnection(AiConfigTestResult* result) const;
+    esp_err_t TestConnection(bool allow_billable_test, AiConfigTestResult* result) const;
     esp_err_t Clear();
 };
 

@@ -53,6 +53,16 @@ std::string TestFailureCode(esp_err_t transport, int tls_error, int http_status)
     if (transport == ESP_ERR_HTTP_CONNECT || transport == ESP_ERR_ESP_TLS_CANNOT_RESOLVE_HOSTNAME || transport == ESP_ERR_ESP_TLS_FAILED_CONNECT_TO_HOST) return "ai_network_failed";
     return "ai_service_unavailable";
 }
+
+std::string ProviderErrorMessage(const std::string& response) {
+    JsonDocument parsed;
+    if (deserializeJson(parsed, response) != DeserializationError::Ok) return {};
+    const char* message = parsed["error"]["message"] | parsed["message"] | "";
+    std::string safe = message ? message : "";
+    for (char& ch : safe) if (ch == '\r' || ch == '\n') ch = ' ';
+    if (safe.size() > 160) safe.resize(160);
+    return safe;
+}
 }
 
 AiProviderConfig AiConfigService::GetPublicConfig() const {
@@ -99,7 +109,7 @@ esp_err_t AiConfigService::Save(const std::string& endpoint, const std::string& 
     return err;
 }
 
-esp_err_t AiConfigService::TestConnection(AiConfigTestResult* result) const {
+esp_err_t AiConfigService::TestConnection(bool allow_billable_test, AiConfigTestResult* result) const {
     if (!result) return ESP_ERR_INVALID_ARG;
     *result = {};
     std::string endpoint, model, key;
@@ -111,19 +121,25 @@ esp_err_t AiConfigService::TestConnection(AiConfigTestResult* result) const {
     config.cert_pem = reinterpret_cast<const char*>(ark_vol_pem_start);
     config.event_handler = CollectResponse;
     config.user_data = &response;
-    config.timeout_ms = 15000;
+    // Keep this aligned with the official PhotoPainter Ark client. Image
+    // generation commonly takes longer than a normal local API request, and
+    // a short timeout wrongly reports a reachable service as offline.
+    config.timeout_ms = 180000;
     config.buffer_size = 4096;
     auto client = esp_http_client_init(&config);
     if (!client) { result->code = "ai_client_init_failed"; return ESP_ERR_NO_MEM; }
-    // The empty prompt deliberately makes the provider reject the request at
-    // validation time. This exercises the configured endpoint, credential and
-    // selected model without creating an image or writing to TF.
+    // A zero-cost probe must not pretend that a 400 for an empty prompt proves
+    // the credential or model works. A user-approved billable probe sends a
+    // minimal real request but deliberately never downloads its result.
     JsonDocument request;
     request["model"] = model;
-    request["prompt"] = "";
+    request["prompt"] = allow_billable_test ? "A minimal abstract color test pattern" : "";
+    // Seedream 5.0 Pro's official request profile. Do not carry over legacy
+    // PhotoPainter-only fields because newer Ark models can reject them.
     request["response_format"] = "url";
-    request["size"] = "2k";
-    request["watermark"] = true;
+    request["size"] = "2K";
+    request["output_format"] = "png";
+    request["watermark"] = false;
     std::string body;
     serializeJson(request, body);
     const std::string auth = "Bearer " + key;
@@ -140,15 +156,31 @@ esp_err_t AiConfigService::TestConnection(AiConfigTestResult* result) const {
         result->code = TestFailureCode(transport, tls_error, result->http_status);
         return transport == ESP_OK ? ESP_FAIL : transport;
     }
+    result->network_reachable = true;
     result->endpoint_reachable = true;
-    if (result->http_status == 400) {
-        result->authenticated = true;
-        result->model_available = true;
-        result->code = "ok";
-        return ESP_OK;
+    result->provider_message = ProviderErrorMessage(response.data);
+    if (allow_billable_test && result->http_status >= 200 && result->http_status < 300) {
+        JsonDocument parsed;
+        if (deserializeJson(parsed, response.data) == DeserializationError::Ok &&
+            parsed["data"][0]["url"].is<const char*>()) {
+            result->authenticated = true;
+            result->model_available = true;
+            result->code = "ok";
+            return ESP_OK;
+        }
+        result->code = "ai_invalid_provider_response";
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    if (!allow_billable_test && result->http_status == 400) {
+        result->code = "model_requires_generation_test";
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (allow_billable_test && result->http_status == 400) {
+        result->code = "ai_http_400";
+        return ESP_FAIL;
     }
     if (result->http_status >= 200 && result->http_status < 300) {
-        result->code = "ai_invalid_provider_response";
+        result->code = "model_requires_generation_test";
         return ESP_ERR_INVALID_RESPONSE;
     }
     result->code = TestFailureCode(transport, tls_error, result->http_status);
