@@ -53,10 +53,15 @@ struct DownloadContext { StorageService* storage=nullptr; std::uint64_t bytes=0;
 esp_err_t DownloadEvent(esp_http_client_event_t* event) { auto* context=static_cast<DownloadContext*>(event->user_data); if (event->event_id!=HTTP_EVENT_ON_DATA || event->data_len<=0) return ESP_OK; if (!context || !context->storage || context->bytes+static_cast<std::size_t>(event->data_len)>kMaxSourceBytes) return ESP_ERR_INVALID_SIZE; if (mbedtls_sha256_update(&context->sha, static_cast<const unsigned char*>(event->data), event->data_len)!=0) return ESP_FAIL; context->error=context->storage->AppendStagedFile("source.jpg", event->data, event->data_len, context->first); context->first=false; if (context->error!=ESP_OK) return context->error; context->bytes += static_cast<std::size_t>(event->data_len); return ESP_OK; }
 bool RequestImageUrl(const std::string& endpoint, const std::string& model, const std::string& key, const char* prompt, std::string* url, ImageUrlRequestResult* result) {
     if (!url || !result) return false;
-    JsonDocument request; request["model"]=model; request["prompt"]=prompt; request["response_format"]="url"; request["size"]="2k"; request["stream"]=false; request["watermark"]=true;
+    // Keep real generation aligned with the verified Seedream 5.0 Pro model
+    // configuration request. Do not inherit legacy-only stream flags.
+    // The preview transaction, preview endpoint and validated official
+    // decoder all use JPEG (`source.jpg`). Keep the provider response in the
+    // same format so the App never receives PNG bytes labelled as JPEG.
+    JsonDocument request; request["model"]=model; request["prompt"]=prompt; request["response_format"]="url"; request["size"]="2K"; request["output_format"]="jpeg"; request["watermark"]=false;
     std::string body; serializeJson(request,body); ResponseBuffer response; esp_http_client_config_t config{};
     config.url=endpoint.c_str(); config.cert_pem=reinterpret_cast<const char*>(ark_vol_pem_start); config.event_handler=ResponseEvent; config.user_data=&response;
-    config.timeout_ms=60000; config.buffer_size=4096; config.buffer_size_tx=2048;
+    config.timeout_ms=180000; config.buffer_size=4096; config.buffer_size_tx=2048;
     auto client=esp_http_client_init(&config); if(!client) { result->code="ai_client_init_failed"; result->transport_error=ESP_ERR_NO_MEM; return false; }
     std::string auth="Bearer "+key; esp_http_client_set_method(client,HTTP_METHOD_POST); esp_http_client_set_header(client,"Content-Type","application/json"); esp_http_client_set_header(client,"Authorization",auth.c_str()); esp_http_client_set_post_field(client,body.data(),body.size());
     result->transport_error=esp_http_client_perform(client); result->http_status=esp_http_client_get_status_code(client);
@@ -79,7 +84,7 @@ AiGenerationService::AiGenerationService(AiConfigService* config, StorageService
     queue_ = xQueueCreate(1, sizeof(Work)); mutex_ = xSemaphoreCreateMutex();
     if (queue_) xTaskCreate(WorkerEntry, "ai_generation", 6144, this, 4, reinterpret_cast<TaskHandle_t*>(&worker_));
 }
-esp_err_t AiGenerationService::Create(const RequestId& request_id, const std::string& prompt, bool display_when_active, JobSnapshot* job, std::string* code) {
+esp_err_t AiGenerationService::Create(const RequestId& request_id, const std::string& prompt, bool /*ignored_display_flag*/, JobSnapshot* job, std::string* code) {
     if (!job || !code || prompt.empty() || prompt.size() > 768 || request_id.empty() || request_id.size() > 64) { if (code) *code="invalid_request"; return ESP_ERR_INVALID_ARG; }
     if (!config_->GetPublicConfig().configured) { *code="ai_not_configured"; return ESP_ERR_INVALID_STATE; }
     xSemaphoreTake(reinterpret_cast<SemaphoreHandle_t>(mutex_), portMAX_DELAY);
@@ -87,11 +92,25 @@ esp_err_t AiGenerationService::Create(const RequestId& request_id, const std::st
     const auto admission = jobs_->CreateOrFind(JobKind::kAiGeneration, request_id, "ai:" + prompt, job);
     if (admission == JobRegistrationResult::kExisting) { xSemaphoreGive(reinterpret_cast<SemaphoreHandle_t>(mutex_)); *code="ok"; return ESP_OK; }
     if (admission != JobRegistrationResult::kCreated) { xSemaphoreGive(reinterpret_cast<SemaphoreHandle_t>(mutex_)); *code=admission==JobRegistrationResult::kRequestIdConflict?"request_id_conflict":"ai_job_busy"; return ESP_ERR_INVALID_STATE; }
-    Work work{}; std::strncpy(work.job_id, job->job_id.c_str(), sizeof(work.job_id)-1); std::strncpy(work.prompt, prompt.c_str(), sizeof(work.prompt)-1); work.display_when_active=display_when_active;
+    Work work{}; work.kind=WorkKind::kGeneratePreview; std::strncpy(work.job_id, job->job_id.c_str(), sizeof(work.job_id)-1); std::strncpy(work.prompt, prompt.c_str(), sizeof(work.prompt)-1);
     active_=true;
     if (xQueueSend(reinterpret_cast<QueueHandle_t>(queue_), &work, 0) != pdTRUE) { active_=false; (void)jobs_->Update(job->job_id, JobState::kFailed,"failed",0,"ai_job_busy"); xSemaphoreGive(reinterpret_cast<SemaphoreHandle_t>(mutex_)); *code="ai_job_busy"; return ESP_ERR_INVALID_STATE; }
     xSemaphoreGive(reinterpret_cast<SemaphoreHandle_t>(mutex_)); *code="accepted"; return ESP_OK;
 }
+esp_err_t AiGenerationService::ConfirmSave(const RequestId& request_id, const std::string& preview_job_id, JobSnapshot* job, std::string* code) {
+    if (!job || !code || request_id.empty() || preview_job_id.empty()) return ESP_ERR_INVALID_ARG;
+    xSemaphoreTake(reinterpret_cast<SemaphoreHandle_t>(mutex_), portMAX_DELAY);
+    const std::uint64_t now=static_cast<std::uint64_t>(esp_timer_get_time()/1000);
+    if (active_) { xSemaphoreGive(reinterpret_cast<SemaphoreHandle_t>(mutex_)); *code="ai_job_busy"; return ESP_ERR_INVALID_STATE; }
+    if (!preview_.ready || preview_.job_id!=preview_job_id) { xSemaphoreGive(reinterpret_cast<SemaphoreHandle_t>(mutex_)); *code="preview_not_found"; return ESP_ERR_NOT_FOUND; }
+    if (now>=preview_.expires_at_ms) { preview_.ready=false; xSemaphoreGive(reinterpret_cast<SemaphoreHandle_t>(mutex_)); (void)storage_->DeletePreview(preview_job_id); *code="preview_expired"; return ESP_ERR_INVALID_STATE; }
+    const auto admission=jobs_->CreateOrFind(JobKind::kAiGeneration,request_id,"ai-save:"+preview_job_id,job);
+    if (admission!=JobRegistrationResult::kCreated) { xSemaphoreGive(reinterpret_cast<SemaphoreHandle_t>(mutex_)); *code=admission==JobRegistrationResult::kExisting?"ok":"ai_job_busy"; return admission==JobRegistrationResult::kExisting?ESP_OK:ESP_ERR_INVALID_STATE; }
+    Work work{}; work.kind=WorkKind::kConfirmSave; std::strncpy(work.job_id,job->job_id.c_str(),sizeof(work.job_id)-1); std::strncpy(work.preview_job_id,preview_job_id.c_str(),sizeof(work.preview_job_id)-1); std::strncpy(work.prompt,preview_.prompt.c_str(),sizeof(work.prompt)-1);
+    active_=true; if(xQueueSend(reinterpret_cast<QueueHandle_t>(queue_),&work,0)!=pdTRUE){active_=false;(void)jobs_->Update(job->job_id,JobState::kFailed,"failed",0,"ai_job_busy");xSemaphoreGive(reinterpret_cast<SemaphoreHandle_t>(mutex_));*code="ai_job_busy";return ESP_ERR_INVALID_STATE;} xSemaphoreGive(reinterpret_cast<SemaphoreHandle_t>(mutex_));*code="accepted";return ESP_OK;
+}
+bool AiGenerationService::GetPreview(const std::string& preview_job_id, PreviewSnapshot* output) { if(!output)return false; xSemaphoreTake(reinterpret_cast<SemaphoreHandle_t>(mutex_),portMAX_DELAY); const std::uint64_t now=static_cast<std::uint64_t>(esp_timer_get_time()/1000); output->job_id=preview_job_id; output->expired=preview_.ready&&preview_.job_id==preview_job_id&&now>=preview_.expires_at_ms; output->ready=preview_.ready&&preview_.job_id==preview_job_id&&!output->expired; output->prompt=output->ready?preview_.prompt:""; output->expires_at_ms=preview_.expires_at_ms; output->source_bytes=preview_.source_bytes; xSemaphoreGive(reinterpret_cast<SemaphoreHandle_t>(mutex_)); return output->ready; }
+esp_err_t AiGenerationService::StreamPreview(const std::string& preview_job_id, const std::function<esp_err_t(const void*, std::size_t)>& consume) { PreviewSnapshot preview; if(!GetPreview(preview_job_id,&preview)) return preview.expired?ESP_ERR_INVALID_STATE:ESP_ERR_NOT_FOUND; return storage_->StreamPreviewFile(preview_job_id,consume); }
 void AiGenerationService::WorkerEntry(void* context) { static_cast<AiGenerationService*>(context)->WorkerLoop(); }
 void AiGenerationService::WorkerLoop() {
     Work work{};
@@ -105,6 +124,41 @@ void AiGenerationService::WorkerLoop() {
         MediaId media_id;
 
         do {
+            if (work.kind == WorkKind::kConfirmSave) {
+                (void)jobs_->Update(work.job_id, JobState::kRunning, "converting", 35);
+                result = storage_->BeginWriteTransaction(NewId("ai-save"), kDisplayFrameBytes + 8192U);
+                if (result != ESP_OK) { failure = result == ESP_ERR_NO_MEM ? "storage_no_space" : "storage_busy"; break; }
+                transaction_started = true;
+                result = ConvertToFrame(storage_, "/sdcard/.ai_preview/" + std::string(work.preview_job_id) + "/source.jpg", &frame_hash);
+                if (result != ESP_OK) { failure = result == ESP_ERR_NO_MEM ? "ai_conversion_memory" : "ai_conversion_failed"; break; }
+                (void)jobs_->Update(work.job_id, JobState::kRunning, "committing", 80);
+                media_id = NewId("ai"); const EpochMs now = static_cast<EpochMs>(esp_timer_get_time() / 1000);
+                JsonDocument manifest; manifest["media_id"]=media_id; manifest["display_name"]="AI image"; manifest["category"]="ai"; manifest["created_at_ms"]=now; manifest["updated_at_ms"]=now; manifest["manifest_version"]=1; manifest["revision"]=1; manifest["prompt"]=work.prompt; manifest["model"]=config_->GetPublicConfig().model;
+                JsonObject profile=manifest["display_profile"].to<JsonObject>(); profile["width"]=kDisplayWidth; profile["height"]=kDisplayHeight; profile["frame_bytes"]=kDisplayFrameBytes; profile["pixel_format"]="4bpp"; profile["palette"]="six_color_e6"; profile["orientation"]="landscape"; profile["rotation_degrees"]=0; profile["fit_mode"]="contain"; profile["converter_version"]="official-fs-v1";
+                JsonObject files=manifest["files"].to<JsonObject>(); JsonObject frame=files["frame"].to<JsonObject>(); frame["present"]=true; frame["mime_type"]="application/octet-stream"; frame["bytes"]=kDisplayFrameBytes; frame["sha256"]=frame_hash;
+                std::string manifest_text; serializeJson(manifest,manifest_text); result=storage_->AppendStagedFile("manifest.json",manifest_text.data(),manifest_text.size(),true); if(result==ESP_OK)result=storage_->FinalizeStagedFile("manifest.json",manifest_text.size()); if(result==ESP_OK)result=storage_->CommitTransaction("media/ai/"+media_id); transaction_started=false; if(result!=ESP_OK){failure="ai_commit_failed";break;} if(library_->RegisterCommitted(MediaCategory::kAi,media_id)!=ESP_OK){failure="ai_commit_failed";break;} (void)storage_->DeletePreview(work.preview_job_id); xSemaphoreTake(reinterpret_cast<SemaphoreHandle_t>(mutex_),portMAX_DELAY); preview_.ready=false; xSemaphoreGive(reinterpret_cast<SemaphoreHandle_t>(mutex_)); (void)jobs_->CompleteSuccess(work.job_id,media_id); result=ESP_OK; break;
+            }
+            if (work.kind == WorkKind::kGeneratePreview) {
+                if (!config_->GetSecret(&endpoint, &model, &key)) { failure = "ai_not_configured"; break; }
+                (void)jobs_->Update(work.job_id, JobState::kRunning, "requesting", 10);
+                ImageUrlRequestResult request_result;
+                if (!RequestImageUrl(endpoint, model, key, work.prompt, &url, &request_result)) { failure = request_result.code; break; }
+                (void)jobs_->Update(work.job_id, JobState::kRunning, "downloading_preview", 50);
+                result = storage_->BeginWriteTransaction(NewId("ai-preview"), kRequiredBytes);
+                if (result != ESP_OK) { failure = result == ESP_ERR_NO_MEM ? "storage_no_space" : "storage_busy"; break; }
+                transaction_started = true;
+                result = DownloadSource(storage_, url, &source_hash, &source_bytes);
+                if (result != ESP_OK) { failure = result == ESP_ERR_INVALID_SIZE ? "ai_source_too_large" : "ai_download_failed"; break; }
+                result = storage_->CommitTransaction(".ai_preview/" + std::string(work.job_id));
+                transaction_started = false;
+                if (result != ESP_OK) { failure = "ai_preview_commit_failed"; break; }
+                xSemaphoreTake(reinterpret_cast<SemaphoreHandle_t>(mutex_), portMAX_DELAY);
+                preview_.job_id=work.job_id; preview_.prompt=work.prompt; preview_.source_bytes=source_bytes; preview_.expires_at_ms=static_cast<std::uint64_t>(esp_timer_get_time()/1000)+30ULL*60ULL*1000ULL; preview_.ready=true;
+                xSemaphoreGive(reinterpret_cast<SemaphoreHandle_t>(mutex_));
+                (void)jobs_->CompleteSuccess(work.job_id, "");
+                result = ESP_OK;
+                break;
+            }
             if (!config_->GetSecret(&endpoint, &model, &key)) { failure = "ai_not_configured"; break; }
             (void)jobs_->Update(work.job_id, JobState::kRunning, "requesting", 5);
             ImageUrlRequestResult request_result;
@@ -144,14 +198,7 @@ void AiGenerationService::WorkerLoop() {
             transaction_started = false;
             if (result == ESP_OK) result = library_->RegisterCommitted(MediaCategory::kAi, media_id);
             if (result != ESP_OK) { failure = "ai_commit_failed"; break; }
-            const auto mode = GetModeManager().GetSnapshot();
-            if (work.display_when_active && mode.active_feature == Feature::kAiAlbum) {
-                (void)jobs_->Update(work.job_id, JobState::kRunning, "displaying", 95);
-                result = display_->SubmitMedia(Feature::kAiAlbum, MediaCategory::kAi, media_id, work.job_id, jobs_);
-                if (result != ESP_OK) { failure = "display_busy"; break; }
-            } else {
-                (void)jobs_->CompleteSuccess(work.job_id, media_id);
-            }
+            (void)jobs_->CompleteSuccess(work.job_id, media_id);
             result = ESP_OK;
         } while (false);
         if (result != ESP_OK) {

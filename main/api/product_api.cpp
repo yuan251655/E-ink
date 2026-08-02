@@ -1038,6 +1038,37 @@ esp_err_t CreateAiGeneration(httpd_req_t* req) {
     return SendJson(req, body.c_str(), "202 Accepted");
 }
 
+esp_err_t GetAiGenerationPreview(httpd_req_t* req) {
+    constexpr char kPrefix[] = "/api/v1/ai/generation/jobs/";
+    constexpr char kSuffix[] = "/preview";
+    const std::size_t uri_length = std::strlen(req->uri);
+    if (std::strncmp(req->uri, kPrefix, sizeof(kPrefix) - 1) != 0 || uri_length <= sizeof(kPrefix) + sizeof(kSuffix) - 2 ||
+        std::strcmp(req->uri + uri_length - (sizeof(kSuffix) - 1), kSuffix) != 0) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    const std::string job_id(req->uri + sizeof(kPrefix) - 1, uri_length - (sizeof(kPrefix) - 1) - (sizeof(kSuffix) - 1));
+    AiGenerationService::PreviewSnapshot preview;
+    if (!GetAiGenerationService().GetPreview(job_id, &preview)) return SendJson(req, preview.expired ? "{\"ok\":false,\"code\":\"preview_expired\"}" : "{\"ok\":false,\"code\":\"preview_not_found\"}", "404 Not Found");
+    httpd_resp_set_type(req, "image/jpeg");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    const esp_err_t result = GetAiGenerationService().StreamPreview(job_id, [req](const void* data, std::size_t size) { return httpd_resp_send_chunk(req, static_cast<const char*>(data), size); });
+    if (result != ESP_OK) return result;
+    return httpd_resp_send_chunk(req, nullptr, 0);
+}
+
+esp_err_t ConfirmAiGenerationSave(httpd_req_t* req) {
+    constexpr char kPrefix[] = "/api/v1/ai/generation/jobs/";
+    constexpr char kSuffix[] = "/confirm-save";
+    JsonDocument input;
+    const std::size_t uri_length = std::strlen(req->uri);
+    if (!ReadBoundedJson(req, &input, 256) || std::strncmp(req->uri, kPrefix, sizeof(kPrefix) - 1) != 0 ||
+        uri_length <= sizeof(kPrefix) + sizeof(kSuffix) - 2 || std::strcmp(req->uri + uri_length - (sizeof(kSuffix) - 1), kSuffix) != 0) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    const std::string preview_job_id(req->uri + sizeof(kPrefix) - 1, uri_length - (sizeof(kPrefix) - 1) - (sizeof(kSuffix) - 1));
+    const std::string request_id = input["request_id"] | "";
+    JobSnapshot job; std::string code;
+    const esp_err_t result = GetAiGenerationService().ConfirmSave(request_id, preview_job_id, &job, &code);
+    if (result != ESP_OK) { std::string body="{\"ok\":false,\"code\":"; AppendJsonString(&body, code); body.append("}"); return SendJson(req, body.c_str(), code=="preview_not_found" || code=="preview_expired" ? "404 Not Found" : "503 Service Unavailable"); }
+    std::string body="{\"ok\":true,\"code\":\"accepted\",\"data\":{\"job_id\":"; AppendJsonString(&body, job.job_id); body.append("}}"); return SendJson(req, body.c_str(), "202 Accepted");
+}
+
 esp_err_t ForgetSta(httpd_req_t* req) {
     if (req->content_len > 2) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
     if (ForgetProductSta() != ESP_OK) return SendJson(req, "{\"ok\":false,\"code\":\"network_busy\"}", "503 Service Unavailable");
@@ -1132,6 +1163,8 @@ esp_err_t RegisterProductApi(httpd_handle_t server) {
         {.uri="/api/v1/ai/config", .method=HTTP_DELETE, .handler=DeleteAiConfig, .user_ctx=nullptr},
         {.uri="/api/v1/ai/config/test", .method=HTTP_POST, .handler=TestAiConfig, .user_ctx=nullptr},
         {.uri="/api/v1/ai/generation/jobs", .method=HTTP_POST, .handler=CreateAiGeneration, .user_ctx=nullptr},
+        {.uri="/api/v1/ai/generation/jobs/*", .method=HTTP_GET, .handler=GetAiGenerationPreview, .user_ctx=nullptr},
+        {.uri="/api/v1/ai/generation/jobs/*", .method=HTTP_POST, .handler=ConfirmAiGenerationSave, .user_ctx=nullptr},
         {.uri="/api/v1/media/upload", .method=HTTP_POST, .handler=UploadMedia, .user_ctx=nullptr},
         {.uri="/api/v1/media", .method=HTTP_GET, .handler=ListMedia, .user_ctx=nullptr},
         {.uri="/api/v1/media/*", .method=HTTP_GET, .handler=GetMediaDetail, .user_ctx=nullptr},

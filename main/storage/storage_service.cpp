@@ -73,6 +73,9 @@ esp_err_t StorageService::Initialize(CustomSDPort* sd_port) {
         result = EnsureDirectoryTreeLocked(mount_point_ + "/.staging");
     }
     if (result == ESP_OK) {
+        result = EnsureDirectoryTreeLocked(mount_point_ + "/.ai_preview");
+    }
+    if (result == ESP_OK) {
         result = EnsureDirectoryTreeLocked(mount_point_ + "/state");
     }
     if (result == ESP_OK) {
@@ -253,7 +256,8 @@ esp_err_t StorageService::FinalizeStagedFile(const std::string& relative_path,
 }
 
 esp_err_t StorageService::CommitTransaction(const std::string& final_media_directory) {
-    if (mutex_ == nullptr || !IsSafeMediaDirectory(final_media_directory)) {
+    const bool preview_directory = IsSafePreviewDirectory(final_media_directory);
+    if (mutex_ == nullptr || (!IsSafeMediaDirectory(final_media_directory) && !preview_directory)) {
         return ESP_ERR_INVALID_ARG;
     }
     xSemaphoreTake(mutex_, portMAX_DELAY);
@@ -262,8 +266,8 @@ esp_err_t StorageService::CommitTransaction(const std::string& final_media_direc
         xSemaphoreGive(mutex_);
         return ESP_ERR_INVALID_STATE;
     }
-    const MediaId media_id = MediaIdFromCategorizedDirectory(final_media_directory);
-    if (media_id.empty() || CommittedMediaIdExistsLocked(media_id)) {
+    const MediaId media_id = preview_directory ? MediaId{} : MediaIdFromCategorizedDirectory(final_media_directory);
+    if (!preview_directory && (media_id.empty() || CommittedMediaIdExistsLocked(media_id))) {
         ESP_LOGW(kTag, "rejecting globally duplicated media id: %s", media_id.c_str());
         SetErrorLocked("media_id_conflict");
         xSemaphoreGive(mutex_);
@@ -407,6 +411,37 @@ esp_err_t StorageService::StreamCommittedFile(
     }
     fclose(file);
     if (result != ESP_OK) SetErrorLocked("storage_read_failed");
+    xSemaphoreGive(mutex_);
+    return result;
+}
+
+esp_err_t StorageService::StreamPreviewFile(
+    const std::string& job_id,
+    const std::function<esp_err_t(const void*, std::size_t)>& consume) {
+    if (mutex_ == nullptr || !IsSafeTransactionId(job_id) || !consume) return ESP_ERR_INVALID_ARG;
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    esp_err_t result = EnsureReadyLocked();
+    const std::string path = mount_point_ + "/.ai_preview/" + job_id + "/source.jpg";
+    if (result == ESP_OK) {
+        FILE* file = fopen(path.c_str(), "rb");
+        if (file == nullptr) result = ESP_ERR_NOT_FOUND;
+        std::uint8_t buffer[4096];
+        while (result == ESP_OK && file != nullptr) {
+            const std::size_t count = fread(buffer, 1, sizeof(buffer), file);
+            if (count > 0) result = consume(buffer, count);
+            if (count < sizeof(buffer)) { if (ferror(file)) result = ESP_FAIL; break; }
+        }
+        if (file != nullptr) fclose(file);
+    }
+    xSemaphoreGive(mutex_);
+    return result;
+}
+
+esp_err_t StorageService::DeletePreview(const std::string& job_id) {
+    if (mutex_ == nullptr || !IsSafeTransactionId(job_id)) return ESP_ERR_INVALID_ARG;
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    esp_err_t result = EnsureReadyLocked();
+    if (result == ESP_OK) result = RemoveDirectoryTreeLocked(mount_point_ + "/.ai_preview/" + job_id);
     xSemaphoreGive(mutex_);
     return result;
 }
@@ -737,6 +772,12 @@ bool StorageService::IsSafeMediaDirectory(const std::string& final_media_directo
         (final_media_directory.rfind(kAiPrefix, 0) == 0 ? kAiPrefix : nullptr);
     if (prefix == nullptr) return false;
     return IsSafeTransactionId(final_media_directory.substr(std::strlen(prefix)));
+}
+
+bool StorageService::IsSafePreviewDirectory(const std::string& relative_directory) const {
+    constexpr char kPrefix[] = ".ai_preview/";
+    if (relative_directory.rfind(kPrefix, 0) != 0) return false;
+    return IsSafeTransactionId(relative_directory.substr(sizeof(kPrefix) - 1));
 }
 
 bool StorageService::IsSafeCommittedMediaDirectory(const std::string& relative_directory) const {

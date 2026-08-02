@@ -68,6 +68,12 @@ public:
     esp_err_t StreamCommittedFile(const std::string& relative_path,
                                   std::uint64_t expected_bytes,
                                   const std::function<esp_err_t(const void*, std::size_t)>& consume);
+    // AI previews are deliberately outside media/. They may be streamed only
+    // by their internally-generated job id and are removed after confirmation
+    // or expiry.
+    esp_err_t StreamPreviewFile(const std::string& job_id,
+                                const std::function<esp_err_t(const void*, std::size_t)>& consume);
+    esp_err_t DeletePreview(const std::string& job_id);
     esp_err_t ReadCommittedText(const std::string& relative_path,
                                 std::size_t maximum_bytes,
                                 std::string* output);
@@ -97,6 +103,7 @@ private:
     bool IsSafeRelativePath(const std::string& path) const;
     bool IsSafeTransactionId(const TransactionId& transaction_id) const;
     bool IsSafeMediaDirectory(const std::string& final_media_directory) const;
+    bool IsSafePreviewDirectory(const std::string& relative_directory) const;
     bool IsSafeCommittedMediaDirectory(const std::string& relative_directory) const;
     bool CommittedMediaIdExistsLocked(const MediaId& media_id) const;
     MediaId MediaIdFromCategorizedDirectory(const std::string& relative_directory) const;
