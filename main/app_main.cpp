@@ -105,6 +105,7 @@ extern "C" void app_main(void) {
         ESP_LOGW(TAG, "LED indicator service unavailable: %s", esp_err_to_name(ret));
     }
     bool product_display_ready = false;
+    bool product_media_ready = false;
     ret = photopainter::product::InitializeProductStorage(SDPort);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Product storage unavailable; continuing official compatibility flow");
@@ -113,7 +114,14 @@ extern "C" void app_main(void) {
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "Media index unavailable; continuing official compatibility flow");
         } else {
-            photopainter::product::GetModeManager().Initialize(photopainter::product::Feature::kLocalAlbum);
+            product_media_ready = true;
+            // Restore only a completed product snapshot after TF/media index is
+            // available.  This does not refresh the e-paper: the panel keeps
+            // its pixels through power-off.  Invalid saved media references
+            // are sanitized by ModeManager before any API can observe them.
+            photopainter::product::GetModeManager().Initialize(
+                photopainter::product::Feature::kLocalAlbum,
+                &photopainter::product::GetMediaLibrary());
             ret = photopainter::product::InitializeDisplayService();
             if (ret != ESP_OK) {
                 ESP_LOGW(TAG, "Display service unavailable; continuing official compatibility flow");
@@ -121,6 +129,11 @@ extern "C" void app_main(void) {
                 product_display_ready = true;
             }
         }
+    }
+    if (!product_media_ready) {
+        // A missing/degraded TF card has no trustworthy media state.  Keep the
+        // product API in its safe first-boot local-album state instead.
+        photopainter::product::GetModeManager().Initialize(photopainter::product::Feature::kLocalAlbum);
     }
 
     // Product firmware never starts the legacy exclusive Mode-3 Xiaozhi or

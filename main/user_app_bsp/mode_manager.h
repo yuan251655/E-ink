@@ -6,6 +6,7 @@
 namespace photopainter::product {
 class DisplayService;
 class JobService;
+class MediaLibrary;
 
 class ModeManager {
 public:
@@ -14,7 +15,9 @@ public:
     ModeManager(const ModeManager&) = delete;
     ModeManager& operator=(const ModeManager&) = delete;
 
-    void Initialize(Feature feature);
+    // Restores only completed product runtime state.  It never resumes an
+    // unfinished operation or triggers a display refresh during boot.
+    void Initialize(Feature fallback_feature, MediaLibrary* media_library = nullptr);
     esp_err_t SetActiveFeature(Feature feature, Revision expected_revision);
     esp_err_t BeginSwitch(Feature target, Revision expected_revision, const JobId& job_id,
                           JobService* jobs, DisplayService* display);
@@ -25,6 +28,11 @@ public:
 
 private:
     static EpochMs NowMs();
+    static bool IsPersistableFeature(Feature feature);
+    static bool IsValidSnapshot(const ModeSnapshot& snapshot);
+    static bool LoadPersistedSnapshot(Feature fallback_feature, ModeSnapshot* output);
+    static esp_err_t PersistSnapshot(const ModeSnapshot& snapshot);
+    bool SanitizeRestoredSnapshotLocked(MediaLibrary* media_library);
     mutable SemaphoreHandle_t mutex_ = nullptr;
     ModeSnapshot snapshot_;
     JobService* jobs_ = nullptr;
