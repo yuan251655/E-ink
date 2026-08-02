@@ -48,6 +48,7 @@ public:
 
     esp_err_t ImgDecode_OneJPGPicture(uint8_t *inbuffer, int inlen, uint8_t **outbuffer, int *outlen);
     esp_err_t ImgDecode_TFOneJPGPicture(const char *path,uint8_t **outbuffer, int *outlen, int *s_width, int *s_height);
+    esp_err_t ImgDecode_TFOneJPGPictureScaled(const char *path, int target_width, int target_height, uint8_t **outbuffer, int *outlen);
     esp_err_t ImgDecode_TFOnePNGPicture(const char *png_path, uint8_t **out_rgb888,int *out_width, int *out_height);
     esp_err_t ImgDecodebmp_TFOneBMPPicture(const char *bmp_path, uint8_t **out_rgb888, int *out_width, int *out_height);
     void ImgDecode_JPGBufferFree(uint8_t *buffer);

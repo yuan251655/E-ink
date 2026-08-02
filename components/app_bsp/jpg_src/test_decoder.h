@@ -33,6 +33,11 @@ typedef struct esp_jpeg_stream *esp_jpeg_stream_handle_t;
  */
 jpeg_error_t esp_jpeg_decode_one_picture(uint8_t *input_buf, int len, uint8_t **output_buf, int *out_len, int *s_width, int *s_height);
 
+// Product AI path: decode a larger JPEG directly into the fixed e-paper work
+// resolution.  ESP's JPEG scaler runs before output allocation, avoiding a
+// full 2k RGB888 frame in PSRAM. Target dimensions must be multiples of 8.
+jpeg_error_t esp_jpeg_decode_scaled_picture(uint8_t *input_buf, int len, int target_width, int target_height, uint8_t **output_buf, int *out_len);
+
 /**
  * @brief  Decode a single JPEG picture with block deocder API
  *

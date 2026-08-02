@@ -99,6 +99,42 @@ jpeg_dec_failed:
     return ret;
 }
 
+jpeg_error_t esp_jpeg_decode_scaled_picture(uint8_t *input_buf, int len, int target_width, int target_height, uint8_t **output_buf, int *out_len)
+{
+    if (!input_buf || len <= 0 || !output_buf || !out_len || target_width <= 0 || target_height <= 0 ||
+        (target_width % 8) != 0 || (target_height % 8) != 0) return JPEG_ERR_INVALID_PARAM;
+    jpeg_error_t ret = JPEG_ERR_OK;
+    jpeg_dec_handle_t jpeg_dec = NULL;
+    jpeg_dec_io_t *jpeg_io = NULL;
+    jpeg_dec_header_info_t *out_info = NULL;
+    uint8_t *out_buf = NULL;
+    jpeg_dec_config_t config = DEFAULT_JPEG_DEC_CONFIG();
+    config.output_type = JPEG_PIXEL_FORMAT_RGB888;
+    config.rotate = JPEG_ROTATE_0D;
+    config.scale.width = target_width;
+    config.scale.height = target_height;
+    ret = jpeg_dec_open(&config, &jpeg_dec);
+    if (ret != JPEG_ERR_OK) goto done;
+    jpeg_io = calloc(1, sizeof(jpeg_dec_io_t));
+    out_info = calloc(1, sizeof(jpeg_dec_header_info_t));
+    if (!jpeg_io || !out_info) { ret = JPEG_ERR_NO_MEM; goto done; }
+    jpeg_io->inbuf = input_buf;
+    jpeg_io->inbuf_len = len;
+    ret = jpeg_dec_parse_header(jpeg_dec, jpeg_io, out_info);
+    if (ret != JPEG_ERR_OK) goto done;
+    *out_len = target_width * target_height * 3;
+    out_buf = jpeg_calloc_align(*out_len, 16);
+    if (!out_buf) { ret = JPEG_ERR_NO_MEM; goto done; }
+    jpeg_io->outbuf = out_buf;
+    ret = jpeg_dec_process(jpeg_dec, jpeg_io);
+    if (ret == JPEG_ERR_OK) { *output_buf = out_buf; out_buf = NULL; }
+done:
+    if (jpeg_dec) jpeg_dec_close(jpeg_dec);
+    free(jpeg_io); free(out_info);
+    if (out_buf) jpeg_free_align(out_buf);
+    return ret;
+}
+
 jpeg_error_t esp_jpeg_decode_one_picture_block(unsigned char *input_buf, int len)
 {
     unsigned char *output_block = NULL;

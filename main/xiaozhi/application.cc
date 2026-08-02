@@ -19,6 +19,7 @@
 
 #include "user_app.h"
 #include "device_log_service.h"
+#include "xiaozhi_runtime.h"
 
 #define TAG "Application"
 
@@ -434,7 +435,9 @@ void Application::Start(bool reuse_existing_network) {
         xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);
     });
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
-        if (device_state_ == kDeviceStateSpeaking) {
+        // This is the single cloud-TTS discard point. System prompt sounds use
+        // AudioService::PlaySound() and never traverse this packet path.
+        if (tts_playback_enabled_ && device_state_ == kDeviceStateSpeaking) {
             audio_service_.PushPacketToDecodeQueue(std::move(packet));
         }
     });
@@ -479,6 +482,7 @@ void Application::Start(bool reuse_existing_network) {
                 auto text = cJSON_GetObjectItem(root, "text");
                 if (cJSON_IsString(text)) {
                     ESP_LOGI(TAG, "<< %s", text->valuestring);
+                    photopainter::product::RecordXiaozhiMessageEvent("assistant", text->valuestring);
                     Schedule([this, display, message = std::string(text->valuestring)]() {
                         display->SetChatMessage("assistant", message.c_str());
                     });
@@ -486,8 +490,9 @@ void Application::Start(bool reuse_existing_network) {
             }
         } else if (strcmp(type->valuestring, "stt") == 0) {
             auto text = cJSON_GetObjectItem(root, "text");
-            if (cJSON_IsString(text)) {
-                ESP_LOGI(TAG, ">> %s", text->valuestring);
+                if (cJSON_IsString(text)) {
+                    ESP_LOGI(TAG, ">> %s", text->valuestring);
+                    photopainter::product::RecordXiaozhiMessageEvent("user", text->valuestring);
                 Schedule([this, display, message = std::string(text->valuestring)]() {
                     display->SetChatMessage("user", message.c_str());
                 });
@@ -702,6 +707,7 @@ void Application::SetDeviceState(DeviceState state) {
     auto previous_state = device_state_;
     device_state_ = state;
     ESP_LOGI(TAG, "STATE: %s", STATE_STRINGS[device_state_]);
+    photopainter::product::RecordXiaozhiStateEvent(STATE_STRINGS[device_state_]);
     user_StateCallback(xiaozhi_application_received,STATE_STRINGS[device_state_]);
 
     // Send the state change event
@@ -761,6 +767,14 @@ void Application::SetWakeWordEnabled(bool enabled) {
     if (started_ && device_state_ == kDeviceStateIdle) {
         audio_service_.EnableWakeWordDetection(enabled);
     }
+}
+
+void Application::SetTtsPlaybackEnabled(bool enabled) {
+    if (tts_playback_enabled_ == enabled) return;
+    tts_playback_enabled_ = enabled;
+    // Drop queued cloud voice promptly. This only clears the Opus decoder
+    // queues; product alert sounds are synchronously decoded elsewhere.
+    if (!enabled) audio_service_.ResetDecoder();
 }
 
 std::string Application::GetActivationCode() const {

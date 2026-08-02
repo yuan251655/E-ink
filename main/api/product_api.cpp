@@ -1045,12 +1045,46 @@ esp_err_t XiaozhiStatus(httpd_req_t* req) {
     AppendJsonString(&body, status.state);
     body.append(",\"started\":").append(status.started ? "true" : "false")
         .append(",\"wake_word_enabled\":").append(status.wake_word_enabled ? "true" : "false")
+        .append(",\"tts_playback_enabled\":").append(status.tts_playback_enabled ? "true" : "false")
         .append(",\"active_only\":").append(status.active_only ? "true" : "false")
         .append(",\"activation_code\":");
     if (status.activation_code.empty()) body.append("null"); else AppendJsonString(&body, status.activation_code);
     body.append(",\"last_error_code\":");
     if (status.last_error_code.empty()) body.append("null"); else AppendJsonString(&body, status.last_error_code);
     body.append("}}");
+    return SendJson(req, body.c_str());
+}
+
+esp_err_t XiaozhiConversation(httpd_req_t* req) {
+    char query[128] = {};
+    char value[24] = {};
+    std::uint64_t after_seq = 0;
+    std::size_t limit = 30;
+    if (httpd_req_get_url_query_len(req) >= sizeof(query)) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    if (httpd_req_get_url_query_len(req) > 0 && httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        if (httpd_query_key_value(query, "after_seq", value, sizeof(value)) == ESP_OK) {
+            char* end = nullptr; after_seq = std::strtoull(value, &end, 10);
+            if (end == value || *end != '\0') return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+        }
+        if (httpd_query_key_value(query, "limit", value, sizeof(value)) == ESP_OK) {
+            char* end = nullptr; const unsigned long requested = std::strtoul(value, &end, 10);
+            if (end == value || *end != '\0' || requested == 0 || requested > 48) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+            limit = requested;
+        }
+    }
+    const auto page = GetXiaozhiConversation(after_seq, limit);
+    std::string body = "{\"ok\":true,\"code\":\"ok\",\"data\":{\"latest_seq\":";
+    AppendUInt64(&body, page.latest_seq); body.append(",\"events\":[");
+    for (std::size_t i = 0; i < page.events.size(); ++i) {
+        if (i != 0) body.push_back(',');
+        const auto& event = page.events[i];
+        body.append("{\"seq\":"); AppendUInt64(&body, event.seq);
+        body.append(",\"timestamp_ms\":"); AppendUInt64(&body, event.timestamp_ms);
+        body.append(",\"type\":"); AppendJsonString(&body, event.type);
+        body.append(",\"role\":"); AppendJsonString(&body, event.role);
+        body.append(",\"text\":"); AppendJsonString(&body, event.text); body.push_back('}');
+    }
+    body.append("]}}");
     return SendJson(req, body.c_str());
 }
 
@@ -1087,6 +1121,7 @@ esp_err_t RegisterProductApi(httpd_handle_t server) {
         {.uri="/api/v1/network/ap", .method=HTTP_POST, .handler=ConfigureAp, .user_ctx=nullptr},
         {.uri="/api/v1/network/ap/restore-default", .method=HTTP_POST, .handler=RestoreDefaultAp, .user_ctx=nullptr},
         {.uri="/api/v1/xiaozhi/status", .method=HTTP_GET, .handler=XiaozhiStatus, .user_ctx=nullptr},
+        {.uri="/api/v1/xiaozhi/conversation", .method=HTTP_GET, .handler=XiaozhiConversation, .user_ctx=nullptr},
         {.uri="/api/v1/ai/config", .method=HTTP_GET, .handler=GetAiConfig, .user_ctx=nullptr},
         {.uri="/api/v1/ai/config", .method=HTTP_POST, .handler=SaveAiConfig, .user_ctx=nullptr},
         {.uri="/api/v1/ai/config", .method=HTTP_DELETE, .handler=DeleteAiConfig, .user_ctx=nullptr},

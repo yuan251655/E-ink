@@ -10,6 +10,7 @@
 #include <mutex>
 #include <deque>
 #include <memory>
+#include <atomic>
 
 #include "protocol.h"
 #include "ota.h"
@@ -67,6 +68,10 @@ public:
     AecMode GetAecMode() const { return aec_mode_; }
     void SetWakeWordEnabled(bool enabled);
     bool IsWakeWordEnabled() const { return wake_word_enabled_; }
+    // Applies to cloud Xiaozhi reply audio only. It does not suppress product
+    // prompt/alert sounds played through AudioService::PlaySound().
+    void SetTtsPlaybackEnabled(bool enabled);
+    bool IsTtsPlaybackEnabled() const { return tts_playback_enabled_.load(); }
     bool IsStarted() const { return started_; }
     std::string GetActivationCode() const;
     void PlaySound(const std::string_view& sound);
@@ -91,6 +96,7 @@ private:
     bool aborted_ = false;
     bool started_ = false;
     bool wake_word_enabled_ = false;
+    std::atomic<bool> tts_playback_enabled_{true};
     bool reuse_existing_network_ = false;
     std::string activation_code_;
     int clock_ticks_ = 0;

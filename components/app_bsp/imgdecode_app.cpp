@@ -75,6 +75,26 @@ esp_err_t ImgDecodeDither::ImgDecode_TFOneJPGPicture(const char *path,uint8_t **
     return ESP_FAIL;
 }
 
+esp_err_t ImgDecodeDither::ImgDecode_TFOneJPGPictureScaled(const char *path, int target_width, int target_height, uint8_t **outbuffer, int *outlen) {
+    if (!path || !outbuffer || !outlen || target_width <= 0 || target_height <= 0) return ESP_ERR_INVALID_ARG;
+    FILE *file = fopen(path, "rb");
+    if (!file) return ESP_FAIL;
+    fseek(file, 0, SEEK_END);
+    const long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    // Product service already enforces this ceiling before calling us. It is
+    // repeated here so this low-level decoder remains safe for future callers.
+    if (file_size <= 0 || file_size > 4 * 1024 * 1024) { fclose(file); return ESP_ERR_INVALID_SIZE; }
+    uint8_t *input = static_cast<uint8_t *>(heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM));
+    if (!input) { fclose(file); return ESP_ERR_NO_MEM; }
+    const size_t read = fread(input, 1, file_size, file);
+    fclose(file);
+    if (read != static_cast<size_t>(file_size)) { heap_caps_free(input); return ESP_FAIL; }
+    const jpeg_error_t decoded = esp_jpeg_decode_scaled_picture(input, static_cast<int>(file_size), target_width, target_height, outbuffer, outlen);
+    heap_caps_free(input);
+    return decoded == JPEG_ERR_OK ? ESP_OK : ESP_FAIL;
+}
+
 esp_err_t ImgDecodeDither::ImgDecode_TFOnePNGPicture(const char *png_path, uint8_t **out_rgb888,int *out_width, int *out_height) {
     FILE *fp = NULL;
     png_structp png_ptr = NULL;
