@@ -73,6 +73,7 @@ public:
     // or expiry.
     esp_err_t StreamPreviewFile(const std::string& job_id,
                                 const std::function<esp_err_t(const void*, std::size_t)>& consume);
+    bool PreviewFileExists(const std::string& job_id);
     esp_err_t DeletePreview(const std::string& job_id);
     esp_err_t ReadCommittedText(const std::string& relative_path,
                                 std::size_t maximum_bytes,
@@ -98,6 +99,9 @@ private:
                                          std::uint64_t* output_bytes) const;
     esp_err_t CreateTransactionDirectoryLocked();
     esp_err_t CleanupInterruptedTransactionsLocked();
+    // Device previews are RAM-owned and expire on reboot. Remove abandoned
+    // directories so rebooted job ids can never collide with stale previews.
+    esp_err_t CleanupAiPreviewsLocked();
     esp_err_t RemoveDirectoryTreeLocked(const std::string& absolute_path);
     esp_err_t EnsureDirectoryTreeLocked(const std::string& absolute_path);
     bool IsSafeRelativePath(const std::string& path) const;

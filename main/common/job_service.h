@@ -82,6 +82,7 @@ private:
 
     mutable SemaphoreHandle_t mutex_ = nullptr;
     std::array<Entry, kCapacity> entries_{};
+    std::uint32_t boot_nonce_ = 0;
     std::uint32_t next_sequence_ = 1;
 };
 

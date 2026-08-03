@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include "esp_err.h"
 
@@ -10,9 +11,22 @@ namespace photopainter::product {
 // except in the HTTPS Authorization header assembled by the generation worker.
 struct AiProviderConfig {
     bool configured = false;
+    std::string profile_id;
+    std::string profile_name;
     std::string endpoint;
     std::string model;
     std::string key_last4;
+};
+
+// Never use this type to return credentials. `key_last4` is the maximum
+// credential detail permitted through the product API or device logs.
+struct AiProviderProfile {
+    std::string id;
+    std::string name;
+    std::string endpoint;
+    std::string model;
+    std::string key_last4;
+    bool active = false;
 };
 
 // Result intentionally exposes no credential, provider response body, or URL
@@ -34,6 +48,11 @@ public:
     AiProviderConfig GetPublicConfig() const;
     bool GetSecret(std::string* endpoint, std::string* model, std::string* key) const;
     esp_err_t Save(const std::string& endpoint, const std::string& model, const std::string& api_key);
+    std::vector<AiProviderProfile> ListProfiles() const;
+    esp_err_t SaveProfile(const std::string& id, const std::string& name, const std::string& endpoint,
+                          const std::string& model, const std::string& api_key, AiProviderProfile* output);
+    esp_err_t ActivateProfile(const std::string& id);
+    esp_err_t DeleteProfile(const std::string& id);
     esp_err_t TestConnection(bool allow_billable_test, AiConfigTestResult* result) const;
     esp_err_t Clear();
 };

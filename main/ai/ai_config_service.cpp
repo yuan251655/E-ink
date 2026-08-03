@@ -1,6 +1,8 @@
 #include "ai_config_service.h"
 
 #include <cstring>
+#include <algorithm>
+#include <cstdio>
 
 #include "ArduinoJson.h"
 #include "esp_http_client.h"
@@ -10,6 +12,11 @@
 namespace photopainter::product {
 namespace {
 constexpr char kNamespace[] = "ai_provider";
+constexpr char kProfilesNamespace[] = "ai_profiles";
+constexpr char kProfilesMigrated[] = "migrated";
+constexpr char kProfileCount[] = "count";
+constexpr char kActiveProfile[] = "active";
+constexpr std::size_t kMaxProfiles = 5;
 constexpr char kEndpoint[] = "endpoint";
 constexpr char kModel[] = "model";
 constexpr char kKey[] = "api_key";
@@ -27,6 +34,92 @@ bool ReadString(nvs_handle_t handle, const char* name, std::size_t maximum, std:
     value.resize(std::strlen(value.c_str()));
     *out = value;
     return true;
+}
+
+bool IsSafeProfileId(const std::string& id) {
+    if (id.empty() || id.size() > 32) return false;
+    for (const char ch : id) {
+        const bool alpha_num = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                               (ch >= '0' && ch <= '9');
+        if (!alpha_num && ch != '-' && ch != '_') return false;
+    }
+    return true;
+}
+
+void ProfileKey(char output[16], const char* field, std::size_t slot) {
+    std::snprintf(output, 16, "%s%u", field, static_cast<unsigned>(slot));
+}
+
+struct StoredProfile {
+    std::string id, name, endpoint, model, key;
+};
+
+bool ReadProfile(nvs_handle_t handle, std::size_t slot, StoredProfile* output) {
+    if (!output) return false;
+    char id[16], name[16], endpoint[16], model[16], key[16];
+    ProfileKey(id, "id", slot); ProfileKey(name, "name", slot); ProfileKey(endpoint, "endpoint", slot);
+    ProfileKey(model, "model", slot); ProfileKey(key, "key", slot);
+    return ReadString(handle, id, 33, &output->id) && ReadString(handle, name, 65, &output->name) &&
+        ReadString(handle, endpoint, kEndpointMax, &output->endpoint) && ReadString(handle, model, kModelMax, &output->model) &&
+        ReadString(handle, key, kKeyMax, &output->key);
+}
+
+esp_err_t WriteProfile(nvs_handle_t handle, std::size_t slot, const StoredProfile& profile) {
+    char id[16], name[16], endpoint[16], model[16], key[16];
+    ProfileKey(id, "id", slot); ProfileKey(name, "name", slot); ProfileKey(endpoint, "endpoint", slot);
+    ProfileKey(model, "model", slot); ProfileKey(key, "key", slot);
+    esp_err_t err = nvs_set_str(handle, id, profile.id.c_str());
+    if (err == ESP_OK) err = nvs_set_str(handle, name, profile.name.c_str());
+    if (err == ESP_OK) err = nvs_set_str(handle, endpoint, profile.endpoint.c_str());
+    if (err == ESP_OK) err = nvs_set_str(handle, model, profile.model.c_str());
+    if (err == ESP_OK) err = nvs_set_str(handle, key, profile.key.c_str());
+    return err;
+}
+
+void EraseProfile(nvs_handle_t handle, std::size_t slot) {
+    char value[16];
+    for (const char* field : {"id", "name", "endpoint", "model", "key"}) {
+        ProfileKey(value, field, slot);
+        (void)nvs_erase_key(handle, value);
+    }
+}
+
+// Migrate the original one-provider namespace once.  It is intentionally
+// copied rather than erased so old firmware can still start safely after a
+// temporary rollback.
+esp_err_t EnsureProfileMigration() {
+    nvs_handle_t profiles;
+    esp_err_t err = nvs_open(kProfilesNamespace, NVS_READWRITE, &profiles);
+    if (err != ESP_OK) return err;
+    std::uint8_t migrated = 0;
+    if (nvs_get_u8(profiles, kProfilesMigrated, &migrated) == ESP_OK && migrated == 1) {
+        nvs_close(profiles); return ESP_OK;
+    }
+    nvs_handle_t legacy;
+    if (nvs_open(kNamespace, NVS_READONLY, &legacy) == ESP_OK) {
+        StoredProfile old;
+        if (ReadString(legacy, kEndpoint, kEndpointMax, &old.endpoint) &&
+            ReadString(legacy, kModel, kModelMax, &old.model) && ReadString(legacy, kKey, kKeyMax, &old.key)) {
+            old.id = "default"; old.name = "默认模型";
+            err = WriteProfile(profiles, 0, old);
+            if (err == ESP_OK) err = nvs_set_u8(profiles, kProfileCount, 1);
+            if (err == ESP_OK) err = nvs_set_str(profiles, kActiveProfile, old.id.c_str());
+        }
+        nvs_close(legacy);
+    }
+    if (err == ESP_OK) err = nvs_set_u8(profiles, kProfilesMigrated, 1);
+    if (err == ESP_OK) err = nvs_commit(profiles);
+    nvs_close(profiles);
+    return err;
+}
+
+std::vector<StoredProfile> ReadAllProfiles(nvs_handle_t handle) {
+    std::vector<StoredProfile> output;
+    std::uint8_t count = 0;
+    (void)nvs_get_u8(handle, kProfileCount, &count);
+    count = std::min<std::uint8_t>(count, static_cast<std::uint8_t>(kMaxProfiles));
+    for (std::size_t slot = 0; slot < count; ++slot) { StoredProfile profile; if (ReadProfile(handle, slot, &profile)) output.push_back(std::move(profile)); }
+    return output;
 }
 
 struct ResponseBuffer { std::string data; bool overflow = false; };
@@ -67,43 +160,102 @@ std::string ProviderErrorMessage(const std::string& response) {
 
 AiProviderConfig AiConfigService::GetPublicConfig() const {
     AiProviderConfig result;
-    nvs_handle_t handle;
-    if (nvs_open(kNamespace, NVS_READONLY, &handle) != ESP_OK) return result;
-    std::string key;
-    result.configured = ReadString(handle, kEndpoint, kEndpointMax, &result.endpoint) &&
-                        ReadString(handle, kModel, kModelMax, &result.model) &&
-                        ReadString(handle, kKey, kKeyMax, &key);
-    nvs_close(handle);
-    if (result.configured && key.size() >= 4) result.key_last4 = key.substr(key.size() - 4);
-    else if (!result.configured) { result.endpoint.clear(); result.model.clear(); }
+    const auto profiles = ListProfiles();
+    for (const auto& profile : profiles) {
+        if (!profile.active) continue;
+        result.configured = true;
+        result.profile_id = profile.id;
+        result.profile_name = profile.name;
+        result.endpoint = profile.endpoint;
+        result.model = profile.model;
+        result.key_last4 = profile.key_last4;
+        break;
+    }
     return result;
 }
 
 bool AiConfigService::GetSecret(std::string* endpoint, std::string* model, std::string* key) const {
     if (!endpoint || !model || !key) return false;
+    if (EnsureProfileMigration() != ESP_OK) return false;
     nvs_handle_t handle;
-    if (nvs_open(kNamespace, NVS_READONLY, &handle) != ESP_OK) return false;
-    const bool ok = ReadString(handle, kEndpoint, kEndpointMax, endpoint) &&
-                    ReadString(handle, kModel, kModelMax, model) && ReadString(handle, kKey, kKeyMax, key);
+    if (nvs_open(kProfilesNamespace, NVS_READONLY, &handle) != ESP_OK) return false;
+    std::string active;
+    (void)ReadString(handle, kActiveProfile, 33, &active);
+    bool ok = false;
+    for (const auto& profile : ReadAllProfiles(handle)) {
+        if (profile.id == active) { *endpoint = profile.endpoint; *model = profile.model; *key = profile.key; ok = true; break; }
+    }
     nvs_close(handle);
     return ok;
 }
 
 esp_err_t AiConfigService::Save(const std::string& endpoint, const std::string& model, const std::string& api_key) {
-    if (endpoint.rfind("https://", 0) != 0 || endpoint.size() >= kEndpointMax || model.empty() ||
-        model.size() >= kModelMax || api_key.size() >= kKeyMax) return ESP_ERR_INVALID_ARG;
-    std::string stored_key = api_key;
-    if (stored_key.empty()) {
-        std::string old_endpoint, old_model;
-        if (!GetSecret(&old_endpoint, &old_model, &stored_key)) return ESP_ERR_INVALID_ARG;
-    }
-    if (stored_key.size() < 8) return ESP_ERR_INVALID_ARG;
+    const auto current = GetPublicConfig();
+    AiProviderProfile output;
+    return SaveProfile(current.profile_id.empty() ? "default" : current.profile_id,
+                       current.profile_name.empty() ? "默认模型" : current.profile_name,
+                       endpoint, model, api_key, &output);
+}
+
+std::vector<AiProviderProfile> AiConfigService::ListProfiles() const {
+    std::vector<AiProviderProfile> output;
+    if (EnsureProfileMigration() != ESP_OK) return output;
     nvs_handle_t handle;
-    esp_err_t err = nvs_open(kNamespace, NVS_READWRITE, &handle);
-    if (err != ESP_OK) return err;
-    err = nvs_set_str(handle, kEndpoint, endpoint.c_str());
-    if (err == ESP_OK) err = nvs_set_str(handle, kModel, model.c_str());
-    if (err == ESP_OK) err = nvs_set_str(handle, kKey, stored_key.c_str());
+    if (nvs_open(kProfilesNamespace, NVS_READONLY, &handle) != ESP_OK) return output;
+    std::string active;
+    (void)ReadString(handle, kActiveProfile, 33, &active);
+    for (const auto& stored : ReadAllProfiles(handle)) {
+        AiProviderProfile profile;
+        profile.id = stored.id; profile.name = stored.name; profile.endpoint = stored.endpoint; profile.model = stored.model;
+        profile.active = stored.id == active;
+        if (stored.key.size() >= 4) profile.key_last4 = stored.key.substr(stored.key.size() - 4);
+        output.push_back(std::move(profile));
+    }
+    nvs_close(handle);
+    return output;
+}
+
+esp_err_t AiConfigService::SaveProfile(const std::string& id, const std::string& name, const std::string& endpoint,
+                                       const std::string& model, const std::string& api_key, AiProviderProfile* output) {
+    if (!IsSafeProfileId(id) || name.empty() || name.size() > 64 || endpoint.rfind("https://", 0) != 0 ||
+        endpoint.size() >= kEndpointMax || model.empty() || model.size() >= kModelMax || api_key.size() >= kKeyMax) return ESP_ERR_INVALID_ARG;
+    esp_err_t err = EnsureProfileMigration(); if (err != ESP_OK) return err;
+    nvs_handle_t handle; err = nvs_open(kProfilesNamespace, NVS_READWRITE, &handle); if (err != ESP_OK) return err;
+    const auto existing = ReadAllProfiles(handle);
+    std::size_t slot = existing.size(); std::string key = api_key; bool found = false;
+    for (std::size_t i = 0; i < existing.size(); ++i) if (existing[i].id == id) { slot = i; found = true; if (key.empty()) key = existing[i].key; break; }
+    if (slot >= kMaxProfiles || key.size() < 8) { nvs_close(handle); return ESP_ERR_INVALID_ARG; }
+    StoredProfile saved{id, name, endpoint, model, key};
+    err = WriteProfile(handle, slot, saved);
+    if (err == ESP_OK && !found) err = nvs_set_u8(handle, kProfileCount, static_cast<std::uint8_t>(existing.size() + 1));
+    std::string active;
+    (void)ReadString(handle, kActiveProfile, 33, &active);
+    if (err == ESP_OK && active.empty()) err = nvs_set_str(handle, kActiveProfile, id.c_str());
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    if (err == ESP_OK && output) { output->id = id; output->name = name; output->endpoint = endpoint; output->model = model; output->key_last4 = key.substr(key.size() - 4); output->active = active.empty() || active == id; }
+    return err;
+}
+
+esp_err_t AiConfigService::ActivateProfile(const std::string& id) {
+    if (!IsSafeProfileId(id) || EnsureProfileMigration() != ESP_OK) return ESP_ERR_INVALID_ARG;
+    nvs_handle_t handle; esp_err_t err = nvs_open(kProfilesNamespace, NVS_READWRITE, &handle); if (err != ESP_OK) return err;
+    bool exists = false; for (const auto& profile : ReadAllProfiles(handle)) if (profile.id == id) { exists = true; break; }
+    if (!exists) { nvs_close(handle); return ESP_ERR_NOT_FOUND; }
+    err = nvs_set_str(handle, kActiveProfile, id.c_str()); if (err == ESP_OK) err = nvs_commit(handle); nvs_close(handle); return err;
+}
+
+esp_err_t AiConfigService::DeleteProfile(const std::string& id) {
+    if (!IsSafeProfileId(id) || EnsureProfileMigration() != ESP_OK) return ESP_ERR_INVALID_ARG;
+    nvs_handle_t handle; esp_err_t err = nvs_open(kProfilesNamespace, NVS_READWRITE, &handle); if (err != ESP_OK) return err;
+    auto profiles = ReadAllProfiles(handle); std::size_t remove = profiles.size();
+    for (std::size_t i = 0; i < profiles.size(); ++i) if (profiles[i].id == id) { remove = i; break; }
+    if (remove == profiles.size()) { nvs_close(handle); return ESP_ERR_NOT_FOUND; }
+    std::string active; (void)ReadString(handle, kActiveProfile, 33, &active);
+    for (std::size_t i = remove; i + 1 < profiles.size(); ++i) { err = WriteProfile(handle, i, profiles[i + 1]); if (err != ESP_OK) break; }
+    if (err == ESP_OK) EraseProfile(handle, profiles.size() - 1);
+    if (err == ESP_OK) err = nvs_set_u8(handle, kProfileCount, static_cast<std::uint8_t>(profiles.size() - 1));
+    if (err == ESP_OK && active == id) { if (profiles.size() > 1) err = nvs_set_str(handle, kActiveProfile, profiles[remove == 0 ? 1 : 0].id.c_str()); else err = nvs_erase_key(handle, kActiveProfile); }
     if (err == ESP_OK) err = nvs_commit(handle);
     nvs_close(handle);
     return err;
@@ -189,9 +341,12 @@ esp_err_t AiConfigService::TestConnection(bool allow_billable_test, AiConfigTest
 
 esp_err_t AiConfigService::Clear() {
     nvs_handle_t handle;
-    esp_err_t err = nvs_open(kNamespace, NVS_READWRITE, &handle);
+    esp_err_t err = nvs_open(kProfilesNamespace, NVS_READWRITE, &handle);
     if (err != ESP_OK) return err;
     err = nvs_erase_all(handle);
+    // Do not re-import a deliberately deleted legacy configuration on the
+    // next read. The legacy namespace itself is retained for rollback safety.
+    if (err == ESP_OK) err = nvs_set_u8(handle, kProfilesMigrated, 1);
     if (err == ESP_OK) err = nvs_commit(handle);
     nvs_close(handle);
     return err;

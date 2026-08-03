@@ -2,6 +2,7 @@
 
 #include <cstdio>
 
+#include "esp_random.h"
 #include "esp_timer.h"
 
 namespace photopainter::product {
@@ -25,6 +26,7 @@ bool IsAllowedTransition(JobState previous, JobState next) {
 
 JobService::JobService() {
     mutex_ = xSemaphoreCreateMutex();
+    boot_nonce_ = esp_random();
 }
 
 JobService::~JobService() {
@@ -173,27 +175,35 @@ std::size_t JobService::FindAvailableSlotLocked() const {
         if (!entries_[index].occupied) return index;
     }
 
-    // Keep every completed job visible for a bounded period. In particular a
-    // mode-cover refresh may take tens of seconds, so replacing its terminal
-    // record immediately makes a client see a misleading "not found" while
-    // it is still polling the request it just submitted.
+    // Prefer retaining completed jobs for their normal observation window.
+    // When the fixed registry is exhausted, however, an old terminal record
+    // must not make the whole product appear "busy" forever. Active jobs are
+    // never eligible here; reclaiming the oldest terminal is safe because its
+    // durable outcome already lives in the media/configuration services.
     const EpochMs now = NowMs();
     std::size_t oldest_terminal = kNoSlot;
+    std::size_t oldest_any_terminal = kNoSlot;
     for (std::size_t index = 0; index < entries_.size(); ++index) {
         const JobSnapshot& candidate = entries_[index].snapshot;
-        if (!IsTerminal(candidate.state) || candidate.finished_at_ms == 0 ||
-            now - candidate.finished_at_ms < kTerminalRetentionMs) continue;
-        if (oldest_terminal == kNoSlot ||
-            candidate.finished_at_ms < entries_[oldest_terminal].snapshot.finished_at_ms) {
+        if (!IsTerminal(candidate.state) || candidate.finished_at_ms == 0) continue;
+        if (oldest_any_terminal == kNoSlot ||
+            candidate.finished_at_ms < entries_[oldest_any_terminal].snapshot.finished_at_ms) {
+            oldest_any_terminal = index;
+        }
+        if (now - candidate.finished_at_ms >= kTerminalRetentionMs &&
+            (oldest_terminal == kNoSlot ||
+                candidate.finished_at_ms < entries_[oldest_terminal].snapshot.finished_at_ms)) {
             oldest_terminal = index;
         }
     }
-    return oldest_terminal;
+    return oldest_terminal != kNoSlot ? oldest_terminal : oldest_any_terminal;
 }
 
 JobId JobService::NextJobIdLocked() {
-    char value[24];
-    std::snprintf(value, sizeof(value), "job-%lu", static_cast<unsigned long>(next_sequence_++));
+    char value[40];
+    // Job ids name temporary TF preview directories. Include a boot nonce so
+    // an App/firmware restart can never collide with a retained preview.
+    std::snprintf(value, sizeof(value), "job-%08lx-%lu", static_cast<unsigned long>(boot_nonce_), static_cast<unsigned long>(next_sequence_++));
     return value;
 }
 

@@ -15,6 +15,7 @@
 #include "job_service.h"
 #include "job_runtime.h"
 #include "local_album_playback_runtime.h"
+#include "ai_album_playback_runtime.h"
 #include "media_library.h"
 #include "media_upload_service.h"
 #include "ai_runtime.h"
@@ -241,6 +242,9 @@ void AppendPlaybackResponse(std::string* output, bool ok, const char* code, cons
 // semantics without exposing service internals or retaining unbounded JSON.
 struct PlaybackRequestRecord {
     bool occupied = false;
+    // Local and AI playback are independent API domains.  request_id is
+    // client-generated, so it must not be allowed to collide across them.
+    std::string domain;
     RequestId request_id;
     std::string fingerprint;
     PlaybackSnapshot snapshot;
@@ -256,17 +260,18 @@ std::string PlaybackRequestFingerprint(Revision expected_revision, const std::st
            std::to_string(interval_seconds) + ":" + order;
 }
 
-const PlaybackRequestRecord* FindPlaybackRequestRecord(const RequestId& request_id) {
+const PlaybackRequestRecord* FindPlaybackRequestRecord(const char* domain, const RequestId& request_id) {
     for (const auto& record : g_playback_request_records) {
-        if (record.occupied && record.request_id == request_id) return &record;
+        if (record.occupied && record.domain == domain && record.request_id == request_id) return &record;
     }
     return nullptr;
 }
 
-void RememberPlaybackRequest(const RequestId& request_id, const std::string& fingerprint,
+void RememberPlaybackRequest(const char* domain, const RequestId& request_id, const std::string& fingerprint,
                              const PlaybackSnapshot& snapshot) {
     auto& record = g_playback_request_records[g_next_playback_request_record];
     record.occupied = true;
+    record.domain = domain;
     record.request_id = request_id;
     record.fingerprint = fingerprint;
     record.snapshot = snapshot;
@@ -368,7 +373,7 @@ esp_err_t UpdateLocalAlbumPlayback(httpd_req_t* req) {
     }
 
     const std::string fingerprint = PlaybackRequestFingerprint(expected_revision, mode_text, interval_seconds, order_text);
-    if (const auto* existing = FindPlaybackRequestRecord(request_id); existing != nullptr) {
+    if (const auto* existing = FindPlaybackRequestRecord("local", request_id); existing != nullptr) {
         if (existing->fingerprint != fingerprint) {
             std::string response;
             AppendPlaybackResponse(&response, false, "request_id_conflict", "request_id was already used for a different playback configuration", current, &request_id);
@@ -399,7 +404,7 @@ esp_err_t UpdateLocalAlbumPlayback(httpd_req_t* req) {
         AppendPlaybackResponse(&response, false, "playback_update_failed", "unable to save playback configuration", updated, &request_id);
         return SendJson(req, response.c_str(), "503 Service Unavailable");
     }
-    RememberPlaybackRequest(request_id, fingerprint, updated);
+    RememberPlaybackRequest("local", request_id, fingerprint, updated);
     std::string response;
     AppendPlaybackResponse(&response, true, "playback_saved", "playback configuration saved", updated, &request_id);
     return SendJson(req, response.c_str());
@@ -559,7 +564,21 @@ esp_err_t JobStatus(httpd_req_t* req) {
     if (marker == nullptr || std::strlen(marker + 13) == 0 || std::strlen(marker + 13) > 63) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
     JobSnapshot job;
     if (!GetProductJobService().Get(marker + 13, &job)) {
-        return SendJson(req, "{\"ok\":false,\"code\":\"job_not_found\",\"message\":\"job result is unavailable\"}", "404 Not Found");
+        // JobService is intentionally RAM-bounded. The latest AI terminal
+        // record survives a reboot so an App that was polling during a
+        // firmware update can recover its pending preview instead of being
+        // left with an ambiguous HTML 404 response.
+        const auto last = GetAiGenerationService().GetLastTaskSnapshot();
+        if (last.available && last.job_id == marker + 13) {
+            job.job_id = last.job_id;
+            job.kind = JobKind::kAiGeneration;
+            job.state = last.state == "success" ? JobState::kSuccess : JobState::kFailed;
+            job.phase = last.phase.empty() ? (last.state == "success" ? "completed" : "failed") : last.phase;
+            job.progress_percent = last.state == "success" ? 100 : 0;
+            job.error_code = last.error_code;
+        } else {
+            return SendJson(req, "{\"ok\":false,\"code\":\"job_not_found\",\"message\":\"job result is unavailable\"}", "404 Not Found");
+        }
     }
     char body[384];
     std::snprintf(body, sizeof(body), "{\"ok\":true,\"code\":\"ok\",\"data\":{\"job_id\":\"%s\",\"state\":%u,\"phase\":\"%s\",\"progress_percent\":%u,\"error_code\":\"%s\",\"media_id\":\"%s\"}}", job.job_id.c_str(), static_cast<unsigned>(job.state), job.phase.c_str(), static_cast<unsigned>(job.progress_percent), job.error_code.c_str(), job.media_id.c_str());
@@ -758,6 +777,8 @@ esp_err_t DeleteMedia(httpd_req_t* req) {
     }
     if (item.category == MediaCategory::kLocal) {
         GetLocalAlbumPlaybackService().NotifyMediaDeleted(item.media_id);
+    } else if (item.category == MediaCategory::kAi) {
+        GetAiAlbumPlaybackService().NotifyMediaDeleted(item.media_id);
     }
     std::string response = "{\"ok\":true,\"code\":\"media_deleted\",\"data\":{\"media_id\":\"" + item.media_id + "\",\"revision\":";
     AppendUInt64(&response, GetMediaLibrary().revision());
@@ -982,7 +1003,9 @@ bool ReadBoundedJson(httpd_req_t* req, JsonDocument* output, std::size_t max_byt
 esp_err_t GetAiConfig(httpd_req_t* req) {
     const auto config = GetAiConfigService().GetPublicConfig();
     std::string body = "{\"ok\":true,\"code\":\"ok\",\"data\":{\"configured\":";
-    body.append(config.configured ? "true" : "false").append(",\"endpoint\":"); AppendJsonString(&body, config.endpoint);
+    body.append(config.configured ? "true" : "false").append(",\"profile_id\":"); AppendJsonString(&body, config.profile_id);
+    body.append(",\"profile_name\":"); AppendJsonString(&body, config.profile_name);
+    body.append(",\"endpoint\":"); AppendJsonString(&body, config.endpoint);
     body.append(",\"model\":"); AppendJsonString(&body, config.model);
     body.append(",\"key_last4\":"); AppendJsonString(&body, config.key_last4); body.append("}}");
     return SendJson(req, body.c_str());
@@ -1025,6 +1048,142 @@ esp_err_t TestAiConfig(httpd_req_t* req) {
     return SendJson(req, body.c_str());
 }
 
+void AppendAiProfileJson(std::string* output, const AiProviderProfile& profile) {
+    output->append("{\"id\":"); AppendJsonString(output, profile.id);
+    output->append(",\"name\":"); AppendJsonString(output, profile.name);
+    output->append(",\"endpoint\":"); AppendJsonString(output, profile.endpoint);
+    output->append(",\"model\":"); AppendJsonString(output, profile.model);
+    output->append(",\"key_last4\":"); AppendJsonString(output, profile.key_last4);
+    output->append(",\"active\":").append(profile.active ? "true" : "false").append("}");
+}
+
+esp_err_t ListAiProfiles(httpd_req_t* req) {
+    const auto profiles = GetAiConfigService().ListProfiles();
+    std::string body = "{\"ok\":true,\"code\":\"ok\",\"data\":{\"profiles\":[";
+    for (std::size_t index = 0; index < profiles.size(); ++index) {
+        if (index != 0) body.push_back(',');
+        AppendAiProfileJson(&body, profiles[index]);
+    }
+    body.append("]}}");
+    return SendJson(req, body.c_str());
+}
+
+esp_err_t SaveAiProfile(httpd_req_t* req) {
+    JsonDocument input;
+    if (!ReadBoundedJson(req, &input, 1536)) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    const std::string id = input["id"] | "";
+    const std::string name = input["name"] | "";
+    const std::string endpoint = input["endpoint"] | "";
+    const std::string model = input["model"] | "";
+    const std::string key = input["api_key"] | "";
+    AiProviderProfile saved;
+    const esp_err_t result = GetAiConfigService().SaveProfile(id, name, endpoint, model, key, &saved);
+    if (result != ESP_OK) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_ai_profile\"}", "400 Bad Request");
+    std::string body = "{\"ok\":true,\"code\":\"ai_profile_saved\",\"data\":";
+    AppendAiProfileJson(&body, saved);
+    body.append("}");
+    return SendJson(req, body.c_str());
+}
+
+esp_err_t ActivateAiProfile(httpd_req_t* req) {
+    JsonDocument input;
+    if (!ReadBoundedJson(req, &input, 128)) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    const std::string id = input["id"] | "";
+    const esp_err_t result = GetAiConfigService().ActivateProfile(id);
+    if (result == ESP_ERR_NOT_FOUND) return SendJson(req, "{\"ok\":false,\"code\":\"ai_profile_not_found\"}", "404 Not Found");
+    if (result != ESP_OK) return SendJson(req, "{\"ok\":false,\"code\":\"ai_profile_activate_failed\"}", "400 Bad Request");
+    return SendJson(req, "{\"ok\":true,\"code\":\"ai_profile_activated\"}");
+}
+
+esp_err_t DeleteAiProfile(httpd_req_t* req) {
+    JsonDocument input;
+    if (!ReadBoundedJson(req, &input, 128)) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    const esp_err_t result = GetAiConfigService().DeleteProfile(input["id"] | "");
+    if (result == ESP_ERR_NOT_FOUND) return SendJson(req, "{\"ok\":false,\"code\":\"ai_profile_not_found\"}", "404 Not Found");
+    if (result != ESP_OK) return SendJson(req, "{\"ok\":false,\"code\":\"ai_profile_delete_failed\"}", "400 Bad Request");
+    return SendJson(req, "{\"ok\":true,\"code\":\"ai_profile_deleted\"}");
+}
+
+esp_err_t GetAiAlbumPlayback(httpd_req_t* req) {
+    std::string response;
+    AppendPlaybackResponse(&response, true, "ok", "playback configuration loaded",
+                           GetAiAlbumPlaybackService().GetSnapshot(), nullptr);
+    return SendJson(req, response.c_str());
+}
+
+esp_err_t UpdateAiAlbumPlayback(httpd_req_t* req) {
+    const PlaybackSnapshot current = GetAiAlbumPlaybackService().GetSnapshot();
+    if (req == nullptr || req->content_len <= 0 || req->content_len > 512) {
+        std::string response;
+        AppendPlaybackResponse(&response, false, "invalid_request", "invalid playback request", current, nullptr);
+        return SendJson(req, response.c_str(), "400 Bad Request");
+    }
+    char body[513]{};
+    int received_total = 0;
+    while (received_total < req->content_len) {
+        const int received = httpd_req_recv(req, body + received_total, req->content_len - received_total);
+        if (received <= 0) {
+            std::string response;
+            AppendPlaybackResponse(&response, false, "invalid_request", "incomplete playback request", current, nullptr);
+            return SendJson(req, response.c_str(), "400 Bad Request");
+        }
+        received_total += received;
+    }
+    JsonDocument input;
+    if (deserializeJson(input, body) != DeserializationError::Ok) {
+        std::string response;
+        AppendPlaybackResponse(&response, false, "invalid_request", "invalid playback JSON", current, nullptr);
+        return SendJson(req, response.c_str(), "400 Bad Request");
+    }
+    const RequestId request_id = input["request_id"] | "";
+    const std::string mode_text = input["mode"] | "";
+    const std::string order_text = input["order"] | "";
+    const Revision expected_revision = input["expected_revision"] | 0ULL;
+    const std::uint32_t interval_seconds = input["interval_seconds"] | 0U;
+    const bool valid = !request_id.empty() && request_id.size() <= 64 &&
+        !input["expected_revision"].isNull() && !input["interval_seconds"].isNull() &&
+        (mode_text == "auto" || mode_text == "paused") &&
+        (order_text == "sequential" || order_text == "random") &&
+        AiAlbumPlaybackService::IsAllowedInterval(interval_seconds);
+    if (!valid) {
+        std::string response;
+        AppendPlaybackResponse(&response, false, "invalid_request", "invalid playback configuration", current, &request_id);
+        return SendJson(req, response.c_str(), "400 Bad Request");
+    }
+    const std::string fingerprint = PlaybackRequestFingerprint(expected_revision, mode_text, interval_seconds, order_text);
+    if (const auto* existing = FindPlaybackRequestRecord("ai", request_id); existing != nullptr) {
+        if (existing->fingerprint != fingerprint) {
+            std::string response;
+            AppendPlaybackResponse(&response, false, "request_id_conflict", "request_id was already used for a different AI playback configuration", current, &request_id);
+            return SendJson(req, response.c_str(), "409 Conflict");
+        }
+        const PlaybackSnapshot replay =
+            current.config.revision == existing->snapshot.config.revision ? current : existing->snapshot;
+        std::string response;
+        AppendPlaybackResponse(&response, true, "playback_saved", "AI playback configuration already saved", replay, &request_id);
+        return SendJson(req, response.c_str());
+    }
+    PlaybackSnapshot updated;
+    const esp_err_t result = GetAiAlbumPlaybackService().UpdateConfig(
+        mode_text == "auto" ? PlaybackMode::kAuto : PlaybackMode::kPaused, interval_seconds,
+        order_text == "random" ? PlaybackOrder::kRandom : PlaybackOrder::kSequential,
+        expected_revision, &updated);
+    if (result == ESP_ERR_INVALID_STATE) {
+        std::string response;
+        AppendPlaybackResponse(&response, false, "revision_conflict", "playback configuration changed on device", updated, &request_id);
+        return SendJson(req, response.c_str(), "409 Conflict");
+    }
+    if (result != ESP_OK) {
+        std::string response;
+        AppendPlaybackResponse(&response, false, "playback_update_failed", "unable to save playback configuration", updated, &request_id);
+        return SendJson(req, response.c_str(), "503 Service Unavailable");
+    }
+    RememberPlaybackRequest("ai", request_id, fingerprint, updated);
+    std::string response;
+    AppendPlaybackResponse(&response, true, "playback_saved", "playback configuration saved", updated, &request_id);
+    return SendJson(req, response.c_str());
+}
+
 esp_err_t CreateAiGeneration(httpd_req_t* req) {
     JsonDocument input;
     if (!ReadBoundedJson(req, &input)) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
@@ -1036,6 +1195,39 @@ esp_err_t CreateAiGeneration(httpd_req_t* req) {
     if (result != ESP_OK) { std::string body="{\"ok\":false,\"code\":"; AppendJsonString(&body, code); body.append("}"); return SendJson(req, body.c_str(), code=="ai_not_configured" ? "409 Conflict" : "503 Service Unavailable"); }
     std::string body = "{\"ok\":true,\"code\":"; AppendJsonString(&body, code); body.append(",\"data\":{\"job_id\":"); AppendJsonString(&body, job.job_id); body.append("}}");
     return SendJson(req, body.c_str(), "202 Accepted");
+}
+
+esp_err_t GetActiveAiGeneration(httpd_req_t* req) {
+    const auto active = GetAiGenerationService().GetActiveTaskSnapshot();
+    std::string body = "{\"ok\":true,\"code\":\"ok\",\"data\":{\"has_active_task\":";
+    body.append(active.has_active_task ? "true" : "false");
+    body.append(",\"job_id\":"); AppendJsonString(&body, active.job_id);
+    body.append(",\"state\":"); AppendJsonString(&body, active.state);
+    body.append(",\"phase\":"); AppendJsonString(&body, active.phase);
+    body.append(",\"kind\":"); AppendJsonString(&body, active.kind);
+    body.append(",\"prompt_summary\":"); AppendJsonString(&body, active.prompt_summary);
+    body.append("}}");
+    return SendJson(req, body.c_str());
+}
+
+esp_err_t GetLastAiGeneration(httpd_req_t* req) {
+    const auto last = GetAiGenerationService().GetLastTaskSnapshot();
+    std::string body = "{\"ok\":true,\"code\":\"ok\",\"data\":{\"available\":";
+    body.append(last.available ? "true" : "false");
+    body.append(",\"job_id\":"); AppendJsonString(&body, last.job_id);
+    body.append(",\"kind\":"); AppendJsonString(&body, last.kind);
+    body.append(",\"state\":"); AppendJsonString(&body, last.state);
+    body.append(",\"phase\":"); AppendJsonString(&body, last.phase);
+    body.append(",\"error_code\":"); AppendJsonString(&body, last.error_code);
+    // `finished_at_ms` is derived from esp_timer and is deliberately a
+    // boot-local monotonic value. Name it as such so clients never format it
+    // as a Unix date.
+    body.append(",\"finished_at_uptime_ms\":"); AppendUInt64(&body, last.finished_at_ms);
+    body.append(",\"profile_id\":"); AppendJsonString(&body, last.profile_id);
+    body.append(",\"profile_name\":"); AppendJsonString(&body, last.profile_name);
+    body.append(",\"prompt_summary\":"); AppendJsonString(&body, last.prompt_summary);
+    body.append("}}");
+    return SendJson(req, body.c_str());
 }
 
 esp_err_t GetAiGenerationPreview(httpd_req_t* req) {
@@ -1150,6 +1342,8 @@ esp_err_t RegisterProductApi(httpd_handle_t server) {
         {.uri="/api/v1/display/status", .method=HTTP_GET, .handler=DisplayStatus, .user_ctx=nullptr},
         {.uri="/api/v1/local-album/playback", .method=HTTP_GET, .handler=GetLocalAlbumPlayback, .user_ctx=nullptr},
         {.uri="/api/v1/local-album/playback", .method=HTTP_POST, .handler=UpdateLocalAlbumPlayback, .user_ctx=nullptr},
+        {.uri="/api/v1/ai-album/playback", .method=HTTP_GET, .handler=GetAiAlbumPlayback, .user_ctx=nullptr},
+        {.uri="/api/v1/ai-album/playback", .method=HTTP_POST, .handler=UpdateAiAlbumPlayback, .user_ctx=nullptr},
         {.uri="/api/v1/network/status", .method=HTTP_GET, .handler=NetworkStatus, .user_ctx=nullptr},
         {.uri="/api/v1/network/scan", .method=HTTP_POST, .handler=ScanWifi, .user_ctx=nullptr},
         {.uri="/api/v1/network/sta", .method=HTTP_POST, .handler=ConfigureSta, .user_ctx=nullptr},
@@ -1162,7 +1356,13 @@ esp_err_t RegisterProductApi(httpd_handle_t server) {
         {.uri="/api/v1/ai/config", .method=HTTP_POST, .handler=SaveAiConfig, .user_ctx=nullptr},
         {.uri="/api/v1/ai/config", .method=HTTP_DELETE, .handler=DeleteAiConfig, .user_ctx=nullptr},
         {.uri="/api/v1/ai/config/test", .method=HTTP_POST, .handler=TestAiConfig, .user_ctx=nullptr},
+        {.uri="/api/v1/ai/config/profiles", .method=HTTP_GET, .handler=ListAiProfiles, .user_ctx=nullptr},
+        {.uri="/api/v1/ai/config/profiles", .method=HTTP_POST, .handler=SaveAiProfile, .user_ctx=nullptr},
+        {.uri="/api/v1/ai/config/profiles/activate", .method=HTTP_POST, .handler=ActivateAiProfile, .user_ctx=nullptr},
+        {.uri="/api/v1/ai/config/profiles", .method=HTTP_DELETE, .handler=DeleteAiProfile, .user_ctx=nullptr},
         {.uri="/api/v1/ai/generation/jobs", .method=HTTP_POST, .handler=CreateAiGeneration, .user_ctx=nullptr},
+        {.uri="/api/v1/ai/generation/active", .method=HTTP_GET, .handler=GetActiveAiGeneration, .user_ctx=nullptr},
+        {.uri="/api/v1/ai/generation/last", .method=HTTP_GET, .handler=GetLastAiGeneration, .user_ctx=nullptr},
         {.uri="/api/v1/ai/generation/jobs/*", .method=HTTP_GET, .handler=GetAiGenerationPreview, .user_ctx=nullptr},
         {.uri="/api/v1/ai/generation/jobs/*", .method=HTTP_POST, .handler=ConfirmAiGenerationSave, .user_ctx=nullptr},
         {.uri="/api/v1/media/upload", .method=HTTP_POST, .handler=UploadMedia, .user_ctx=nullptr},

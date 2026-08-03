@@ -130,6 +130,7 @@ esp_err_t StorageService::Remount() {
         if (result == ESP_OK) result = EnsureDirectoryTreeLocked(mount_point_ + "/media/local");
         if (result == ESP_OK) result = EnsureDirectoryTreeLocked(mount_point_ + "/media/ai");
         if (result == ESP_OK) result = EnsureDirectoryTreeLocked(mount_point_ + "/.staging");
+        if (result == ESP_OK) result = EnsureDirectoryTreeLocked(mount_point_ + "/.ai_preview");
         if (result == ESP_OK) result = EnsureDirectoryTreeLocked(mount_point_ + "/state");
         if (result == ESP_OK) result = EnsureDirectoryTreeLocked(mount_point_ + "/system");
     }
@@ -341,6 +342,29 @@ esp_err_t StorageService::CleanupInterruptedTransactionsLocked() {
     return ESP_OK;
 }
 
+esp_err_t StorageService::CleanupAiPreviewsLocked() {
+    // preview_ lives only in RAM and is invalid after boot/remount. Retaining
+    // its directory would make the newly restarted JobService's job-1 collide
+    // with .ai_preview/job-1 during an otherwise successful model request.
+    const std::string preview_root = mount_point_ + "/.ai_preview";
+    DIR* directory = opendir(preview_root.c_str());
+    if (directory == nullptr) return ESP_FAIL;
+    esp_err_t result = ESP_OK;
+    while (result == ESP_OK) {
+        struct dirent* entry = readdir(directory);
+        if (entry == nullptr) break;
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        const std::string candidate = preview_root + "/" + entry->d_name;
+        if (IsDirectory(candidate)) {
+            result = RemoveDirectoryTreeLocked(candidate);
+        } else if (unlink(candidate.c_str()) != 0) {
+            result = ESP_FAIL;
+        }
+    }
+    closedir(directory);
+    return result;
+}
+
 esp_err_t StorageService::ReadCommittedFile(const std::string& relative_path,
                                             void* buffer,
                                             std::size_t expected_bytes) {
@@ -435,6 +459,17 @@ esp_err_t StorageService::StreamPreviewFile(
     }
     xSemaphoreGive(mutex_);
     return result;
+}
+
+bool StorageService::PreviewFileExists(const std::string& job_id) {
+    if (mutex_ == nullptr || !IsSafeTransactionId(job_id)) return false;
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    const esp_err_t ready = EnsureReadyLocked();
+    const std::string path = mount_point_ + "/.ai_preview/" + job_id + "/source.jpg";
+    FILE* file = ready == ESP_OK ? fopen(path.c_str(), "rb") : nullptr;
+    if (file != nullptr) fclose(file);
+    xSemaphoreGive(mutex_);
+    return file != nullptr;
 }
 
 esp_err_t StorageService::DeletePreview(const std::string& job_id) {

@@ -16,6 +16,7 @@
 #include "storage_runtime.h"
 #include "media_library_runtime.h"
 #include "local_album_playback_runtime.h"
+#include "ai_album_playback_runtime.h"
 #include "display_runtime.h"
 #include "indicator_service.h"
 #include "device_log_service.h"
@@ -152,6 +153,8 @@ extern "C" void app_main(void) {
     if (product_display_ready) {
         ret = photopainter::product::InitializeLocalAlbumPlaybackService();
         if (ret != ESP_OK) ESP_LOGW(TAG, "Local album playback unavailable; continuing without auto playback");
+        ret = photopainter::product::InitializeAiAlbumPlaybackService();
+        if (ret != ESP_OK) ESP_LOGW(TAG, "AI album playback unavailable; continuing without auto playback");
     }
     ServerPort_StartProductLocalApi(SDPort);
     photopainter::product::InitializeXiaozhiRuntime();

@@ -194,13 +194,17 @@ esp_err_t InitializeProductNetwork() {
     RefreshApRuntimeState();
     wifi_config_t persisted_sta{};
     ESP_RETURN_ON_ERROR(esp_wifi_get_config(WIFI_IF_STA, &persisted_sta), "product_network", "read STA config");
+    // Mark the runtime ready before the first connect attempt. A fast initial
+    // disconnect can otherwise arrive while `initialized` is still false;
+    // its reconnect timer is then skipped and STA remains offline until a
+    // user manually configures Wi-Fi again.
+    initialized = true;
     if (persisted_sta.sta.ssid[0] != '\0') {
         snapshot.sta_configured = true;
         snapshot.sta_ssid = reinterpret_cast<const char*>(persisted_sta.sta.ssid);
         (void)esp_wifi_connect();
     }
     ++snapshot.revision;
-    initialized = true;
     return ESP_OK;
 }
 
