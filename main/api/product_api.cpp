@@ -563,12 +563,20 @@ esp_err_t JobStatus(httpd_req_t* req) {
     const char* marker = std::strstr(req->uri, "/api/v1/jobs/");
     if (marker == nullptr || std::strlen(marker + 13) == 0 || std::strlen(marker + 13) > 63) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
     JobSnapshot job;
-    if (!GetProductJobService().Get(marker + 13, &job)) {
+    const auto last = GetAiGenerationService().GetLastTaskSnapshot();
+    const bool has_live_job = GetProductJobService().Get(marker + 13, &job);
+    const bool live_job_is_terminal = has_live_job &&
+        (job.state == JobState::kSuccess || job.state == JobState::kFailed ||
+         job.state == JobState::kCancelled || job.state == JobState::kTimeout);
+    // The media transaction is authoritative.  If a prior firmware task
+    // reached a durable AI terminal record but its RAM JobService snapshot was
+    // left at "committing", return the durable terminal result rather than
+    // making the App wait forever.
+    if (!has_live_job || (!live_job_is_terminal && last.available && last.job_id == marker + 13)) {
         // JobService is intentionally RAM-bounded. The latest AI terminal
         // record survives a reboot so an App that was polling during a
         // firmware update can recover its pending preview instead of being
         // left with an ambiguous HTML 404 response.
-        const auto last = GetAiGenerationService().GetLastTaskSnapshot();
         if (last.available && last.job_id == marker + 13) {
             job.job_id = last.job_id;
             job.kind = JobKind::kAiGeneration;
@@ -576,6 +584,7 @@ esp_err_t JobStatus(httpd_req_t* req) {
             job.phase = last.phase.empty() ? (last.state == "success" ? "completed" : "failed") : last.phase;
             job.progress_percent = last.state == "success" ? 100 : 0;
             job.error_code = last.error_code;
+            job.media_id = last.media_id;
         } else {
             return SendJson(req, "{\"ok\":false,\"code\":\"job_not_found\",\"message\":\"job result is unavailable\"}", "404 Not Found");
         }
@@ -1215,6 +1224,7 @@ esp_err_t GetLastAiGeneration(httpd_req_t* req) {
     std::string body = "{\"ok\":true,\"code\":\"ok\",\"data\":{\"available\":";
     body.append(last.available ? "true" : "false");
     body.append(",\"job_id\":"); AppendJsonString(&body, last.job_id);
+    body.append(",\"media_id\":"); AppendJsonString(&body, last.media_id);
     body.append(",\"kind\":"); AppendJsonString(&body, last.kind);
     body.append(",\"state\":"); AppendJsonString(&body, last.state);
     body.append(",\"phase\":"); AppendJsonString(&body, last.phase);

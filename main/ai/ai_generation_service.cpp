@@ -31,8 +31,16 @@ namespace {
 constexpr std::size_t kMaxSourceBytes = 4U * 1024U * 1024U;
 constexpr std::size_t kMaxResponseBytes = 8192U;
 constexpr std::uint64_t kRequiredBytes = kMaxSourceBytes + kDisplayFrameBytes + 4096U;
+constexpr std::size_t kMaxCropDecodePixels = 1500000U;
+constexpr char kGenerationProfileId[] = "eink-landscape-5x3-v1";
+constexpr char kEinkDisplayConstraint[] =
+    "\n\n[电子纸相框固定构图要求]\n"
+    "横向 5:3 构图，适配 800×480 像素全屏显示。"
+    "主体、人物和关键内容完整位于画面中央 80% 安全区域，"
+    "不要把关键细节、人物或文字贴近四周边缘；使用横向满屏构图，不要竖幅版式。";
 constexpr char kDiagNamespace[] = "ai_gen_diag";
 constexpr char kLastJob[] = "job";
+constexpr char kLastMediaId[] = "media_id";
 constexpr char kLastKind[] = "kind";
 constexpr char kLastState[] = "state";
 constexpr char kLastPhase[] = "phase";
@@ -66,6 +74,49 @@ std::string RequestFingerprint(const char* scope, const std::string& payload) {
         mbedtls_sha256_finish(&hash, digest) == 0;
     mbedtls_sha256_free(&hash);
     return ok ? std::string(scope) + Hex(digest) : std::string(scope) + "hash_failed";
+}
+std::string BuildEinkDisplayPrompt(const char* user_prompt) {
+    std::string prompt = user_prompt == nullptr ? "" : user_prompt;
+    prompt.append(kEinkDisplayConstraint);
+    return prompt;
+}
+bool ReadJpegDimensions(const std::string& path, int* width, int* height) {
+    if (width == nullptr || height == nullptr) return false;
+    FILE* file = fopen(path.c_str(), "rb");
+    if (file == nullptr) return false;
+    const int soi_a = fgetc(file);
+    const int soi_b = fgetc(file);
+    if (soi_a != 0xff || soi_b != 0xd8) { fclose(file); return false; }
+    bool found = false;
+    while (!found) {
+        int marker_start = fgetc(file);
+        while (marker_start == 0xff) marker_start = fgetc(file);
+        if (marker_start == EOF || marker_start == 0xda || marker_start == 0xd9) break;
+        const int length_hi = fgetc(file);
+        const int length_lo = fgetc(file);
+        if (length_hi == EOF || length_lo == EOF) break;
+        const int length = (length_hi << 8) | length_lo;
+        if (length < 2) break;
+        const bool is_sof = marker_start >= 0xc0 && marker_start <= 0xcf &&
+            marker_start != 0xc4 && marker_start != 0xc8 && marker_start != 0xcc;
+        if (is_sof && length >= 8) {
+            (void)fgetc(file);
+            const int height_hi = fgetc(file); const int height_lo = fgetc(file);
+            const int width_hi = fgetc(file); const int width_lo = fgetc(file);
+            if (height_hi != EOF && height_lo != EOF && width_hi != EOF && width_lo != EOF) {
+                *height = (height_hi << 8) | height_lo;
+                *width = (width_hi << 8) | width_lo;
+                found = *width > 0 && *height > 0;
+            }
+            break;
+        }
+        if (fseek(file, length - 2, SEEK_CUR) != 0) break;
+        int next = fgetc(file);
+        if (next == EOF) break;
+        if (ungetc(next, file) == EOF) break;
+    }
+    fclose(file);
+    return found;
 }
 uint8_t NibbleForRgb(const uint8_t* rgb) { if (rgb[0]==0 && rgb[1]==0 && rgb[2]==0) return 0; if (rgb[0]==255 && rgb[1]==255 && rgb[2]==255) return 1; if (rgb[0]==255 && rgb[1]==255 && rgb[2]==0) return 2; if (rgb[0]==255 && rgb[1]==0 && rgb[2]==0) return 3; if (rgb[0]==0 && rgb[1]==0 && rgb[2]==255) return 5; if (rgb[0]==0 && rgb[1]==255 && rgb[2]==0) return 6; return 1; }
 struct ResponseBuffer { std::string data; };
@@ -134,7 +185,69 @@ bool DownloadSource(StorageService* storage, const std::string& url, std::string
     if(result->transport_error!=ESP_OK||result->http_status<200||result->http_status>=300||context.error!=ESP_OK||context.bytes==0||!hash_ok||result->invalid_source) { result->code=DownloadFailureCode(*result); ESP_LOGW("ai_generation","source download failed: code=%s http=%d transport=%s tls=%d bytes=%llu jpeg=%d",result->code.c_str(),result->http_status,esp_err_to_name(result->transport_error),result->tls_error,static_cast<unsigned long long>(result->bytes),!result->invalid_source); return false; }
     const esp_err_t finalize=storage->FinalizeStagedFile("source.jpg",context.bytes); if(finalize!=ESP_OK){ result->storage_error=finalize; result->code=DownloadFailureCode(*result); return false; } *sha256=Hex(digest);*bytes=context.bytes;result->code="ok";return true;
 }
-esp_err_t ConvertToFrame(StorageService* storage, const std::string& absolute_source, std::string* sha256) { ImgDecodeDither decoder; uint8_t* decoded=nullptr; int decoded_bytes=0; const esp_err_t decode=decoder.ImgDecode_TFOneJPGPictureScaled(absolute_source.c_str(),kDisplayWidth,kDisplayHeight,&decoded,&decoded_bytes); if(decode!=ESP_OK||!decoded||decoded_bytes!=kDisplayWidth*kDisplayHeight*3){if(decoded)decoder.ImgDecode_JPGBufferFree(decoded);return ESP_ERR_INVALID_RESPONSE;} uint8_t* dithered=static_cast<uint8_t*>(heap_caps_malloc(kDisplayWidth*kDisplayHeight*3,MALLOC_CAP_SPIRAM)); if(!dithered){decoder.ImgDecode_JPGBufferFree(decoded);return ESP_ERR_NO_MEM;} decoder.ImgDecode_DitherRgb888(decoded,dithered,kDisplayWidth,kDisplayHeight); decoder.ImgDecode_JPGBufferFree(decoded); mbedtls_sha256_context hash;mbedtls_sha256_init(&hash);mbedtls_sha256_starts(&hash,false); std::uint8_t row[kDisplayWidth/2]; bool first=true; esp_err_t result=ESP_OK; for(int y=0;y<kDisplayHeight&&result==ESP_OK;++y){for(int x=0;x<kDisplayWidth;x+=2){const uint8_t a=NibbleForRgb(dithered+(y*kDisplayWidth+x)*3);const uint8_t b=NibbleForRgb(dithered+(y*kDisplayWidth+x+1)*3);row[x/2]=static_cast<uint8_t>((a<<4)|b);} if(mbedtls_sha256_update(&hash,row,sizeof(row))!=0) result=ESP_FAIL; if(result==ESP_OK)result=storage->AppendStagedFile("image.bin",row,sizeof(row),first); first=false;} heap_caps_free(dithered); unsigned char digest[32]{}; const bool hash_ok=mbedtls_sha256_finish(&hash,digest)==0;mbedtls_sha256_free(&hash);if(result!=ESP_OK||!hash_ok)return result==ESP_OK?ESP_FAIL:result;result=storage->FinalizeStagedFile("image.bin",kDisplayFrameBytes);if(result==ESP_OK)*sha256=Hex(digest);return result; }
+esp_err_t ConvertToFrame(StorageService* storage, const std::string& absolute_source, std::string* sha256) {
+    int source_width = 0;
+    int source_height = 0;
+    if (!ReadJpegDimensions(absolute_source, &source_width, &source_height)) return ESP_ERR_INVALID_RESPONSE;
+    const bool source_is_wider = source_width * kDisplayHeight >= source_height * kDisplayWidth;
+    const int decode_width = source_is_wider
+        ? (source_width * kDisplayHeight + source_height - 1) / source_height
+        : kDisplayWidth;
+    const int decode_height = source_is_wider
+        ? kDisplayHeight
+        : (source_height * kDisplayWidth + source_width - 1) / source_width;
+    if (decode_width < kDisplayWidth || decode_height < kDisplayHeight ||
+        static_cast<std::size_t>(decode_width) * static_cast<std::size_t>(decode_height) > kMaxCropDecodePixels) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    ImgDecodeDither decoder;
+    uint8_t* decoded = nullptr;
+    int decoded_bytes = 0;
+    const esp_err_t decode = decoder.ImgDecode_TFOneJPGPictureScaled(
+        absolute_source.c_str(), decode_width, decode_height, &decoded, &decoded_bytes);
+    if (decode != ESP_OK || !decoded || decoded_bytes != decode_width * decode_height * 3) {
+        if (decoded) decoder.ImgDecode_JPGBufferFree(decoded);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    uint8_t* cropped = static_cast<uint8_t*>(heap_caps_malloc(kDisplayWidth * kDisplayHeight * 3, MALLOC_CAP_SPIRAM));
+    uint8_t* dithered = static_cast<uint8_t*>(heap_caps_malloc(kDisplayWidth * kDisplayHeight * 3, MALLOC_CAP_SPIRAM));
+    if (!cropped || !dithered) {
+        if (cropped) heap_caps_free(cropped);
+        if (dithered) heap_caps_free(dithered);
+        decoder.ImgDecode_JPGBufferFree(decoded);
+        return ESP_ERR_NO_MEM;
+    }
+    const int crop_left = (decode_width - kDisplayWidth) / 2;
+    const int crop_top = (decode_height - kDisplayHeight) / 2;
+    for (int row_index = 0; row_index < kDisplayHeight; ++row_index) {
+        std::memcpy(cropped + row_index * kDisplayWidth * 3,
+                    decoded + ((row_index + crop_top) * decode_width + crop_left) * 3,
+                    kDisplayWidth * 3);
+    }
+    decoder.ImgDecode_DitherRgb888(cropped, dithered, kDisplayWidth, kDisplayHeight);
+    heap_caps_free(cropped);
+    decoder.ImgDecode_JPGBufferFree(decoded);
+
+    mbedtls_sha256_context hash; mbedtls_sha256_init(&hash); mbedtls_sha256_starts(&hash, false);
+    std::uint8_t row[kDisplayWidth / 2]; bool first = true; esp_err_t result = ESP_OK;
+    for (int y = 0; y < kDisplayHeight && result == ESP_OK; ++y) {
+        for (int x = 0; x < kDisplayWidth; x += 2) {
+            const uint8_t a = NibbleForRgb(dithered + (y * kDisplayWidth + x) * 3);
+            const uint8_t b = NibbleForRgb(dithered + (y * kDisplayWidth + x + 1) * 3);
+            row[x / 2] = static_cast<uint8_t>((a << 4) | b);
+        }
+        if (mbedtls_sha256_update(&hash, row, sizeof(row)) != 0) result = ESP_FAIL;
+        if (result == ESP_OK) result = storage->AppendStagedFile("image.bin", row, sizeof(row), first);
+        first = false;
+    }
+    heap_caps_free(dithered);
+    unsigned char digest[32]{}; const bool hash_ok = mbedtls_sha256_finish(&hash, digest) == 0; mbedtls_sha256_free(&hash);
+    if (result != ESP_OK || !hash_ok) return result == ESP_OK ? ESP_FAIL : result;
+    result = storage->FinalizeStagedFile("image.bin", kDisplayFrameBytes);
+    if (result == ESP_OK) *sha256 = Hex(digest);
+    return result;
+}
 }
 AiGenerationService::AiGenerationService(AiConfigService* config, StorageService* storage, MediaLibrary* library, JobService* jobs, DisplayService* display)
  : config_(config), storage_(storage), library_(library), jobs_(jobs), display_(display) {
@@ -179,6 +292,7 @@ void AiGenerationService::LoadLastTask() {
     loaded.available = ReadNvsString(handle, kLastJob, 65, &loaded.job_id) &&
         ReadNvsString(handle, kLastKind, 32, &loaded.kind) && ReadNvsString(handle, kLastState, 16, &loaded.state) &&
         ReadNvsString(handle, kLastPhase, 32, &loaded.phase);
+    (void)ReadNvsString(handle, kLastMediaId, 65, &loaded.media_id);
     (void)ReadNvsString(handle, kLastError, 96, &loaded.error_code);
     (void)nvs_get_u64(handle, kLastFinished, &loaded.finished_at_ms);
     (void)ReadNvsString(handle, kLastProfileId, 33, &loaded.profile_id);
@@ -202,10 +316,12 @@ void AiGenerationService::LoadLastTask() {
     }
     xSemaphoreGive(reinterpret_cast<SemaphoreHandle_t>(mutex_));
 }
-void AiGenerationService::RecordTerminalTask(const Work& work, bool success, const std::string& error_code) {
+void AiGenerationService::RecordTerminalTask(const Work& work, bool success, const std::string& error_code,
+                                             const MediaId& media_id) {
     LastTaskSnapshot recorded;
     recorded.available = true;
     recorded.job_id = work.job_id;
+    recorded.media_id = success ? media_id : "";
     recorded.kind = work.kind == WorkKind::kConfirmSave ? "confirm_save" : "generate_preview";
     recorded.state = success ? "success" : "failed";
     recorded.phase = success ? "completed" : "failed";
@@ -218,6 +334,7 @@ void AiGenerationService::RecordTerminalTask(const Work& work, bool success, con
     nvs_handle_t handle;
     if (nvs_open(kDiagNamespace, NVS_READWRITE, &handle) == ESP_OK) {
         esp_err_t result = nvs_set_str(handle, kLastJob, recorded.job_id.c_str());
+        if (result == ESP_OK) result = nvs_set_str(handle, kLastMediaId, recorded.media_id.c_str());
         if (result == ESP_OK) result = nvs_set_str(handle, kLastKind, recorded.kind.c_str());
         if (result == ESP_OK) result = nvs_set_str(handle, kLastState, recorded.state.c_str());
         if (result == ESP_OK) result = nvs_set_str(handle, kLastPhase, recorded.phase.c_str());
@@ -287,16 +404,19 @@ void AiGenerationService::WorkerLoop() {
                 UpdateActivePhaseLocked("committing");
                 media_id = NewId("ai"); const EpochMs now = static_cast<EpochMs>(esp_timer_get_time() / 1000);
                 JsonDocument manifest; manifest["media_id"]=media_id; manifest["display_name"]="AI image"; manifest["category"]="ai"; manifest["created_at_ms"]=now; manifest["updated_at_ms"]=now; manifest["manifest_version"]=1; manifest["revision"]=1; manifest["prompt"]=work.prompt; manifest["model"]=config_->GetPublicConfig().model;
-                JsonObject profile=manifest["display_profile"].to<JsonObject>(); profile["width"]=kDisplayWidth; profile["height"]=kDisplayHeight; profile["frame_bytes"]=kDisplayFrameBytes; profile["pixel_format"]="4bpp"; profile["palette"]="six_color_e6"; profile["orientation"]="landscape"; profile["rotation_degrees"]=0; profile["fit_mode"]="contain"; profile["converter_version"]="official-fs-v1";
+                JsonObject generation_profile=manifest["generation_profile"].to<JsonObject>(); generation_profile["id"]=kGenerationProfileId; generation_profile["source_size"]="2K"; generation_profile["target_width"]=kDisplayWidth; generation_profile["target_height"]=kDisplayHeight; generation_profile["fit_mode"]="crop_to_fill";
+                JsonObject profile=manifest["display_profile"].to<JsonObject>(); profile["width"]=kDisplayWidth; profile["height"]=kDisplayHeight; profile["frame_bytes"]=kDisplayFrameBytes; profile["pixel_format"]="4bpp"; profile["palette"]="six_color_e6"; profile["orientation"]="landscape"; profile["rotation_degrees"]=0; profile["fit_mode"]="crop_to_fill"; profile["converter_version"]="official-fs-crop-v1";
                 JsonObject files=manifest["files"].to<JsonObject>(); JsonObject frame=files["frame"].to<JsonObject>(); frame["present"]=true; frame["mime_type"]="application/octet-stream"; frame["bytes"]=kDisplayFrameBytes; frame["sha256"]=frame_hash;
-                std::string manifest_text; serializeJson(manifest,manifest_text); result=storage_->AppendStagedFile("manifest.json",manifest_text.data(),manifest_text.size(),true); if(result==ESP_OK)result=storage_->FinalizeStagedFile("manifest.json",manifest_text.size()); if(result==ESP_OK)result=storage_->CommitTransaction("media/ai/"+media_id); transaction_started=false; if(result!=ESP_OK){failure="ai_commit_failed";break;} if(library_->RegisterCommitted(MediaCategory::kAi,media_id)!=ESP_OK){failure="ai_commit_failed";break;} (void)storage_->DeletePreview(work.preview_job_id); xSemaphoreTake(reinterpret_cast<SemaphoreHandle_t>(mutex_),portMAX_DELAY); preview_.ready=false; xSemaphoreGive(reinterpret_cast<SemaphoreHandle_t>(mutex_)); (void)jobs_->CompleteSuccess(work.job_id,media_id); result=ESP_OK; break;
+                std::string manifest_text; serializeJson(manifest,manifest_text); result=storage_->AppendStagedFile("manifest.json",manifest_text.data(),manifest_text.size(),true); if(result==ESP_OK)result=storage_->FinalizeStagedFile("manifest.json",manifest_text.size()); if(result==ESP_OK)result=storage_->CommitTransaction("media/ai/"+media_id); transaction_started=false; if(result!=ESP_OK){failure="ai_commit_failed";break;} if(library_->RegisterCommitted(MediaCategory::kAi,media_id)!=ESP_OK){failure="ai_commit_failed";break;} if(!jobs_->CompleteSuccess(work.job_id,media_id)){failure="ai_job_state_sync_failed";result=ESP_FAIL;break;} (void)storage_->DeletePreview(work.preview_job_id); xSemaphoreTake(reinterpret_cast<SemaphoreHandle_t>(mutex_),portMAX_DELAY); preview_.ready=false; xSemaphoreGive(reinterpret_cast<SemaphoreHandle_t>(mutex_)); result=ESP_OK; break;
             }
             if (work.kind == WorkKind::kGeneratePreview) {
                 if (!config_->GetSecret(&endpoint, &model, &key)) { failure = "ai_not_configured"; break; }
+                const std::string model_prompt = BuildEinkDisplayPrompt(work.prompt);
+                if (model_prompt.size() > 1800U) { failure = "prompt_too_long"; break; }
                 (void)jobs_->Update(work.job_id, JobState::kRunning, "requesting", 10);
                 UpdateActivePhaseLocked("requesting");
                 ImageUrlRequestResult request_result;
-                if (!RequestImageUrl(endpoint, model, key, work.prompt, &url, &request_result)) { failure = request_result.code; break; }
+                if (!RequestImageUrl(endpoint, model, key, model_prompt.c_str(), &url, &request_result)) { failure = request_result.code; break; }
                 (void)jobs_->Update(work.job_id, JobState::kRunning, "downloading_preview", 50);
                 UpdateActivePhaseLocked("downloading_preview");
                 result = storage_->BeginWriteTransaction(NewId("ai-preview"), kRequiredBytes);
@@ -318,14 +438,16 @@ void AiGenerationService::WorkerLoop() {
                 xSemaphoreTake(reinterpret_cast<SemaphoreHandle_t>(mutex_), portMAX_DELAY);
                 preview_.job_id=work.job_id; preview_.prompt=work.prompt; preview_.source_bytes=source_bytes; preview_.expires_at_ms=static_cast<std::uint64_t>(esp_timer_get_time()/1000)+30ULL*60ULL*1000ULL; preview_.ready=true;
                 xSemaphoreGive(reinterpret_cast<SemaphoreHandle_t>(mutex_));
-                (void)jobs_->CompleteSuccess(work.job_id, "");
+                if (!jobs_->CompleteSuccess(work.job_id, "")) { failure = "ai_job_state_sync_failed"; result = ESP_FAIL; break; }
                 result = ESP_OK;
                 break;
             }
             if (!config_->GetSecret(&endpoint, &model, &key)) { failure = "ai_not_configured"; break; }
+            const std::string model_prompt = BuildEinkDisplayPrompt(work.prompt);
+            if (model_prompt.size() > 1800U) { failure = "prompt_too_long"; break; }
             (void)jobs_->Update(work.job_id, JobState::kRunning, "requesting", 5);
             ImageUrlRequestResult request_result;
-            if (!RequestImageUrl(endpoint, model, key, work.prompt, &url, &request_result)) { failure = request_result.code; break; }
+            if (!RequestImageUrl(endpoint, model, key, model_prompt.c_str(), &url, &request_result)) { failure = request_result.code; break; }
             (void)jobs_->Update(work.job_id, JobState::kRunning, "downloading", 25);
             result = storage_->BeginWriteTransaction(transaction, kRequiredBytes);
             if (result != ESP_OK) { failure = result == ESP_ERR_NO_MEM ? "storage_no_space" : "storage_busy"; break; }
@@ -346,10 +468,16 @@ void AiGenerationService::WorkerLoop() {
             manifest["updated_at_ms"] = now;
             manifest["manifest_version"] = 1;
             manifest["revision"] = 1;
+            JsonObject generation_profile = manifest["generation_profile"].to<JsonObject>();
+            generation_profile["id"] = kGenerationProfileId;
+            generation_profile["source_size"] = "2K";
+            generation_profile["target_width"] = kDisplayWidth;
+            generation_profile["target_height"] = kDisplayHeight;
+            generation_profile["fit_mode"] = "crop_to_fill";
             JsonObject profile = manifest["display_profile"].to<JsonObject>();
             profile["width"] = kDisplayWidth; profile["height"] = kDisplayHeight; profile["frame_bytes"] = kDisplayFrameBytes;
             profile["pixel_format"] = "4bpp"; profile["palette"] = "six_color_e6"; profile["orientation"] = "landscape";
-            profile["rotation_degrees"] = 0; profile["fit_mode"] = "contain"; profile["converter_version"] = "official-fs-v1";
+            profile["rotation_degrees"] = 0; profile["fit_mode"] = "crop_to_fill"; profile["converter_version"] = "official-fs-crop-v1";
             JsonObject files = manifest["files"].to<JsonObject>();
             JsonObject source = files["source"].to<JsonObject>(); source["present"] = true; source["mime_type"] = "image/jpeg"; source["bytes"] = source_bytes; source["sha256"] = source_hash;
             JsonObject preview = files["preview"].to<JsonObject>(); preview["present"] = false; preview["mime_type"] = ""; preview["bytes"] = 0; preview["sha256"] = "";
@@ -361,14 +489,15 @@ void AiGenerationService::WorkerLoop() {
             transaction_started = false;
             if (result == ESP_OK) result = library_->RegisterCommitted(MediaCategory::kAi, media_id);
             if (result != ESP_OK) { failure = "ai_commit_failed"; break; }
-            (void)jobs_->CompleteSuccess(work.job_id, media_id);
+            if (!jobs_->CompleteSuccess(work.job_id, media_id)) { failure = "ai_job_state_sync_failed"; result = ESP_FAIL; break; }
             result = ESP_OK;
         } while (false);
         if (result != ESP_OK) {
             if (transaction_started || storage_->HasActiveWriteTransaction()) (void)storage_->RollbackTransaction();
             (void)jobs_->Update(work.job_id, JobState::kFailed, "failed", 0, failure);
         }
-        RecordTerminalTask(work, result == ESP_OK, result == ESP_OK ? std::string{} : failure);
+        RecordTerminalTask(work, result == ESP_OK, result == ESP_OK ? std::string{} : failure,
+                           result == ESP_OK ? media_id : MediaId{});
         xSemaphoreTake(reinterpret_cast<SemaphoreHandle_t>(mutex_), portMAX_DELAY);
         active_ = false;
         active_task_ = {};

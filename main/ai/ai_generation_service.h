@@ -31,6 +31,10 @@ public:
     struct LastTaskSnapshot {
         bool available = false;
         std::string job_id;
+        // Present only for a completed TF media commit.  It lets a client
+        // distinguish "the worker stopped" from "this exact image is safely
+        // visible in the AI library" after a reconnect or reboot.
+        std::string media_id;
         std::string kind;
         std::string state;
         std::string phase;
@@ -57,7 +61,8 @@ private:
     void UpdateActivePhaseLocked(const char* phase);
     static std::string SummarizePrompt(const char* prompt);
     void LoadLastTask();
-    void RecordTerminalTask(const Work& work, bool success, const std::string& error_code);
+    void RecordTerminalTask(const Work& work, bool success, const std::string& error_code,
+                            const MediaId& media_id = {});
     void* queue_ = nullptr; void* worker_ = nullptr; void* mutex_ = nullptr; bool active_ = false; PreviewState preview_; ActiveTaskSnapshot active_task_; LastTaskSnapshot last_task_;
 };
 }  // namespace photopainter::product

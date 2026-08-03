@@ -412,11 +412,16 @@ esp_err_t MediaLibrary::LoadManifest(const CommittedMediaLocation& location, Med
     const std::string fit_mode = profile["fit_mode"] | "";
     if (pixel_format != "4bpp" || palette != "six_color_e6" ||
         (orientation != "landscape" && orientation != "portrait") ||
-        (fit_mode != "contain" && fit_mode != "cover")) return ESP_ERR_INVALID_ARG;
+        // AI images use this explicit label for the CropToFill conversion.
+        // It has the same display semantics as the existing `cover` enum;
+        // accepting it keeps manifest metadata truthful without excluding a
+        // successfully committed TF item from the authoritative library.
+        (fit_mode != "contain" && fit_mode != "cover" && fit_mode != "crop_to_fill")) return ESP_ERR_INVALID_ARG;
     item.display_profile.pixel_format = PixelFormat::kIndexed4Bpp;
     item.display_profile.palette = Palette::kSixColorE6;
     item.display_profile.orientation = orientation == "portrait" ? Orientation::kPortrait : Orientation::kLandscape;
-    item.display_profile.fit_mode = fit_mode == "cover" ? FitMode::kCover : FitMode::kContain;
+    item.display_profile.fit_mode = (fit_mode == "cover" || fit_mode == "crop_to_fill")
+        ? FitMode::kCover : FitMode::kContain;
     JsonObjectConst files = root["files"].as<JsonObjectConst>();
     if (item.manifest_version == 1) {
         if (!ReadDescriptor(files["source"].as<JsonObjectConst>(), &item.source) ||
