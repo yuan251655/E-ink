@@ -8,6 +8,8 @@
 #include <vector>
 
 #include "ArduinoJson.h"
+#include "nvs.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "display_runtime.h"
 #include "display_service.h"
@@ -18,9 +20,6 @@
 #include "ai_album_playback_runtime.h"
 #include "media_library.h"
 #include "media_upload_service.h"
-#include "ai_runtime.h"
-#include "ai_config_service.h"
-#include "ai_generation_service.h"
 #include "xiaozhi_runtime.h"
 #include "media_library_runtime.h"
 #include "mode_manager.h"
@@ -410,8 +409,40 @@ esp_err_t UpdateLocalAlbumPlayback(httpd_req_t* req) {
     return SendJson(req, response.c_str());
 }
 
+const char* ResetReasonName(esp_reset_reason_t reason) {
+    switch (reason) {
+        case ESP_RST_POWERON: return "power_on";
+        case ESP_RST_EXT: return "external";
+        case ESP_RST_SW: return "software";
+        case ESP_RST_PANIC: return "panic";
+        case ESP_RST_INT_WDT: return "interrupt_watchdog";
+        case ESP_RST_TASK_WDT: return "task_watchdog";
+        case ESP_RST_WDT: return "other_watchdog";
+        case ESP_RST_DEEPSLEEP: return "deep_sleep";
+        case ESP_RST_BROWNOUT: return "brownout";
+        case ESP_RST_SDIO: return "sdio";
+        default: return "unknown";
+    }
+}
+
 esp_err_t Health(httpd_req_t* req) {
-    return SendJson(req, "{\"ok\":true,\"code\":\"ok\",\"message\":\"ready\",\"data\":{\"api_version\":\"v1\"}}");
+    std::string body = "{\"ok\":true,\"code\":\"ok\",\"message\":\"ready\",\"data\":{\"api_version\":\"v1\",\"uptime_ms\":";
+    char uptime[21]{};
+    FormatUInt64(static_cast<std::uint64_t>(esp_timer_get_time() / 1000), uptime);
+    body.append(uptime);
+    body.append(",\"reset_reason\":");
+    AppendJsonString(&body, ResetReasonName(esp_reset_reason()));
+    char active_stage[48]{};
+    nvs_handle_t handle{};
+    std::size_t stage_size = sizeof(active_stage);
+    if (nvs_open("ai_gen_diag", NVS_READONLY, &handle) == ESP_OK) {
+        (void)nvs_get_str(handle, "active_stage", active_stage, &stage_size);
+        nvs_close(handle);
+    }
+    body.append(",\"last_ai_stage\":");
+    AppendJsonString(&body, active_stage);
+    body.append("}}");
+    return SendJson(req, body.c_str());
 }
 
 esp_err_t GetMode(httpd_req_t* req) {
@@ -563,32 +594,8 @@ esp_err_t JobStatus(httpd_req_t* req) {
     const char* marker = std::strstr(req->uri, "/api/v1/jobs/");
     if (marker == nullptr || std::strlen(marker + 13) == 0 || std::strlen(marker + 13) > 63) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
     JobSnapshot job;
-    const auto last = GetAiGenerationService().GetLastTaskSnapshot();
     const bool has_live_job = GetProductJobService().Get(marker + 13, &job);
-    const bool live_job_is_terminal = has_live_job &&
-        (job.state == JobState::kSuccess || job.state == JobState::kFailed ||
-         job.state == JobState::kCancelled || job.state == JobState::kTimeout);
-    // The media transaction is authoritative.  If a prior firmware task
-    // reached a durable AI terminal record but its RAM JobService snapshot was
-    // left at "committing", return the durable terminal result rather than
-    // making the App wait forever.
-    if (!has_live_job || (!live_job_is_terminal && last.available && last.job_id == marker + 13)) {
-        // JobService is intentionally RAM-bounded. The latest AI terminal
-        // record survives a reboot so an App that was polling during a
-        // firmware update can recover its pending preview instead of being
-        // left with an ambiguous HTML 404 response.
-        if (last.available && last.job_id == marker + 13) {
-            job.job_id = last.job_id;
-            job.kind = JobKind::kAiGeneration;
-            job.state = last.state == "success" ? JobState::kSuccess : JobState::kFailed;
-            job.phase = last.phase.empty() ? (last.state == "success" ? "completed" : "failed") : last.phase;
-            job.progress_percent = last.state == "success" ? 100 : 0;
-            job.error_code = last.error_code;
-            job.media_id = last.media_id;
-        } else {
-            return SendJson(req, "{\"ok\":false,\"code\":\"job_not_found\",\"message\":\"job result is unavailable\"}", "404 Not Found");
-        }
-    }
+    if (!has_live_job) return SendJson(req, "{\"ok\":false,\"code\":\"job_not_found\",\"message\":\"job result is unavailable\"}", "404 Not Found");
     char body[384];
     std::snprintf(body, sizeof(body), "{\"ok\":true,\"code\":\"ok\",\"data\":{\"job_id\":\"%s\",\"state\":%u,\"phase\":\"%s\",\"progress_percent\":%u,\"error_code\":\"%s\",\"media_id\":\"%s\"}}", job.job_id.c_str(), static_cast<unsigned>(job.state), job.phase.c_str(), static_cast<unsigned>(job.progress_percent), job.error_code.c_str(), job.media_id.c_str());
     return SendJson(req, body);
@@ -1009,110 +1016,6 @@ bool ReadBoundedJson(httpd_req_t* req, JsonDocument* output, std::size_t max_byt
     return deserializeJson(*output, body) == DeserializationError::Ok;
 }
 
-esp_err_t GetAiConfig(httpd_req_t* req) {
-    const auto config = GetAiConfigService().GetPublicConfig();
-    std::string body = "{\"ok\":true,\"code\":\"ok\",\"data\":{\"configured\":";
-    body.append(config.configured ? "true" : "false").append(",\"profile_id\":"); AppendJsonString(&body, config.profile_id);
-    body.append(",\"profile_name\":"); AppendJsonString(&body, config.profile_name);
-    body.append(",\"endpoint\":"); AppendJsonString(&body, config.endpoint);
-    body.append(",\"model\":"); AppendJsonString(&body, config.model);
-    body.append(",\"key_last4\":"); AppendJsonString(&body, config.key_last4); body.append("}}");
-    return SendJson(req, body.c_str());
-}
-
-esp_err_t SaveAiConfig(httpd_req_t* req) {
-    JsonDocument input;
-    if (!ReadBoundedJson(req, &input, 1024)) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
-    const std::string endpoint = input["endpoint"] | "";
-    const std::string model = input["model"] | "";
-    const std::string key = input["api_key"] | "";
-    const esp_err_t result = GetAiConfigService().Save(endpoint, model, key);
-    if (result != ESP_OK) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_ai_config\"}", "400 Bad Request");
-    return GetAiConfig(req);
-}
-
-esp_err_t DeleteAiConfig(httpd_req_t* req) {
-    if (req->content_len > 2) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
-    if (GetAiConfigService().Clear() != ESP_OK) return SendJson(req, "{\"ok\":false,\"code\":\"ai_config_delete_failed\"}", "500 Internal Server Error");
-    return SendJson(req, "{\"ok\":true,\"code\":\"ai_config_deleted\"}");
-}
-
-esp_err_t TestAiConfig(httpd_req_t* req) {
-    JsonDocument input;
-    if (!ReadBoundedJson(req, &input, 128)) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
-    const bool allow_billable_test = input["allow_billable_test"] | false;
-    AiConfigTestResult result;
-    (void)GetAiConfigService().TestConnection(allow_billable_test, &result);
-    std::string body = "{\"ok\":true,\"code\":";
-    AppendJsonString(&body, result.code);
-    body.append(",\"data\":{\"configured\":").append(result.configured ? "true" : "false")
-        .append(",\"network_reachable\":").append(result.network_reachable ? "true" : "false")
-        .append(",\"endpoint_reachable\":").append(result.endpoint_reachable ? "true" : "false")
-        .append(",\"authenticated\":").append(result.authenticated ? "true" : "false")
-        .append(",\"model_available\":").append(result.model_available ? "true" : "false")
-        .append(",\"http_status\":").append(std::to_string(result.http_status))
-        .append(",\"provider_message\":");
-    AppendJsonString(&body, result.provider_message);
-    body.append(",\"billable_test\":").append(allow_billable_test ? "true" : "false").append("}}");
-    return SendJson(req, body.c_str());
-}
-
-void AppendAiProfileJson(std::string* output, const AiProviderProfile& profile) {
-    output->append("{\"id\":"); AppendJsonString(output, profile.id);
-    output->append(",\"name\":"); AppendJsonString(output, profile.name);
-    output->append(",\"endpoint\":"); AppendJsonString(output, profile.endpoint);
-    output->append(",\"model\":"); AppendJsonString(output, profile.model);
-    output->append(",\"key_last4\":"); AppendJsonString(output, profile.key_last4);
-    output->append(",\"active\":").append(profile.active ? "true" : "false").append("}");
-}
-
-esp_err_t ListAiProfiles(httpd_req_t* req) {
-    const auto profiles = GetAiConfigService().ListProfiles();
-    std::string body = "{\"ok\":true,\"code\":\"ok\",\"data\":{\"profiles\":[";
-    for (std::size_t index = 0; index < profiles.size(); ++index) {
-        if (index != 0) body.push_back(',');
-        AppendAiProfileJson(&body, profiles[index]);
-    }
-    body.append("]}}");
-    return SendJson(req, body.c_str());
-}
-
-esp_err_t SaveAiProfile(httpd_req_t* req) {
-    JsonDocument input;
-    if (!ReadBoundedJson(req, &input, 1536)) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
-    const std::string id = input["id"] | "";
-    const std::string name = input["name"] | "";
-    const std::string endpoint = input["endpoint"] | "";
-    const std::string model = input["model"] | "";
-    const std::string key = input["api_key"] | "";
-    AiProviderProfile saved;
-    const esp_err_t result = GetAiConfigService().SaveProfile(id, name, endpoint, model, key, &saved);
-    if (result != ESP_OK) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_ai_profile\"}", "400 Bad Request");
-    std::string body = "{\"ok\":true,\"code\":\"ai_profile_saved\",\"data\":";
-    AppendAiProfileJson(&body, saved);
-    body.append("}");
-    return SendJson(req, body.c_str());
-}
-
-esp_err_t ActivateAiProfile(httpd_req_t* req) {
-    JsonDocument input;
-    if (!ReadBoundedJson(req, &input, 128)) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
-    const std::string id = input["id"] | "";
-    const esp_err_t result = GetAiConfigService().ActivateProfile(id);
-    if (result == ESP_ERR_NOT_FOUND) return SendJson(req, "{\"ok\":false,\"code\":\"ai_profile_not_found\"}", "404 Not Found");
-    if (result != ESP_OK) return SendJson(req, "{\"ok\":false,\"code\":\"ai_profile_activate_failed\"}", "400 Bad Request");
-    return SendJson(req, "{\"ok\":true,\"code\":\"ai_profile_activated\"}");
-}
-
-esp_err_t DeleteAiProfile(httpd_req_t* req) {
-    JsonDocument input;
-    if (!ReadBoundedJson(req, &input, 128)) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
-    const esp_err_t result = GetAiConfigService().DeleteProfile(input["id"] | "");
-    if (result == ESP_ERR_NOT_FOUND) return SendJson(req, "{\"ok\":false,\"code\":\"ai_profile_not_found\"}", "404 Not Found");
-    if (result != ESP_OK) return SendJson(req, "{\"ok\":false,\"code\":\"ai_profile_delete_failed\"}", "400 Bad Request");
-    return SendJson(req, "{\"ok\":true,\"code\":\"ai_profile_deleted\"}");
-}
-
 esp_err_t GetAiAlbumPlayback(httpd_req_t* req) {
     std::string response;
     AppendPlaybackResponse(&response, true, "ok", "playback configuration loaded",
@@ -1191,84 +1094,6 @@ esp_err_t UpdateAiAlbumPlayback(httpd_req_t* req) {
     std::string response;
     AppendPlaybackResponse(&response, true, "playback_saved", "playback configuration saved", updated, &request_id);
     return SendJson(req, response.c_str());
-}
-
-esp_err_t CreateAiGeneration(httpd_req_t* req) {
-    JsonDocument input;
-    if (!ReadBoundedJson(req, &input)) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
-    const std::string request_id = input["request_id"] | "";
-    const std::string prompt = input["prompt"] | "";
-    const bool display_when_active = input["display_when_active"] | true;
-    JobSnapshot job; std::string code;
-    const esp_err_t result = GetAiGenerationService().Create(request_id, prompt, display_when_active, &job, &code);
-    if (result != ESP_OK) { std::string body="{\"ok\":false,\"code\":"; AppendJsonString(&body, code); body.append("}"); return SendJson(req, body.c_str(), code=="ai_not_configured" ? "409 Conflict" : "503 Service Unavailable"); }
-    std::string body = "{\"ok\":true,\"code\":"; AppendJsonString(&body, code); body.append(",\"data\":{\"job_id\":"); AppendJsonString(&body, job.job_id); body.append("}}");
-    return SendJson(req, body.c_str(), "202 Accepted");
-}
-
-esp_err_t GetActiveAiGeneration(httpd_req_t* req) {
-    const auto active = GetAiGenerationService().GetActiveTaskSnapshot();
-    std::string body = "{\"ok\":true,\"code\":\"ok\",\"data\":{\"has_active_task\":";
-    body.append(active.has_active_task ? "true" : "false");
-    body.append(",\"job_id\":"); AppendJsonString(&body, active.job_id);
-    body.append(",\"state\":"); AppendJsonString(&body, active.state);
-    body.append(",\"phase\":"); AppendJsonString(&body, active.phase);
-    body.append(",\"kind\":"); AppendJsonString(&body, active.kind);
-    body.append(",\"prompt_summary\":"); AppendJsonString(&body, active.prompt_summary);
-    body.append("}}");
-    return SendJson(req, body.c_str());
-}
-
-esp_err_t GetLastAiGeneration(httpd_req_t* req) {
-    const auto last = GetAiGenerationService().GetLastTaskSnapshot();
-    std::string body = "{\"ok\":true,\"code\":\"ok\",\"data\":{\"available\":";
-    body.append(last.available ? "true" : "false");
-    body.append(",\"job_id\":"); AppendJsonString(&body, last.job_id);
-    body.append(",\"media_id\":"); AppendJsonString(&body, last.media_id);
-    body.append(",\"kind\":"); AppendJsonString(&body, last.kind);
-    body.append(",\"state\":"); AppendJsonString(&body, last.state);
-    body.append(",\"phase\":"); AppendJsonString(&body, last.phase);
-    body.append(",\"error_code\":"); AppendJsonString(&body, last.error_code);
-    // `finished_at_ms` is derived from esp_timer and is deliberately a
-    // boot-local monotonic value. Name it as such so clients never format it
-    // as a Unix date.
-    body.append(",\"finished_at_uptime_ms\":"); AppendUInt64(&body, last.finished_at_ms);
-    body.append(",\"profile_id\":"); AppendJsonString(&body, last.profile_id);
-    body.append(",\"profile_name\":"); AppendJsonString(&body, last.profile_name);
-    body.append(",\"prompt_summary\":"); AppendJsonString(&body, last.prompt_summary);
-    body.append("}}");
-    return SendJson(req, body.c_str());
-}
-
-esp_err_t GetAiGenerationPreview(httpd_req_t* req) {
-    constexpr char kPrefix[] = "/api/v1/ai/generation/jobs/";
-    constexpr char kSuffix[] = "/preview";
-    const std::size_t uri_length = std::strlen(req->uri);
-    if (std::strncmp(req->uri, kPrefix, sizeof(kPrefix) - 1) != 0 || uri_length <= sizeof(kPrefix) + sizeof(kSuffix) - 2 ||
-        std::strcmp(req->uri + uri_length - (sizeof(kSuffix) - 1), kSuffix) != 0) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
-    const std::string job_id(req->uri + sizeof(kPrefix) - 1, uri_length - (sizeof(kPrefix) - 1) - (sizeof(kSuffix) - 1));
-    AiGenerationService::PreviewSnapshot preview;
-    if (!GetAiGenerationService().GetPreview(job_id, &preview)) return SendJson(req, preview.expired ? "{\"ok\":false,\"code\":\"preview_expired\"}" : "{\"ok\":false,\"code\":\"preview_not_found\"}", "404 Not Found");
-    httpd_resp_set_type(req, "image/jpeg");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    const esp_err_t result = GetAiGenerationService().StreamPreview(job_id, [req](const void* data, std::size_t size) { return httpd_resp_send_chunk(req, static_cast<const char*>(data), size); });
-    if (result != ESP_OK) return result;
-    return httpd_resp_send_chunk(req, nullptr, 0);
-}
-
-esp_err_t ConfirmAiGenerationSave(httpd_req_t* req) {
-    constexpr char kPrefix[] = "/api/v1/ai/generation/jobs/";
-    constexpr char kSuffix[] = "/confirm-save";
-    JsonDocument input;
-    const std::size_t uri_length = std::strlen(req->uri);
-    if (!ReadBoundedJson(req, &input, 256) || std::strncmp(req->uri, kPrefix, sizeof(kPrefix) - 1) != 0 ||
-        uri_length <= sizeof(kPrefix) + sizeof(kSuffix) - 2 || std::strcmp(req->uri + uri_length - (sizeof(kSuffix) - 1), kSuffix) != 0) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
-    const std::string preview_job_id(req->uri + sizeof(kPrefix) - 1, uri_length - (sizeof(kPrefix) - 1) - (sizeof(kSuffix) - 1));
-    const std::string request_id = input["request_id"] | "";
-    JobSnapshot job; std::string code;
-    const esp_err_t result = GetAiGenerationService().ConfirmSave(request_id, preview_job_id, &job, &code);
-    if (result != ESP_OK) { std::string body="{\"ok\":false,\"code\":"; AppendJsonString(&body, code); body.append("}"); return SendJson(req, body.c_str(), code=="preview_not_found" || code=="preview_expired" ? "404 Not Found" : "503 Service Unavailable"); }
-    std::string body="{\"ok\":true,\"code\":\"accepted\",\"data\":{\"job_id\":"; AppendJsonString(&body, job.job_id); body.append("}}"); return SendJson(req, body.c_str(), "202 Accepted");
 }
 
 esp_err_t ForgetSta(httpd_req_t* req) {
@@ -1362,19 +1187,6 @@ esp_err_t RegisterProductApi(httpd_handle_t server) {
         {.uri="/api/v1/network/ap/restore-default", .method=HTTP_POST, .handler=RestoreDefaultAp, .user_ctx=nullptr},
         {.uri="/api/v1/xiaozhi/status", .method=HTTP_GET, .handler=XiaozhiStatus, .user_ctx=nullptr},
         {.uri="/api/v1/xiaozhi/conversation", .method=HTTP_GET, .handler=XiaozhiConversation, .user_ctx=nullptr},
-        {.uri="/api/v1/ai/config", .method=HTTP_GET, .handler=GetAiConfig, .user_ctx=nullptr},
-        {.uri="/api/v1/ai/config", .method=HTTP_POST, .handler=SaveAiConfig, .user_ctx=nullptr},
-        {.uri="/api/v1/ai/config", .method=HTTP_DELETE, .handler=DeleteAiConfig, .user_ctx=nullptr},
-        {.uri="/api/v1/ai/config/test", .method=HTTP_POST, .handler=TestAiConfig, .user_ctx=nullptr},
-        {.uri="/api/v1/ai/config/profiles", .method=HTTP_GET, .handler=ListAiProfiles, .user_ctx=nullptr},
-        {.uri="/api/v1/ai/config/profiles", .method=HTTP_POST, .handler=SaveAiProfile, .user_ctx=nullptr},
-        {.uri="/api/v1/ai/config/profiles/activate", .method=HTTP_POST, .handler=ActivateAiProfile, .user_ctx=nullptr},
-        {.uri="/api/v1/ai/config/profiles", .method=HTTP_DELETE, .handler=DeleteAiProfile, .user_ctx=nullptr},
-        {.uri="/api/v1/ai/generation/jobs", .method=HTTP_POST, .handler=CreateAiGeneration, .user_ctx=nullptr},
-        {.uri="/api/v1/ai/generation/active", .method=HTTP_GET, .handler=GetActiveAiGeneration, .user_ctx=nullptr},
-        {.uri="/api/v1/ai/generation/last", .method=HTTP_GET, .handler=GetLastAiGeneration, .user_ctx=nullptr},
-        {.uri="/api/v1/ai/generation/jobs/*", .method=HTTP_GET, .handler=GetAiGenerationPreview, .user_ctx=nullptr},
-        {.uri="/api/v1/ai/generation/jobs/*", .method=HTTP_POST, .handler=ConfirmAiGenerationSave, .user_ctx=nullptr},
         {.uri="/api/v1/media/upload", .method=HTTP_POST, .handler=UploadMedia, .user_ctx=nullptr},
         {.uri="/api/v1/media", .method=HTTP_GET, .handler=ListMedia, .user_ctx=nullptr},
         {.uri="/api/v1/media/*", .method=HTTP_GET, .handler=GetMediaDetail, .user_ctx=nullptr},

@@ -9,6 +9,7 @@
 
 #include "ArduinoJson.h"
 #include "esp_random.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "job_service.h"
@@ -29,6 +30,7 @@ constexpr char kTag[] = "MediaUpload";
 
 struct Metadata {
     RequestId request_id;
+    MediaCategory category = MediaCategory::kLocal;
     std::string display_name;
     std::string frame_sha256;
     DisplayProfile profile;
@@ -186,10 +188,12 @@ bool ParseMetadata(const std::string& json, Metadata* output, std::string* code)
     JsonObjectConst root = document.as<JsonObjectConst>();
     const std::string category = root["category"] | "";
     const std::string mode = root["upload_mode"] | "";
-    if (category != "local") { *code = "unsupported"; return false; }
+    Metadata parsed;
+    if (category == "local") parsed.category = MediaCategory::kLocal;
+    else if (category == "ai") parsed.category = MediaCategory::kAi;
+    else { *code = "unsupported"; return false; }
     if (mode != "bin_only") { *code = "unsupported"; return false; }
 
-    Metadata parsed;
     parsed.request_id = root["request_id"] | "";
     if (parsed.request_id.empty() || parsed.request_id.size() > 64) { *code = "invalid_request"; return false; }
     parsed.display_name = root["display_name"] | "";
@@ -260,39 +264,45 @@ bool ReceivePartBody(RequestReader* reader, const std::string& boundary,
     const std::string marker = "\r\n--" + boundary;
     std::string pending;
     pending.reserve(marker.size() + 1);
-    // The HTTP server task has a deliberately small stack.  Keep the large
-    // upload coalescing buffer on the heap instead of corrupting its stack
-    // during a normal 192000-byte frame upload.
-    std::vector<char> output(kWriteBufferBytes);
+    // This code runs in the HTTP server task while the Wi-Fi stack is active.
+    // A throwing std::vector allocation here turns low-memory input into a
+    // process panic. Use PSRAM explicitly and fail the request cleanly.
+    auto* output = static_cast<char*>(heap_caps_malloc(kWriteBufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (output == nullptr) return false;
     std::size_t output_size = 0;
-    auto flush = [&]() { return output_size == 0 || consume(output.data(), output_size); };
+    auto release = [&]() { heap_caps_free(output); };
+    auto flush = [&]() { return output_size == 0 || consume(output, output_size); };
     char byte = 0;
     while (reader->ReadByte(&byte)) {
         pending.push_back(byte);
         if (pending.size() > marker.size()) {
             output[output_size++] = pending.front();
             pending.erase(0, 1);
-            if (output_size == output.size()) {
-                if (!flush()) return false;
+            if (output_size == kWriteBufferBytes) {
+                if (!flush()) { release(); return false; }
                 output_size = 0;
             }
         }
         if (pending == marker) {
-            if (!flush()) return false;
+            if (!flush()) { release(); return false; }
             char suffix[2]{};
-            if (!reader->ReadByte(&suffix[0]) || !reader->ReadByte(&suffix[1])) return false;
+            if (!reader->ReadByte(&suffix[0]) || !reader->ReadByte(&suffix[1])) { release(); return false; }
             if (suffix[0] == '-' && suffix[1] == '-') {
                 *final_boundary = true;
                 // A conforming client may append a final CRLF; it is harmless.
+                release();
                 return true;
             }
             if (suffix[0] == '\r' && suffix[1] == '\n') {
                 *final_boundary = false;
+                release();
                 return true;
             }
+            release();
             return false;
         }
     }
+    release();
     return false;
 }
 
@@ -401,12 +411,14 @@ MediaUploadResult ReceiveBinOnlyMultipart(httpd_req_t* request,
 
     if (transaction_started && frame_received && part_count == kMaxParts) {
         (void)jobs.Update(result.job.job_id, JobState::kRunning, "committing", 85);
-        const MediaId media_id = NewSafeId("local");
+        const bool is_ai = metadata.category == MediaCategory::kAi;
+        const char* category_name = is_ai ? "ai" : "local";
+        const MediaId media_id = NewSafeId(category_name);
         const EpochMs now = static_cast<EpochMs>(esp_timer_get_time() / 1000);
         JsonDocument manifest;
         manifest["media_id"] = media_id;
         manifest["display_name"] = metadata.display_name;
-        manifest["category"] = "local";
+        manifest["category"] = category_name;
         manifest["created_at_ms"] = now;
         manifest["updated_at_ms"] = now;
         manifest["manifest_version"] = 2;
@@ -427,11 +439,11 @@ MediaUploadResult ReceiveBinOnlyMultipart(httpd_req_t* request,
         failure = storage.AppendStagedFile("manifest.json", manifest_json.data(), manifest_json.size(), true);
         if (failure == ESP_OK) failure = storage.FinalizeStagedFile("manifest.json", manifest_json.size());
         if (failure == ESP_OK) {
-            failure = storage.CommitTransaction("media/local/" + media_id);
+            failure = storage.CommitTransaction(std::string("media/") + category_name + "/" + media_id);
             if (failure != ESP_OK) ESP_LOGE(kTag, "media commit failed: %s", esp_err_to_name(failure));
         }
         if (failure == ESP_OK) {
-            failure = media_library.RegisterCommitted(MediaCategory::kLocal, media_id);
+            failure = media_library.RegisterCommitted(metadata.category, media_id);
             if (failure != ESP_OK) ESP_LOGE(kTag, "media register failed: %s", esp_err_to_name(failure));
         }
         if (failure == ESP_OK && jobs.CompleteSuccess(result.job.job_id, media_id)) {

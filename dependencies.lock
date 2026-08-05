@@ -113,6 +113,16 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 4.1.7
+  espressif/cjson:
+    component_hash: e788323270d90738662d66fffa910bfe1fba019bba087f01557e70c40485b469
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.7.19~2
   espressif/cmake_utilities:
     component_hash: 351350613ceafba240b761b4ea991e0f231ac7a9f59a9ee901f751bddc0bb18f
     dependencies:
@@ -512,6 +522,16 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 1.11.3
+  espressif/mqtt:
+    component_hash: fb18bc3b65aa8c94693a9811ffc322cca8a65d92d5ec84983d3e385080e3969c
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.3'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.1.0
   espressif/zlib:
     component_hash: 64ea2fd6754c5a05951f1ddb312ac835cd782e68cb5bd9dfcd1c3a107c8fbfbc
     dependencies:
@@ -561,7 +581,7 @@ dependencies:
   idf:
     source:
       type: idf
-    version: 5.5.1
+    version: 5.5.3
   lvgl/lvgl:
     component_hash: b702d642e03e95928046d5c6726558e6444e112420c77efa5fdb6650b0a13c5d
     dependencies: []
@@ -638,6 +658,7 @@ direct_dependencies:
 - espressif/adc_battery_estimation
 - espressif/adc_mic
 - espressif/button
+- espressif/cjson
 - espressif/esp-sr
 - espressif/esp32-camera
 - espressif/esp_codec_dev
@@ -661,6 +682,7 @@ direct_dependencies:
 - espressif/led_strip
 - espressif/libpng
 - espressif/mdns
+- espressif/mqtt
 - espressif2022/esp_emote_gfx
 - espressif2022/image_player
 - lvgl/lvgl
@@ -669,6 +691,6 @@ direct_dependencies:
 - waveshare/esp_lcd_sh8601
 - waveshare/esp_lcd_touch_cst9217
 - wvirgil123/sscma_client
-manifest_hash: 9a1dca428aa30901c06b77a189e131e6fb4c50482115f9ea40c8e116c4677aae
+manifest_hash: 2b2ad59b19ec976f710bc5b34e1271f32a002f808c676f203757d11a83a76142
 target: esp32s3
 version: 2.0.0

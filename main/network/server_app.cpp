@@ -297,6 +297,12 @@ static void ServerPort_Start(CustomSDPort *SDPort, bool enable_legacy_upload) {
     // Multipart intake validates JSON and streams media.  Leave enough
     // headroom for HTTP/lwIP frames; payload buffers themselves stay on heap.
     config.stack_size = 12288;
+    // A phone-prepared reference image is streamed in ~2 KiB chunks.  The
+    // ESP-IDF default is only five seconds and emits an HTTP 408 itself on a
+    // single receive gap, before the multipart reader can retry.  Give Wi-Fi
+    // and TF-card write stalls a bounded but realistic window.
+    config.recv_wait_timeout = 30;
+    config.send_wait_timeout = 30;
     // Product mode is API-only. Do not enable the official catch-all web
     // router here: its `/*` wildcard can intercept versioned API routes.
     config.uri_match_fn = httpd_uri_match_wildcard;

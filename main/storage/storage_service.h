@@ -73,6 +73,7 @@ public:
     // or expiry.
     esp_err_t StreamPreviewFile(const std::string& job_id,
                                 const std::function<esp_err_t(const void*, std::size_t)>& consume);
+    esp_err_t GetPreviewFileSize(const std::string& job_id, std::uint64_t* output_bytes);
     bool PreviewFileExists(const std::string& job_id);
     esp_err_t DeletePreview(const std::string& job_id);
     esp_err_t ReadCommittedText(const std::string& relative_path,

@@ -461,6 +461,19 @@ esp_err_t StorageService::StreamPreviewFile(
     return result;
 }
 
+esp_err_t StorageService::GetPreviewFileSize(const std::string& job_id, std::uint64_t* output_bytes) {
+    if (mutex_ == nullptr || output_bytes == nullptr || !IsSafeTransactionId(job_id)) return ESP_ERR_INVALID_ARG;
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    esp_err_t result = EnsureReadyLocked();
+    struct stat info {};
+    if (result == ESP_OK && (stat((mount_point_ + "/.ai_preview/" + job_id + "/source.jpg").c_str(), &info) != 0 || !S_ISREG(info.st_mode))) {
+        result = ESP_ERR_NOT_FOUND;
+    }
+    if (result == ESP_OK) *output_bytes = static_cast<std::uint64_t>(info.st_size);
+    xSemaphoreGive(mutex_);
+    return result;
+}
+
 bool StorageService::PreviewFileExists(const std::string& job_id) {
     if (mutex_ == nullptr || !IsSafeTransactionId(job_id)) return false;
     xSemaphoreTake(mutex_, portMAX_DELAY);

@@ -13,8 +13,8 @@ class MediaLibrary;
 class StorageService;
 
 // The API handler owns HTTP status mapping.  This worker only receives the
-// request, atomically admits a valid local media item, and returns a stable
-// product error code plus the upload job snapshot.
+// request, atomically admits a valid local or AI media item, and returns a
+// stable product error code plus the upload job snapshot.
 struct MediaUploadResult {
     esp_err_t error = ESP_FAIL;
     std::string code = "invalid_request";

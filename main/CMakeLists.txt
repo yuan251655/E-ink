@@ -75,9 +75,6 @@ set(SOURCES "xiaozhi/audio/audio_codec.cc"
             "network/product_network.cpp"
             "api/product_api.cpp"
             "api/media_upload_service.cpp"
-            "ai/ai_config_service.cpp"
-            "ai/ai_generation_service.cpp"
-            "ai/ai_runtime.cpp"
             "common/job_service.cpp"
             "common/job_runtime.cpp"
             "common/device_log_service.cpp"
@@ -105,7 +102,6 @@ set(SOURCES "xiaozhi/audio/audio_codec.cc"
 set(INCLUDE_DIRS "." "xiaozhi" "xiaozhi/ui" "xiaozhi/ui/lvgl_display"
                  "xiaozhi/audio" "xiaozhi/protocols" "xiaozhi/official" "system" "network"
                  "api" "album" "storage" "display" "user_app_bsp"
-                 "ai"
                  "input" "led" "power" "network" "sensors" "board" "common")
 
 # Add board common files
@@ -653,7 +649,7 @@ idf_component_register(SRCS ${SOURCES}
                                 "user_app_bsp/assets/mode_covers/mode_cover_info_dashboard.bin"
                     INCLUDE_DIRS ${INCLUDE_DIRS}
                     PRIV_REQUIRES app_bsp port_bsp codec_board pmicpower
-                    esp_http_client esp_http_server esp_wifi json espressif__mdns
+                    esp_http_client esp_http_server esp_wifi espressif__cjson espressif__mdns
                     espressif__libpng espressif__esp_new_jpeg
                     78__esp-opus 78__esp-opus-encoder spi_flash esp_app_format app_update
                     esp_psram efuse

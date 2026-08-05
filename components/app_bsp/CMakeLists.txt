@@ -13,7 +13,6 @@ idf_component_register(
     port_bsp
     esp_wifi
     esp_http_server
-    json
     REQUIRES
     espressif__libpng
     INCLUDE_DIRS
@@ -24,3 +23,8 @@ idf_component_register(
     EMBED_TXTFILES 
     "./certs/ark_vol.pem"
     "./certs/volces_chain.pem")
+
+# libpng's required setjmp/longjmp error path makes GCC conservatively emit
+# -Wclobbered for local cleanup variables. Keep global warnings-as-errors for
+# this component while allowing that known library-integration warning.
+target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-error=clobbered)
