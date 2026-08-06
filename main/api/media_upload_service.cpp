@@ -191,6 +191,7 @@ bool ParseMetadata(const std::string& json, Metadata* output, std::string* code)
     Metadata parsed;
     if (category == "local") parsed.category = MediaCategory::kLocal;
     else if (category == "ai") parsed.category = MediaCategory::kAi;
+    else if (category == "dashboard") parsed.category = MediaCategory::kDashboard;
     else { *code = "unsupported"; return false; }
     if (mode != "bin_only") { *code = "unsupported"; return false; }
 
@@ -265,9 +266,11 @@ bool ReceivePartBody(RequestReader* reader, const std::string& boundary,
     std::string pending;
     pending.reserve(marker.size() + 1);
     // This code runs in the HTTP server task while the Wi-Fi stack is active.
-    // A throwing std::vector allocation here turns low-memory input into a
-    // process panic. Use PSRAM explicitly and fail the request cleanly.
-    auto* output = static_cast<char*>(heap_caps_malloc(kWriteBufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    // Keep the bounded buffer off the task stack, but use internal DMA-capable
+    // RAM: FatFs/SDMMC cannot reliably write directly from PSRAM. Allocation
+    // failure remains a normal request failure rather than an exception/panic.
+    auto* output = static_cast<char*>(heap_caps_malloc(
+        kWriteBufferBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
     if (output == nullptr) return false;
     std::size_t output_size = 0;
     auto release = [&]() { heap_caps_free(output); };
@@ -411,8 +414,8 @@ MediaUploadResult ReceiveBinOnlyMultipart(httpd_req_t* request,
 
     if (transaction_started && frame_received && part_count == kMaxParts) {
         (void)jobs.Update(result.job.job_id, JobState::kRunning, "committing", 85);
-        const bool is_ai = metadata.category == MediaCategory::kAi;
-        const char* category_name = is_ai ? "ai" : "local";
+        const char* category_name = metadata.category == MediaCategory::kAi ? "ai" :
+            (metadata.category == MediaCategory::kDashboard ? "dashboard" : "local");
         const MediaId media_id = NewSafeId(category_name);
         const EpochMs now = static_cast<EpochMs>(esp_timer_get_time() / 1000);
         JsonDocument manifest;

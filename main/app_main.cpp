@@ -14,11 +14,13 @@
 
 #include "user_app.h"
 #include "storage_runtime.h"
+#include "dashboard_data_service.h"
 #include "media_library_runtime.h"
 #include "local_album_playback_runtime.h"
 #include "ai_album_playback_runtime.h"
 #include "display_runtime.h"
 #include "indicator_service.h"
+#include "power_service.h"
 #include "device_log_service.h"
 #include "mode_manager.h"
 #include "xiaozhi_runtime.h"
@@ -105,12 +107,20 @@ extern "C" void app_main(void) {
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "LED indicator service unavailable: %s", esp_err_to_name(ret));
     }
+    ret = photopainter::product::InitializePowerService();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Power service unavailable; continuing without PMIC telemetry: %s", esp_err_to_name(ret));
+    }
     bool product_display_ready = false;
     bool product_media_ready = false;
     ret = photopainter::product::InitializeProductStorage(SDPort);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Product storage unavailable; continuing official compatibility flow");
     } else {
+        ret = photopainter::product::GetDashboardDataService().Initialize(&photopainter::product::GetStorageService());
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Dashboard data unavailable; continuing without dashboard state: %s", esp_err_to_name(ret));
+        }
         ret = photopainter::product::InitializeMediaLibrary();
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "Media index unavailable; continuing official compatibility flow");

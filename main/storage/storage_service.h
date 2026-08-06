@@ -79,6 +79,11 @@ public:
     esp_err_t ReadCommittedText(const std::string& relative_path,
                                 std::size_t maximum_bytes,
                                 std::string* output);
+    // Small device-state documents live under /state. Names are validated and
+    // writes use a same-volume temporary file followed by atomic rename.
+    esp_err_t ReadStateText(const std::string& name, std::size_t maximum_bytes,
+                            std::string* output);
+    esp_err_t WriteStateTextAtomic(const std::string& name, const std::string& content);
     esp_err_t GetCommittedFileSize(const std::string& relative_path,
                                    std::uint64_t* output_bytes);
     // Enumerates categorized media plus legacy flat media/<id> entries. New
@@ -106,6 +111,7 @@ private:
     esp_err_t RemoveDirectoryTreeLocked(const std::string& absolute_path);
     esp_err_t EnsureDirectoryTreeLocked(const std::string& absolute_path);
     bool IsSafeRelativePath(const std::string& path) const;
+    bool IsSafeStateName(const std::string& name) const;
     bool IsSafeTransactionId(const TransactionId& transaction_id) const;
     bool IsSafeMediaDirectory(const std::string& final_media_directory) const;
     bool IsSafePreviewDirectory(const std::string& relative_directory) const;

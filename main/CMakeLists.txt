@@ -87,8 +87,10 @@ set(SOURCES "xiaozhi/audio/audio_codec.cc"
             "display/display_service.cpp"
             "display/display_runtime.cpp"
             "led/indicator_service.cpp"
+            "power/power_service.cpp"
             "storage/storage_service.cpp"
             "storage/storage_runtime.cpp"
+            "dashboard/dashboard_data_service.cpp"
             "user_app_bsp/user_app.cpp"
             "user_app_bsp/mode_manager.cpp"
             "user_app_bsp/mode_cover_assets.cpp"
@@ -101,7 +103,7 @@ set(SOURCES "xiaozhi/audio/audio_codec.cc"
 
 set(INCLUDE_DIRS "." "xiaozhi" "xiaozhi/ui" "xiaozhi/ui/lvgl_display"
                  "xiaozhi/audio" "xiaozhi/protocols" "xiaozhi/official" "system" "network"
-                 "api" "album" "storage" "display" "user_app_bsp"
+                 "api" "album" "storage" "dashboard" "display" "user_app_bsp"
                  "input" "led" "power" "network" "sensors" "board" "common")
 
 # Add board common files
@@ -630,8 +632,8 @@ endif()
 # Define generation path
 set(LANG_JSON "${CMAKE_CURRENT_SOURCE_DIR}/xiaozhi/assets/locales/${LANG_DIR}/language.json")
 set(LANG_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/xiaozhi/assets/lang_config.h")
-file(GLOB LANG_SOUNDS ${CMAKE_CURRENT_SOURCE_DIR}/xiaozhi/assets/locales/${LANG_DIR}/*.ogg)
-file(GLOB COMMON_SOUNDS ${CMAKE_CURRENT_SOURCE_DIR}/xiaozhi/assets/common/*.ogg)
+file(GLOB LANG_SOUNDS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} xiaozhi/assets/locales/${LANG_DIR}/*.ogg)
+file(GLOB COMMON_SOUNDS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} xiaozhi/assets/common/*.ogg)
 
 # If target chip is ESP32, exclude specific files to avoid build errors
 if(CONFIG_IDF_TARGET_ESP32)

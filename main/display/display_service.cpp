@@ -26,7 +26,8 @@ esp_err_t DisplayService::SubmitLocal(const MediaId& media_id, const JobId& job_
 esp_err_t DisplayService::SubmitMedia(Feature feature, MediaCategory category, const MediaId& media_id,
                                       const JobId& job_id, JobService* jobs) {
     const bool valid_owner = (feature == Feature::kLocalAlbum && category == MediaCategory::kLocal) ||
-                             (feature == Feature::kAiAlbum && category == MediaCategory::kAi);
+                             (feature == Feature::kAiAlbum && category == MediaCategory::kAi) ||
+                             (feature == Feature::kInfoDashboard && category == MediaCategory::kDashboard);
     if (!valid_owner) return ESP_ERR_INVALID_ARG;
     if (!queue_ || !state_mutex_ || !jobs || media_id.empty() || job_id.empty() || media_id.size() >= 65 || job_id.size() >= 65) return ESP_ERR_INVALID_ARG;
     xSemaphoreTake(state_mutex_, portMAX_DELAY);

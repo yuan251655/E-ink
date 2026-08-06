@@ -14,6 +14,7 @@
 #include "display_runtime.h"
 #include "display_service.h"
 #include "device_log_service.h"
+#include "dashboard_data_service.h"
 #include "job_service.h"
 #include "job_runtime.h"
 #include "local_album_playback_runtime.h"
@@ -24,6 +25,7 @@
 #include "media_library_runtime.h"
 #include "mode_manager.h"
 #include "product_network.h"
+#include "power_service.h"
 #include "storage_runtime.h"
 #include "storage_service.h"
 
@@ -297,11 +299,14 @@ esp_err_t SubmitMediaDisplay(httpd_req_t* req, const MediaId& media_id, const Re
                              Revision expected_revision, const std::string& after_display) {
     MediaItem item;
     if (!GetMediaLibrary().Find(media_id, &item) ||
-        (item.category != MediaCategory::kLocal && item.category != MediaCategory::kAi) ||
+        (item.category != MediaCategory::kLocal && item.category != MediaCategory::kAi &&
+         item.category != MediaCategory::kDashboard) ||
         GetMediaLibrary().ValidateFrameForDisplay(media_id) != ESP_OK) {
         return SendJson(req, "{\"ok\":false,\"code\":\"media_invalid\"}", "422 Unprocessable Entity");
     }
-    const Feature owner = item.category == MediaCategory::kAi ? Feature::kAiAlbum : Feature::kLocalAlbum;
+    const Feature owner = item.category == MediaCategory::kAi ? Feature::kAiAlbum :
+                          item.category == MediaCategory::kDashboard ? Feature::kInfoDashboard :
+                          Feature::kLocalAlbum;
     const ModeSnapshot mode = GetModeManager().GetSnapshot();
     if (mode.active_feature != owner) return SendJson(req, "{\"ok\":false,\"code\":\"mode_changed\"}", "409 Conflict");
     if (mode.state != ModeSnapshot::State::kIdle) return SendJson(req, "{\"ok\":false,\"code\":\"mode_switch_busy\"}", "409 Conflict");
@@ -425,6 +430,8 @@ const char* ResetReasonName(esp_reset_reason_t reason) {
     }
 }
 
+bool ReadBoundedJson(httpd_req_t* req, JsonDocument* output, std::size_t max_bytes);
+
 esp_err_t Health(httpd_req_t* req) {
     std::string body = "{\"ok\":true,\"code\":\"ok\",\"message\":\"ready\",\"data\":{\"api_version\":\"v1\",\"uptime_ms\":";
     char uptime[21]{};
@@ -441,7 +448,42 @@ esp_err_t Health(httpd_req_t* req) {
     }
     body.append(",\"last_ai_stage\":");
     AppendJsonString(&body, active_stage);
-    body.append("}}");
+    const PowerSnapshot power = GetPowerService().GetSnapshot();
+    body.append(",\"power\":{\"pmic_online\":").append(power.pmic_online ? "true" : "false")
+        .append(",\"usb_present\":").append(power.usb_present ? "true" : "false")
+        .append(",\"battery_present\":").append(power.battery_present ? "true" : "false")
+        .append("}}}");
+    return SendJson(req, body.c_str());
+}
+
+esp_err_t PowerStatus(httpd_req_t* req) {
+    const PowerSnapshot power = GetPowerService().GetSnapshot();
+    std::string body = "{\"ok\":true,\"code\":\"ok\",\"data\":{\"stage\":\"observation_only\",\"pmic_online\":";
+    body.append(power.pmic_online ? "true" : "false");
+    body.append(",\"usb\":{\"present\":").append(power.usb_present ? "true" : "false")
+        .append(",\"voltage_mv\":").append(std::to_string(power.usb_voltage_mv)).append("}");
+    body.append(",\"system_voltage_mv\":").append(std::to_string(power.system_voltage_mv));
+    body.append(",\"battery\":{\"present\":").append(power.battery_present ? "true" : "false")
+        .append(",\"voltage_mv\":").append(std::to_string(power.battery_voltage_mv)).append(",\"percent\":");
+    if (power.battery_present && power.battery_percent >= 0) body.append(std::to_string(power.battery_percent));
+    else body.append("null");
+    body.append(",\"charging\":").append(power.charging ? "true" : "false")
+        .append(",\"discharging\":").append(power.discharging ? "true" : "false")
+        .append(",\"charger_state\":");
+    AppendJsonString(&body, PowerChargerStateName(power.charger_state));
+    body.append(",\"configured_current_ma\":");
+    if (power.main_charge_current_setting_ma >= 0) body.append(std::to_string(power.main_charge_current_setting_ma));
+    else body.append("null");
+    body.append(",\"target_voltage_mv\":");
+    if (power.main_charge_target_voltage_mv >= 0) body.append(std::to_string(power.main_charge_target_voltage_mv));
+    else body.append("null");
+    body.append(",\"termination_current_ma\":");
+    if (power.main_charge_termination_current_ma >= 0) body.append(std::to_string(power.main_charge_termination_current_ma));
+    else body.append("null");
+    body.append(",\"termination_enabled\":").append(power.main_charge_termination_enabled ? "true" : "false");
+    body.append("},\"rtc_backup\":{\"charge_enabled\":")
+        .append(power.rtc_backup_charge_enabled ? "true" : "false")
+        .append("},\"policy\":{\"main_battery_charge_policy\":\"fixed_safe_profile\",\"deep_sleep_enabled\":false}}}");
     return SendJson(req, body.c_str());
 }
 
@@ -617,6 +659,7 @@ esp_err_t ListMedia(httpd_req_t* req) {
     if (category[0] != '\0') {
         if (std::strcmp(category, "local") == 0) requested_category = MediaCategory::kLocal;
         else if (std::strcmp(category, "ai") == 0) requested_category = MediaCategory::kAi;
+        else if (std::strcmp(category, "dashboard") == 0) requested_category = MediaCategory::kDashboard;
         else return SendJson(req, "{\"ok\":false,\"code\":\"unsupported\"}", "400 Bad Request");
     }
     char* end = nullptr;
@@ -839,16 +882,84 @@ void AppendStorageHealth(std::string* body, const StorageSnapshot& storage) {
     AppendUInt64(body, storage.local_media_bytes);
     body->append("},\"ai\":{\"item_count\":").append(std::to_string(storage.ai_media_count)).append(",\"bytes\":");
     AppendUInt64(body, storage.ai_media_bytes);
-    body->append("},\"dashboard\":{\"item_count\":0,\"bytes\":0},\"logs\":{\"item_count\":0,\"bytes\":0},\"staging\":{\"item_count\":").append(std::to_string(storage.staging_count)).append(",\"bytes\":");
+    body->append("},\"dashboard\":{\"item_count\":").append(std::to_string(storage.dashboard_media_count)).append(",\"bytes\":");
+    AppendUInt64(body, storage.dashboard_media_bytes);
+    body->append("},\"logs\":{\"item_count\":0,\"bytes\":0},\"staging\":{\"item_count\":").append(std::to_string(storage.staging_count)).append(",\"bytes\":");
     AppendUInt64(body, storage.staging_bytes);
     body->append("},\"system\":{\"item_count\":0,\"bytes\":0}},\"active_operation\":");
     if (storage.active_transaction_id.empty()) body->append("null"); else body->append("\"upload\"");
     body->append(",\"last_error\":");
     if (storage.last_error_code.empty()) body->append("null"); else { body->append("{\"code\":"); AppendJsonString(body, storage.last_error_code); body->append("}"); }
-    body->append(",\"index_state\":\"ready\",\"current_media_protected\":false,\"last_check_age_seconds\":"); AppendUInt64(body, check_age);
+    const ModeSnapshot mode = GetModeManager().GetSnapshot();
+    const bool current_media_protected = !mode.current_media_id.empty() &&
+        mode.current_content_category != MediaCategory::kSystem;
+    body->append(",\"index_state\":\"ready\",\"current_media_protected\":").append(current_media_protected ? "true" : "false").append(",\"last_check_age_seconds\":"); AppendUInt64(body, check_age);
     body->append(",\"last_remount_age_seconds\":"); AppendUInt64(body, remount_age);
     body->append(",\"revision\":"); AppendUInt64(body, storage.revision);
     body->push_back('}');
+}
+
+void AppendDashboardSnapshotJson(std::string* body, const DashboardDataSnapshot& snapshot) {
+    body->append("{\"revision\":"); AppendUInt64(body, snapshot.revision);
+    body->append(",\"layout_id\":"); AppendJsonString(body, snapshot.layout_id);
+    body->append(",\"timezone\":"); AppendJsonString(body, snapshot.timezone);
+    body->append(",\"location\":{\"city_name\":"); AppendJsonString(body, snapshot.city_name); body->append("}");
+    body->append(",\"memo\":{\"text\":"); AppendJsonString(body, snapshot.memo); body->append("}");
+    body->append(",\"todos\":[");
+    for (std::size_t index = 0; index < snapshot.todos.size(); ++index) {
+        if (index != 0) body->push_back(',');
+        const auto& todo = snapshot.todos[index];
+        body->append("{\"id\":"); AppendJsonString(body, todo.id);
+        body->append(",\"title\":"); AppendJsonString(body, todo.title);
+        body->append(",\"completed\":").append(todo.completed ? "true" : "false")
+            .append(",\"position\":").append(std::to_string(todo.position)).append("}");
+    }
+    body->append("],\"display\":{\"state\":\"stale\",\"rendered_revision\":null,\"refresh_job_id\":null}}");
+}
+
+esp_err_t GetDashboard(httpd_req_t* req) {
+    std::string body = "{\"ok\":true,\"code\":\"ok\",\"data\":";
+    AppendDashboardSnapshotJson(&body, GetDashboardDataService().GetSnapshot());
+    body.append("}");
+    return SendJson(req, body.c_str());
+}
+
+esp_err_t UpdateDashboard(httpd_req_t* req) {
+    JsonDocument input;
+    if (!ReadBoundedJson(req, &input, 6144)) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    const std::string request_id = input["request_id"] | "";
+    if (request_id.empty() || request_id.size() > 64 || input["expected_revision"].isNull()) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    }
+    DashboardDataSnapshot candidate = GetDashboardDataService().GetSnapshot();
+    const JsonObjectConst patch = input["patch"].as<JsonObjectConst>();
+    if (patch.isNull()) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    if (!patch["layout_id"].isNull()) candidate.layout_id = patch["layout_id"] | "";
+    if (!patch["timezone"].isNull()) candidate.timezone = patch["timezone"] | "";
+    if (!patch["location"].isNull()) candidate.city_name = patch["location"]["city_name"] | "";
+    if (!patch["memo"].isNull()) candidate.memo = patch["memo"]["text"] | "";
+    if (!patch["todos"].isNull()) {
+        candidate.todos.clear();
+        for (JsonObjectConst value : patch["todos"].as<JsonArrayConst>()) {
+            DashboardTodoState todo;
+            todo.id = value["id"] | "";
+            todo.title = value["title"] | "";
+            todo.completed = value["completed"] | false;
+            todo.position = value["position"] | static_cast<std::uint32_t>(candidate.todos.size());
+            candidate.todos.push_back(std::move(todo));
+        }
+    }
+    DashboardDataSnapshot updated;
+    const esp_err_t result = GetDashboardDataService().Replace(candidate, input["expected_revision"] | 0ULL, &updated);
+    if (result == ESP_ERR_INVALID_STATE) {
+        std::string body = "{\"ok\":false,\"code\":\"dashboard_revision_conflict\",\"data\":";
+        AppendDashboardSnapshotJson(&body, GetDashboardDataService().GetSnapshot()); body.append("}");
+        return SendJson(req, body.c_str(), "409 Conflict");
+    }
+    if (result != ESP_OK) return SendJson(req, "{\"ok\":false,\"code\":\"dashboard_save_failed\"}", result == ESP_ERR_INVALID_ARG ? "400 Bad Request" : "503 Service Unavailable");
+    std::string body = "{\"ok\":true,\"code\":\"dashboard_saved\",\"data\":";
+    AppendDashboardSnapshotJson(&body, updated); body.append("}");
+    return SendJson(req, body.c_str());
 }
 
 esp_err_t StorageStatus(httpd_req_t* req) {
@@ -1164,6 +1275,7 @@ esp_err_t RegisterProductApi(httpd_handle_t server) {
         {.uri="/setup", .method=HTTP_GET, .handler=ProvisionPage, .user_ctx=nullptr},
         {.uri="/index.html", .method=HTTP_GET, .handler=ProvisionPage, .user_ctx=nullptr},
         {.uri="/api/v1/health", .method=HTTP_GET, .handler=Health, .user_ctx=nullptr},
+        {.uri="/api/v1/power/status", .method=HTTP_GET, .handler=PowerStatus, .user_ctx=nullptr},
         {.uri="/api/v1/device/capabilities", .method=HTTP_GET, .handler=Capabilities, .user_ctx=nullptr},
         {.uri="/api/v1/device/status", .method=HTTP_GET, .handler=Status, .user_ctx=nullptr},
         {.uri="/api/v1/mode", .method=HTTP_GET, .handler=GetMode, .user_ctx=nullptr},
@@ -1175,6 +1287,8 @@ esp_err_t RegisterProductApi(httpd_handle_t server) {
         {.uri="/api/v1/storage/health", .method=HTTP_GET, .handler=StorageStatus, .user_ctx=nullptr},
         {.uri="/api/v1/storage/recheck", .method=HTTP_POST, .handler=RemountStorage, .user_ctx=nullptr},
         {.uri="/api/v1/display/status", .method=HTTP_GET, .handler=DisplayStatus, .user_ctx=nullptr},
+        {.uri="/api/v1/dashboard", .method=HTTP_GET, .handler=GetDashboard, .user_ctx=nullptr},
+        {.uri="/api/v1/dashboard", .method=HTTP_POST, .handler=UpdateDashboard, .user_ctx=nullptr},
         {.uri="/api/v1/local-album/playback", .method=HTTP_GET, .handler=GetLocalAlbumPlayback, .user_ctx=nullptr},
         {.uri="/api/v1/local-album/playback", .method=HTTP_POST, .handler=UpdateLocalAlbumPlayback, .user_ctx=nullptr},
         {.uri="/api/v1/ai-album/playback", .method=HTTP_GET, .handler=GetAiAlbumPlayback, .user_ctx=nullptr},

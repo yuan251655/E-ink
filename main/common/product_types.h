@@ -156,6 +156,8 @@ struct StorageSnapshot {
     std::uint64_t local_media_bytes = 0;
     std::uint32_t ai_media_count = 0;
     std::uint64_t ai_media_bytes = 0;
+    std::uint32_t dashboard_media_count = 0;
+    std::uint64_t dashboard_media_bytes = 0;
     std::uint32_t staging_count = 0;
     std::uint64_t staging_bytes = 0;
     std::uint64_t last_remount_uptime_ms = 0;

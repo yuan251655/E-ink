@@ -201,6 +201,5 @@ uint8_t User_Mode_init(void)
     xTaskCreate(boot_button_user_Task, "boot_button_user_Task", 4 * 1024, NULL, 3, NULL);
     xTaskCreate(Green_led_user_Task, "Green_led_user_Task", 3 * 1024, &Green_led_arg, 2, NULL);
     xTaskCreate(Red_led_user_Task, "Red_led_user_Task", 3 * 1024, &Red_led_arg, 2, NULL);
-    xTaskCreate(Axp2101_isChargingTask, "Axp2101_isChargingTask", 3 * 1024, NULL, 2, NULL);   //AXP2101 Charging
     return 1;
 }

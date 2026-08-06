@@ -168,7 +168,8 @@ esp_err_t MediaLibrary::RegisterCommitted(MediaCategory category, const MediaId&
     if (media_id.empty() || mutex_ == nullptr) return ESP_ERR_INVALID_ARG;
 
     const char* category_directory = category == MediaCategory::kLocal ? "local" :
-        (category == MediaCategory::kAi ? "ai" : nullptr);
+        (category == MediaCategory::kAi ? "ai" :
+         (category == MediaCategory::kDashboard ? "dashboard" : nullptr));
     if (category_directory == nullptr) return ESP_ERR_INVALID_ARG;
     const CommittedMediaLocation location{
         category,
@@ -345,8 +346,11 @@ bool MediaLibrary::IsValidSnapshotLocation(const MediaItem& item) const {
         return item.storage_relative_directory == "media/local/" + item.media_id ||
                item.storage_relative_directory == "media/" + item.media_id;
     }
-    return item.category == MediaCategory::kAi && item.feature == Feature::kAiAlbum &&
-           item.storage_relative_directory == "media/ai/" + item.media_id;
+    if (item.category == MediaCategory::kAi && item.feature == Feature::kAiAlbum) {
+        return item.storage_relative_directory == "media/ai/" + item.media_id;
+    }
+    return item.category == MediaCategory::kDashboard && item.feature == Feature::kInfoDashboard &&
+           item.storage_relative_directory == "media/dashboard/" + item.media_id;
 }
 
 Revision MediaLibrary::revision() const {
@@ -384,9 +388,11 @@ esp_err_t MediaLibrary::LoadManifest(const CommittedMediaLocation& location, Med
     const std::string manifest_media_id = root["media_id"] | "";
     const std::string category = root["category"] | "";
     const MediaCategory manifest_category = category == "local" ? MediaCategory::kLocal :
-        (category == "ai" ? MediaCategory::kAi : MediaCategory::kSystem);
+        (category == "ai" ? MediaCategory::kAi :
+         (category == "dashboard" ? MediaCategory::kDashboard : MediaCategory::kSystem));
     if (manifest_media_id != location.media_id || manifest_category != location.category ||
-        (manifest_category != MediaCategory::kLocal && manifest_category != MediaCategory::kAi)) {
+        (manifest_category != MediaCategory::kLocal && manifest_category != MediaCategory::kAi &&
+         manifest_category != MediaCategory::kDashboard)) {
         return ESP_ERR_INVALID_ARG;
     }
     MediaItem item;
@@ -394,7 +400,8 @@ esp_err_t MediaLibrary::LoadManifest(const CommittedMediaLocation& location, Med
     item.display_name = root["display_name"] | "";
     if (item.display_name.size() > 128) return ESP_ERR_INVALID_SIZE;
     item.category = manifest_category;
-    item.feature = manifest_category == MediaCategory::kAi ? Feature::kAiAlbum : Feature::kLocalAlbum;
+    item.feature = manifest_category == MediaCategory::kAi ? Feature::kAiAlbum :
+        (manifest_category == MediaCategory::kDashboard ? Feature::kInfoDashboard : Feature::kLocalAlbum);
     item.storage_relative_directory = location.relative_directory;
     item.created_at_ms = root["created_at_ms"] | 0ULL;
     item.updated_at_ms = root["updated_at_ms"] | item.created_at_ms;

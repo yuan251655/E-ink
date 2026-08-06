@@ -14,6 +14,53 @@ static XPowersPMU axp2101;
 static I2cMasterBus           *i2cbus_   = NULL;
 static i2c_master_dev_handle_t i2cPMICdev = NULL;
 static uint8_t                 i2cPMICAddress;
+static bool                    pmic_ready = false;
+
+static int16_t AXP2101ChargeCurrentSettingMilliamp(uint8_t raw) {
+    switch (raw) {
+        case XPOWERS_AXP2101_CHG_CUR_0MA: return 0;
+        case XPOWERS_AXP2101_CHG_CUR_100MA: return 100;
+        case XPOWERS_AXP2101_CHG_CUR_125MA: return 125;
+        case XPOWERS_AXP2101_CHG_CUR_150MA: return 150;
+        case XPOWERS_AXP2101_CHG_CUR_175MA: return 175;
+        case XPOWERS_AXP2101_CHG_CUR_200MA: return 200;
+        case XPOWERS_AXP2101_CHG_CUR_300MA: return 300;
+        case XPOWERS_AXP2101_CHG_CUR_400MA: return 400;
+        case XPOWERS_AXP2101_CHG_CUR_500MA: return 500;
+        case XPOWERS_AXP2101_CHG_CUR_600MA: return 600;
+        case XPOWERS_AXP2101_CHG_CUR_700MA: return 700;
+        case XPOWERS_AXP2101_CHG_CUR_800MA: return 800;
+        case XPOWERS_AXP2101_CHG_CUR_900MA: return 900;
+        case XPOWERS_AXP2101_CHG_CUR_1000MA: return 1000;
+        default: return -1;
+    }
+}
+
+static int16_t AXP2101ChargeTargetVoltageMillivolt(uint8_t raw) {
+    switch (raw) {
+        case XPOWERS_AXP2101_CHG_VOL_4V: return 4000;
+        case XPOWERS_AXP2101_CHG_VOL_4V1: return 4100;
+        case XPOWERS_AXP2101_CHG_VOL_4V2: return 4200;
+        case XPOWERS_AXP2101_CHG_VOL_4V35: return 4350;
+        case XPOWERS_AXP2101_CHG_VOL_4V4: return 4400;
+        default: return -1;
+    }
+}
+
+static int16_t AXP2101ChargeTerminationCurrentMilliamp(uint8_t raw) {
+    switch (raw) {
+        case XPOWERS_AXP2101_CHG_ITERM_0MA: return 0;
+        case XPOWERS_AXP2101_CHG_ITERM_25MA: return 25;
+        case XPOWERS_AXP2101_CHG_ITERM_50MA: return 50;
+        case XPOWERS_AXP2101_CHG_ITERM_75MA: return 75;
+        case XPOWERS_AXP2101_CHG_ITERM_100MA: return 100;
+        case XPOWERS_AXP2101_CHG_ITERM_125MA: return 125;
+        case XPOWERS_AXP2101_CHG_ITERM_150MA: return 150;
+        case XPOWERS_AXP2101_CHG_ITERM_175MA: return 175;
+        case XPOWERS_AXP2101_CHG_ITERM_200MA: return 200;
+        default: return -1;
+    }
+}
 
 static int AXP2101_SLAVE_Read(uint8_t devAddr, uint8_t regAddr, uint8_t *data, uint8_t len) {
     int ret;
@@ -66,16 +113,19 @@ void Custom_PmicPortInit(I2cMasterBus *i2cbus,uint8_t dev_addr) {
         ESP_ERROR_CHECK(i2c_master_bus_add_device(BusHandle, &dev_cfg, &i2cPMICdev));
         i2cPMICAddress = dev_addr;
     }
-    if (axp2101.begin(i2cPMICAddress, AXP2101_SLAVE_Read, AXP2101_SLAVE_Write)) {
+    pmic_ready = axp2101.begin(i2cPMICAddress, AXP2101_SLAVE_Read, AXP2101_SLAVE_Write);
+    if (pmic_ready) {
         ESP_LOGI(TAG, "Init PMU SUCCESS!");
     } else {
         ESP_LOGE(TAG, "Init PMU FAILED!");
+        return;
     }
     Custom_PmicPortGpioInit();
     Custom_PmicRegisterInit();
 }
 
 void Custom_PmicRegisterInit(void) {
+    if (!pmic_ready) return;
     axp2101.setVbusCurrentLimit(XPOWERS_AXP2101_VBUS_CUR_LIM_2000MA);
 
     if(axp2101.getDC1Voltage() != 3300) {
@@ -99,12 +149,33 @@ void Custom_PmicRegisterInit(void) {
         ESP_LOGW("axp2101_init_log","Set ALDO4 to output 3V3");
     }
 
-    axp2101.setPrechargeCurr(XPOWERS_AXP2101_PRECHARGE_50MA);
-    axp2101.setChargerConstantCurr(XPOWERS_AXP2101_CHG_CUR_500MA);
+    // The connected 454261 is a single-cell 3.7 V Li-ion pack with a 4.2 V
+    // charge limit. Keep a conservative 200 mA CC profile and let the PMIC
+    // terminate the CV phase at 25 mA. This is a hardware-enforced charge
+    // cycle and does not depend on the App or its displayed percentage.
+    axp2101.enableCellbatteryCharge();
+    axp2101.setPrechargeCurr(XPOWERS_AXP2101_PRECHARGE_100MA);
+    if (!axp2101.setChargerConstantCurr(XPOWERS_AXP2101_CHG_CUR_200MA)) {
+        ESP_LOGE(TAG, "Failed to set main battery charge current");
+    }
+    if (!axp2101.setChargeTargetVoltage(XPOWERS_AXP2101_CHG_VOL_4V2)) {
+        ESP_LOGE(TAG, "Failed to set main battery charge target voltage");
+    }
     axp2101.setChargerTerminationCurr(XPOWERS_AXP2101_CHG_ITERM_25MA);
+    axp2101.enableChargerTerminationLimit();
+
+    // VBACKUP is explicitly disabled so a non-rechargeable RTC coin cell
+    // cannot be charged accidentally.
+    axp2101.disableButtonBatteryCharge();
+    axp2101.enableSystemVoltageMeasure();
+    axp2101.enableVbusVoltageMeasure();
+    axp2101.enableBattVoltageMeasure();
+    axp2101.enableBattDetection();
 }
 
 void Axp2101_isChargingTask(void *arg) {
+    // Retained only for source compatibility with the official BSP. Product
+    // firmware no longer creates this task; clients query PowerService.
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(20000));
         ESP_LOGI(TAG, "isCharging: %s", axp2101.isCharging() ? "YES" : "NO");
@@ -128,18 +199,15 @@ void Axp2101_isChargingTask(void *arg) {
 }
 
 PmicRegisterConfig Custom_PmicGetBatteryInfo(void) {
-    PmicRegisterConfig config;
-    int data = axp2101.readRegister(0x17);
-    if(data > 0) {
-        axp2101.writeRegister(0x17,(uint8_t)(data & 0xFB)); 
-    }
-    bool is_charging = axp2101.isCharging();
+    PmicRegisterConfig config = {};
+    const PmicPowerSnapshot snapshot = Custom_PmicGetPowerSnapshot();
+    bool is_charging = snapshot.charging;
     if(is_charging) {
         strcpy(config.isCharging, "Battery Status : Charging");
     } else {
         strcpy(config.isCharging, "Battery Status : Not Charging");
     }
-    uint8_t charge_status = axp2101.getChargerStatus();
+    uint8_t charge_status = snapshot.charger_status;
     if (charge_status == XPOWERS_AXP2101_CHG_TRI_STATE) {
         strcpy(config.chargeStatus, "Charging Status : Tri_Charge");
     } else if (charge_status == XPOWERS_AXP2101_CHG_PRE_STATE) {
@@ -153,9 +221,37 @@ PmicRegisterConfig Custom_PmicGetBatteryInfo(void) {
     } else if (charge_status == XPOWERS_AXP2101_CHG_STOP_STATE) {
         strcpy(config.chargeStatus, "Charging Status : Not_Charging");
     }
-    uint16_t battery_voltage = axp2101.getBattVoltage();
+    uint16_t battery_voltage = snapshot.battery_voltage_mv;
     snprintf(config.batteryVoltage, sizeof(config.batteryVoltage), "Battery Voltage : %dmV", battery_voltage);
-    int battery_percent = axp2101.getBatteryPercent();
+    int battery_percent = snapshot.battery_percent;
     snprintf(config.batteryPercent, sizeof(config.batteryPercent), "Battery Percent : %d%%", battery_percent);
     return config;
+}
+
+PmicPowerSnapshot Custom_PmicGetPowerSnapshot(void) {
+    PmicPowerSnapshot snapshot = {};
+    snapshot.battery_percent = -1;
+    snapshot.main_charge_current_setting_ma = -1;
+    snapshot.main_charge_target_voltage_mv = -1;
+    snapshot.main_charge_termination_current_ma = -1;
+    snapshot.pmic_ready = pmic_ready;
+    if (!pmic_ready) return snapshot;
+
+    snapshot.usb_vbus_present = axp2101.isVbusIn();
+    snapshot.battery_present = axp2101.isBatteryConnect();
+    snapshot.charging = axp2101.isCharging();
+    snapshot.discharging = axp2101.isDischarge();
+    snapshot.backup_battery_charge_enabled = axp2101.isEnableButtonBatteryCharge();
+    snapshot.charger_status = axp2101.getChargerStatus();
+    snapshot.vbus_voltage_mv = axp2101.getVbusVoltage();
+    snapshot.system_voltage_mv = axp2101.getSystemVoltage();
+    snapshot.main_charge_current_setting_ma = AXP2101ChargeCurrentSettingMilliamp(axp2101.getChargerConstantCurr());
+    snapshot.main_charge_target_voltage_mv = AXP2101ChargeTargetVoltageMillivolt(axp2101.getChargeTargetVoltage());
+    snapshot.main_charge_termination_current_ma = AXP2101ChargeTerminationCurrentMilliamp(axp2101.getChargerTerminationCurr());
+    snapshot.main_charge_termination_enabled = axp2101.isChargerTerminationLimit();
+    if (snapshot.battery_present) {
+        snapshot.battery_voltage_mv = axp2101.getBattVoltage();
+        snapshot.battery_percent = axp2101.getBatteryPercent();
+    }
+    return snapshot;
 }

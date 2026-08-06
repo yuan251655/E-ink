@@ -313,7 +313,8 @@ void ModeManager::RecordDisplayedMedia(Feature owner, MediaCategory category, co
     ModeSnapshot persisted;
     xSemaphoreTake(mutex_, portMAX_DELAY);
     if (snapshot_.active_feature == owner && snapshot_.state == ModeSnapshot::State::kIdle) {
-        snapshot_.current_content_kind = ModeSnapshot::ContentKind::kMedia;
+        snapshot_.current_content_kind = owner == Feature::kInfoDashboard
+            ? ModeSnapshot::ContentKind::kDashboard : ModeSnapshot::ContentKind::kMedia;
         snapshot_.current_content_owner = owner;
         snapshot_.current_content_category = category;
         snapshot_.current_media_id = media_id;
