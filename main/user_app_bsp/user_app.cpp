@@ -9,6 +9,7 @@
 #include "power_bsp.h"
 #include "led_bsp.h"
 #include "imgdecode_app.h"
+#include "rtc_service.h"
 
 CustomSDPort *SDPort = NULL;
 ImgDecodeDither decdither;
@@ -119,6 +120,7 @@ static void Red_led_user_Task(void *arg) {
                 Led_SetLevel(LED_PIN_Red, LED_OFF);
                 vTaskDelay(pdMS_TO_TICKS(400));
             }
+            Led_SetLevel(LED_PIN_Red, LED_ON);
             xEventGroupClearBits(Red_led_Mode_queue, GroupBit1);
         }
     }
@@ -176,7 +178,9 @@ uint8_t User_Mode_init(void)
 {
     epaper_gui_semapHandle = xSemaphoreCreateMutex(); /* Acquire the mutual exclusion lock to prevent re-flashing */
     Custom_PmicPortInit(&I2cBus,0x34);
+    (void)photopainter::product::InitializeRtcService();
     Led_init();                                       /* LED Blink Initialization */
+    Led_SetLevel(LED_PIN_Red, LED_ON);                /* Product running: red steady */
     SDPort = new CustomSDPort("/sdcard");
     uint8_t sdcard_win = SDPort->SDPort_GetSdcardInitOK();              /* SD Card Initialization */
     if (sdcard_win == 0)

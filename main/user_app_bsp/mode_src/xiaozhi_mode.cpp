@@ -63,19 +63,9 @@ void xiaozhi_init_received(const char *arg1)
 }
 
 void xiaozhi_application_received(const char *str) {
-    static bool is_led_flag = false;
     strcpy(sleep_buff, str);
-    if (is_led_flag) {
-        if (strstr(sleep_buff, "idle") != NULL) {
-            gpio_set_level((gpio_num_t) 45, 1);
-            is_led_flag = false;
-        }
-    } else {
-        if ((strstr(sleep_buff, "listening") != NULL) || (strstr(sleep_buff, "speaking") != NULL)) {
-            gpio_set_level((gpio_num_t) 45, 0);
-            is_led_flag = true;
-        }
-    }
+    // Product indicator ownership belongs to the LED service.  The legacy
+    // Xiaozhi state callback must not overwrite the boot red-light state.
 }
 
 void xiaozhi_ai_Message(const char *arg1, const char *arg2) //ai chat

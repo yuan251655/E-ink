@@ -89,6 +89,7 @@ set(SOURCES "xiaozhi/audio/audio_codec.cc"
             "led/indicator_service.cpp"
             "power/power_service.cpp"
             "power/button_sleep_service.cpp"
+            "time/rtc_service.cpp"
             "storage/storage_service.cpp"
             "storage/storage_runtime.cpp"
             "dashboard/dashboard_data_service.cpp"
@@ -105,7 +106,7 @@ set(SOURCES "xiaozhi/audio/audio_codec.cc"
 set(INCLUDE_DIRS "." "xiaozhi" "xiaozhi/ui" "xiaozhi/ui/lvgl_display"
                  "xiaozhi/audio" "xiaozhi/protocols" "xiaozhi/official" "system" "network"
                  "api" "album" "storage" "dashboard" "display" "user_app_bsp"
-                 "input" "led" "power" "network" "sensors" "board" "common")
+                 "input" "led" "power" "time" "network" "sensors" "board" "common")
 
 # Add board common files
 file(GLOB BOARD_COMMON_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/boards/common/*.cc)

@@ -29,6 +29,12 @@ void IndicatorService::SetRefreshActive(bool active) {
     }
 }
 
+void IndicatorService::RunSelfTest() {
+    if (!initialized_) return;
+    xEventGroupSetBits(Red_led_Mode_queue, GroupBit1);
+    xEventGroupSetBits(Green_led_Mode_queue, set_bit_button(7));
+}
+
 IndicatorService& GetIndicatorService() {
     static IndicatorService service;
     return service;

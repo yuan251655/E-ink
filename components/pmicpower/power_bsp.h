@@ -22,6 +22,7 @@ typedef struct {
     bool charging;
     bool discharging;
     bool backup_battery_charge_enabled;
+    bool backup_battery_charge_safe;
     uint8_t charger_status;
     uint16_t vbus_voltage_mv;
     uint16_t system_voltage_mv;

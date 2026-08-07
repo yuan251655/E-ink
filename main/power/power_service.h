@@ -26,6 +26,7 @@ struct PowerSnapshot {
     // Stage P0 safety invariant: this remains false until a compatible
     // rechargeable backup cell and its policy are explicitly confirmed.
     bool rtc_backup_charge_enabled = false;
+    bool rtc_backup_charge_safe = false;
     PowerChargerState charger_state = PowerChargerState::kUnknown;
     std::uint16_t usb_voltage_mv = 0;
     std::uint16_t system_voltage_mv = 0;

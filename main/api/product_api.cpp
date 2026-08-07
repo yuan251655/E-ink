@@ -17,6 +17,7 @@
 #include "dashboard_data_service.h"
 #include "job_service.h"
 #include "job_runtime.h"
+#include "indicator_service.h"
 #include "local_album_playback_runtime.h"
 #include "ai_album_playback_runtime.h"
 #include "media_library.h"
@@ -26,6 +27,7 @@
 #include "mode_manager.h"
 #include "product_network.h"
 #include "power_service.h"
+#include "rtc_service.h"
 #include "storage_runtime.h"
 #include "storage_service.h"
 
@@ -483,8 +485,75 @@ esp_err_t PowerStatus(httpd_req_t* req) {
     body.append(",\"termination_enabled\":").append(power.main_charge_termination_enabled ? "true" : "false");
     body.append("},\"rtc_backup\":{\"charge_enabled\":")
         .append(power.rtc_backup_charge_enabled ? "true" : "false")
+        .append(",\"safe_to_install\":")
+        .append(power.rtc_backup_charge_safe ? "true" : "false")
         .append("},\"policy\":{\"main_battery_charge_policy\":\"fixed_safe_profile\",\"deep_sleep_enabled\":true}}}");
     return SendJson(req, body.c_str());
+}
+
+esp_err_t IndicatorSelfTest(httpd_req_t* req) {
+    if (req == nullptr || req->content_len > 2) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    }
+    GetIndicatorService().RunSelfTest();
+    return SendJson(req, "{\"ok\":true,\"code\":\"led_test_started\"}");
+}
+
+esp_err_t TimeStatus(httpd_req_t* req) {
+    const auto rtc = GetRtcService().GetSnapshot();
+    std::string body = "{\"ok\":true,\"code\":\"ok\",\"data\":{\"present\":";
+    body.append(rtc.present ? "true" : "false").append(",\"valid\":");
+    body.append(rtc.valid ? "true" : "false").append(",\"year\":");
+    AppendUInt64(&body, rtc.year); body.append(",\"month\":"); AppendUInt64(&body, rtc.month);
+    body.append(",\"day\":"); AppendUInt64(&body, rtc.day); body.append(",\"weekday\":"); AppendUInt64(&body, rtc.weekday);
+    body.append(",\"hour\":"); AppendUInt64(&body, rtc.hour); body.append(",\"minute\":"); AppendUInt64(&body, rtc.minute);
+    body.append(",\"second\":"); AppendUInt64(&body, rtc.second);
+    body.append(",\"rtc_int_level\":").append(std::to_string(GetRtcService().ReadInterruptLevel())).append("}}");
+    return SendJson(req, body.c_str());
+}
+
+esp_err_t StartRtcInterruptDiagnostic(httpd_req_t* req) {
+    if (req == nullptr || req->content_len <= 0 || req->content_len > 64) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    }
+    char body[65]{};
+    const int received = httpd_req_recv(req, body, req->content_len);
+    if (received != req->content_len) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    JsonDocument input;
+    const std::uint16_t seconds = deserializeJson(input, body) == DeserializationError::Ok ? input["seconds"] | 0 : 0;
+    if (seconds == 0 || seconds > 255 || GetRtcService().ArmInterruptDiagnostic(static_cast<std::uint8_t>(seconds)) != ESP_OK) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"rtc_int_test_failed\"}", "503 Service Unavailable");
+    }
+    return SendJson(req, "{\"ok\":true,\"code\":\"rtc_int_test_armed\"}");
+}
+
+esp_err_t SetTime(httpd_req_t* req) {
+    if (req == nullptr || req->content_len <= 0 || req->content_len > 192) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    }
+    char body[193]{};
+    int received = 0;
+    while (received < req->content_len) {
+        const int read = httpd_req_recv(req, body + received, req->content_len - received);
+        if (read <= 0) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+        received += read;
+    }
+    JsonDocument input;
+    if (deserializeJson(input, body) != DeserializationError::Ok) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    }
+    RtcSnapshot time;
+    time.year = input["year"] | 0;
+    time.month = input["month"] | 0;
+    time.day = input["day"] | 0;
+    time.weekday = input["weekday"] | 7;
+    time.hour = input["hour"] | 24;
+    time.minute = input["minute"] | 60;
+    time.second = input["second"] | 60;
+    if (GetRtcService().SetTime(time) != ESP_OK) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"rtc_set_failed\"}", "503 Service Unavailable");
+    }
+    return TimeStatus(req);
 }
 
 esp_err_t GetMode(httpd_req_t* req) {
@@ -1276,6 +1345,10 @@ esp_err_t RegisterProductApi(httpd_handle_t server) {
         {.uri="/index.html", .method=HTTP_GET, .handler=ProvisionPage, .user_ctx=nullptr},
         {.uri="/api/v1/health", .method=HTTP_GET, .handler=Health, .user_ctx=nullptr},
         {.uri="/api/v1/power/status", .method=HTTP_GET, .handler=PowerStatus, .user_ctx=nullptr},
+        {.uri="/api/v1/device/led-test", .method=HTTP_POST, .handler=IndicatorSelfTest, .user_ctx=nullptr},
+        {.uri="/api/v1/time/status", .method=HTTP_GET, .handler=TimeStatus, .user_ctx=nullptr},
+        {.uri="/api/v1/time", .method=HTTP_POST, .handler=SetTime, .user_ctx=nullptr},
+        {.uri="/api/v1/time/int-test", .method=HTTP_POST, .handler=StartRtcInterruptDiagnostic, .user_ctx=nullptr},
         {.uri="/api/v1/device/capabilities", .method=HTTP_GET, .handler=Capabilities, .user_ctx=nullptr},
         {.uri="/api/v1/device/status", .method=HTTP_GET, .handler=Status, .user_ctx=nullptr},
         {.uri="/api/v1/mode", .method=HTTP_GET, .handler=GetMode, .user_ctx=nullptr},

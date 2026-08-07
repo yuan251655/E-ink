@@ -15,6 +15,7 @@ static I2cMasterBus           *i2cbus_   = NULL;
 static i2c_master_dev_handle_t i2cPMICdev = NULL;
 static uint8_t                 i2cPMICAddress;
 static bool                    pmic_ready = false;
+static bool                    backup_battery_charge_verified_disabled = false;
 
 static int16_t AXP2101ChargeCurrentSettingMilliamp(uint8_t raw) {
     switch (raw) {
@@ -163,9 +164,20 @@ void Custom_PmicRegisterInit(void) {
     axp2101.setChargerTerminationCurr(XPOWERS_AXP2101_CHG_ITERM_25MA);
     axp2101.enableChargerTerminationLimit();
 
-    // VBACKUP is explicitly disabled so a non-rechargeable RTC coin cell
-    // cannot be charged accidentally.
-    axp2101.disableButtonBatteryCharge();
+    // CR2032 is non-rechargeable. Disable VBACKUP charging and verify the
+    // register before the firmware may report that installation is safe.
+    backup_battery_charge_verified_disabled = false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        (void)axp2101.disableButtonBatteryCharge();
+        if (!axp2101.isEnableButtonBatteryCharge()) {
+            backup_battery_charge_verified_disabled = true;
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (!backup_battery_charge_verified_disabled) {
+        ESP_LOGE(TAG, "RTC backup charging could not be disabled; do not install CR2032");
+    }
     axp2101.enableSystemVoltageMeasure();
     axp2101.enableVbusVoltageMeasure();
     axp2101.enableBattVoltageMeasure();
@@ -241,6 +253,8 @@ PmicPowerSnapshot Custom_PmicGetPowerSnapshot(void) {
     snapshot.charging = axp2101.isCharging();
     snapshot.discharging = axp2101.isDischarge();
     snapshot.backup_battery_charge_enabled = axp2101.isEnableButtonBatteryCharge();
+    snapshot.backup_battery_charge_safe =
+        backup_battery_charge_verified_disabled && !snapshot.backup_battery_charge_enabled;
     snapshot.charger_status = axp2101.getChargerStatus();
     snapshot.vbus_voltage_mv = axp2101.getVbusVoltage();
     snapshot.system_voltage_mv = axp2101.getSystemVoltage();

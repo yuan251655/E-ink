@@ -1,3 +1,5 @@
+#include <cstdint>
+
 #include <driver/gpio.h>
 #include <esp_err.h>
 #include <esp_event.h>
@@ -48,7 +50,12 @@ const char* ResetReasonCode() {
 
 const char* WakeupCauseCode() {
     switch (esp_sleep_get_wakeup_cause()) {
-        case ESP_SLEEP_WAKEUP_EXT1: return "key";
+        case ESP_SLEEP_WAKEUP_EXT1: {
+            const std::uint64_t pins = esp_sleep_get_ext1_wakeup_status();
+            if ((pins & (1ULL << GPIO_NUM_6)) != 0) return "rtc";
+            if ((pins & (1ULL << GPIO_NUM_4)) != 0) return "key";
+            return "ext1";
+        }
         case ESP_SLEEP_WAKEUP_TIMER: return "timer";
         case ESP_SLEEP_WAKEUP_UNDEFINED: return "none";
         default: return "other";

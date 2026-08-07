@@ -10,6 +10,7 @@ class IndicatorService {
 public:
     esp_err_t Initialize();
     void SetRefreshActive(bool active);
+    void RunSelfTest();
 
 private:
     bool initialized_ = false;

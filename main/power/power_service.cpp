@@ -2,6 +2,7 @@
 
 #include "esp_log.h"
 #include "XPowersLib.h"
+#include "device_log_service.h"
 #include "power_bsp.h"
 
 namespace photopainter::product {
@@ -29,10 +30,18 @@ esp_err_t PowerService::Initialize() {
         ESP_LOGW(kTag, "AXP2101 is unavailable; power API will report pmic_online=false");
         return ESP_ERR_NOT_FOUND;
     }
-    ESP_LOGI(kTag, "AXP2101 online; USB=%s battery=%s RTC backup charge=%s",
+    ESP_LOGI(kTag, "AXP2101 online; USB=%s battery=%s RTC backup charge=%s safe=%s",
              pmic.usb_vbus_present ? "present" : "absent",
              pmic.battery_present ? "present" : "absent",
-             pmic.backup_battery_charge_enabled ? "enabled" : "disabled");
+             pmic.backup_battery_charge_enabled ? "enabled" : "disabled",
+             pmic.backup_battery_charge_safe ? "yes" : "no");
+    if (!pmic.backup_battery_charge_safe) {
+        GetDeviceLogService().Add(DeviceLogSeverity::kError, "power", "rtc_backup_charge_unsafe",
+                                  "RTC backup charging is not verified disabled; do not install CR2032");
+        return ESP_ERR_INVALID_STATE;
+    }
+    GetDeviceLogService().Add(DeviceLogSeverity::kInfo, "power", "rtc_backup_charge_safe",
+                              "RTC backup charging is verified disabled");
     return ESP_OK;
 }
 
@@ -46,6 +55,7 @@ PowerSnapshot PowerService::GetSnapshot() const {
     snapshot.charging = pmic.charging;
     snapshot.discharging = pmic.discharging;
     snapshot.rtc_backup_charge_enabled = pmic.backup_battery_charge_enabled;
+    snapshot.rtc_backup_charge_safe = pmic.backup_battery_charge_safe;
     snapshot.charger_state = ToChargerState(pmic.charger_status);
     snapshot.usb_voltage_mv = pmic.vbus_voltage_mv;
     snapshot.system_voltage_mv = pmic.system_voltage_mv;
