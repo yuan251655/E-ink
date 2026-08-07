@@ -2,6 +2,7 @@
 #include <esp_err.h>
 #include <esp_event.h>
 #include <esp_log.h>
+#include <esp_sleep.h>
 #include <esp_system.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -31,6 +32,7 @@ namespace {
 const char* ResetReasonCode() {
     switch (esp_reset_reason()) {
         case ESP_RST_POWERON: return "power_on";
+        case ESP_RST_DEEPSLEEP: return "deep_sleep";
         case ESP_RST_EXT: return "external";
         case ESP_RST_SW: return "software";
         case ESP_RST_PANIC: return "panic";
@@ -42,6 +44,15 @@ const char* ResetReasonCode() {
         default: return "unknown";
     }
 }
+
+const char* WakeupCauseCode() {
+    switch (esp_sleep_get_wakeup_cause()) {
+        case ESP_SLEEP_WAKEUP_EXT1: return "key";
+        case ESP_SLEEP_WAKEUP_TIMER: return "timer";
+        case ESP_SLEEP_WAKEUP_UNDEFINED: return "none";
+        default: return "other";
+    }
+}
 }  // namespace
 
 extern "C" void app_main(void) {
@@ -50,6 +61,9 @@ extern "C" void app_main(void) {
         "Reset reason recorded");
     photopainter::product::GetDeviceLogService().Add(
         photopainter::product::DeviceLogSeverity::kInfo, "system", "boot", "设备启动");
+    photopainter::product::GetDeviceLogService().Add(
+        photopainter::product::DeviceLogSeverity::kInfo, "system", WakeupCauseCode(),
+        "Wake cause recorded");
     // Initialize the default event loop
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 

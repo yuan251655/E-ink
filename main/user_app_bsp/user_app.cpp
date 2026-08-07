@@ -184,21 +184,9 @@ uint8_t User_Mode_init(void)
     Green_led_Mode_queue = xEventGroupCreate();
     Red_led_Mode_queue   = xEventGroupCreate();
     epaper_groups        = xEventGroupCreate();
-    /*GPIO */
-    gpio_config_t gpio_conf = {};
-    gpio_conf.intr_type     = GPIO_INTR_DISABLE;
-    gpio_conf.mode          = GPIO_MODE_INPUT;
-    gpio_conf.pin_bit_mask  = 0x1ULL << GPIO_NUM_4;
-    gpio_conf.pull_down_en  = GPIO_PULLDOWN_DISABLE;
-    gpio_conf.pull_up_en    = GPIO_PULLUP_ENABLE;
-    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&gpio_conf));
-    do {
-        vTaskDelay(pdMS_TO_TICKS(50)); 
-    } while (!gpio_get_level(GPIO_NUM_4));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_reset_pin(GPIO_NUM_4));
-    Custom_ButtonInit();
-    xTaskCreate(key1_button_user_Task, "key1_button_user_Task", 4 * 1024, NULL, 3, NULL);
-    xTaskCreate(boot_button_user_Task, "boot_button_user_Task", 4 * 1024, NULL, 3, NULL);
+    // The official GPIO4/BOOT handlers directly change legacy modes and
+    // refresh the panel. The product firmware has no mapped sleep button yet,
+    // so do not start those legacy tasks or a KEY press would trigger old actions.
     xTaskCreate(Green_led_user_Task, "Green_led_user_Task", 3 * 1024, &Green_led_arg, 2, NULL);
     xTaskCreate(Red_led_user_Task, "Red_led_user_Task", 3 * 1024, &Red_led_arg, 2, NULL);
     return 1;
