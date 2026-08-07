@@ -149,16 +149,15 @@ void Custom_PmicRegisterInit(void) {
         ESP_LOGW("axp2101_init_log","Set ALDO4 to output 3V3");
     }
 
-    // The connected 454261 is a single-cell 3.7 V Li-ion pack with a 4.2 V
-    // charge limit. Keep a conservative 200 mA CC profile and let the PMIC
-    // terminate the CV phase at 25 mA. This is a hardware-enforced charge
-    // cycle and does not depend on the App or its displayed percentage.
+    // Temporary safety cap: the real pack reached 4.20 V while the PMIC still
+    // reported constant-current charging. Hold at 4.10 V until termination
+    // behavior is verified with hardware measurements.
     axp2101.enableCellbatteryCharge();
     axp2101.setPrechargeCurr(XPOWERS_AXP2101_PRECHARGE_100MA);
     if (!axp2101.setChargerConstantCurr(XPOWERS_AXP2101_CHG_CUR_200MA)) {
         ESP_LOGE(TAG, "Failed to set main battery charge current");
     }
-    if (!axp2101.setChargeTargetVoltage(XPOWERS_AXP2101_CHG_VOL_4V2)) {
+    if (!axp2101.setChargeTargetVoltage(XPOWERS_AXP2101_CHG_VOL_4V1)) {
         ESP_LOGE(TAG, "Failed to set main battery charge target voltage");
     }
     axp2101.setChargerTerminationCurr(XPOWERS_AXP2101_CHG_ITERM_25MA);
