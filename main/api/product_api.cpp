@@ -483,7 +483,7 @@ esp_err_t PowerStatus(httpd_req_t* req) {
     body.append(",\"termination_enabled\":").append(power.main_charge_termination_enabled ? "true" : "false");
     body.append("},\"rtc_backup\":{\"charge_enabled\":")
         .append(power.rtc_backup_charge_enabled ? "true" : "false")
-        .append("},\"policy\":{\"main_battery_charge_policy\":\"fixed_safe_profile\",\"deep_sleep_enabled\":false}}}");
+        .append("},\"policy\":{\"main_battery_charge_policy\":\"fixed_safe_profile\",\"deep_sleep_enabled\":true}}}");
     return SendJson(req, body.c_str());
 }
 

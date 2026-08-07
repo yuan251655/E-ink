@@ -21,6 +21,7 @@
 #include "ai_album_playback_runtime.h"
 #include "display_runtime.h"
 #include "indicator_service.h"
+#include "button_sleep_service.h"
 #include "power_service.h"
 #include "device_log_service.h"
 #include "mode_manager.h"
@@ -124,6 +125,10 @@ extern "C" void app_main(void) {
     ret = photopainter::product::InitializePowerService();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Power service unavailable; continuing without PMIC telemetry: %s", esp_err_to_name(ret));
+    }
+    ret = photopainter::product::InitializeButtonSleepService();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "BOOT sleep service unavailable: %s", esp_err_to_name(ret));
     }
     bool product_display_ready = false;
     bool product_media_ready = false;
