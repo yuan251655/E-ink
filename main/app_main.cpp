@@ -194,4 +194,5 @@ extern "C" void app_main(void) {
     }
     ServerPort_StartProductLocalApi(SDPort);
     photopainter::product::InitializeXiaozhiRuntime();
+    photopainter::product::ResumeRtcWakeVerification();
 }

@@ -27,6 +27,7 @@
 #include "mode_manager.h"
 #include "product_network.h"
 #include "power_service.h"
+#include "button_sleep_service.h"
 #include "rtc_service.h"
 #include "storage_runtime.h"
 #include "storage_service.h"
@@ -501,6 +502,7 @@ esp_err_t IndicatorSelfTest(httpd_req_t* req) {
 
 esp_err_t TimeStatus(httpd_req_t* req) {
     const auto rtc = GetRtcService().GetSnapshot();
+    const auto wake_test = GetRtcWakeVerificationSnapshot();
     std::string body = "{\"ok\":true,\"code\":\"ok\",\"data\":{\"present\":";
     body.append(rtc.present ? "true" : "false").append(",\"valid\":");
     body.append(rtc.valid ? "true" : "false").append(",\"year\":");
@@ -508,8 +510,25 @@ esp_err_t TimeStatus(httpd_req_t* req) {
     body.append(",\"day\":"); AppendUInt64(&body, rtc.day); body.append(",\"weekday\":"); AppendUInt64(&body, rtc.weekday);
     body.append(",\"hour\":"); AppendUInt64(&body, rtc.hour); body.append(",\"minute\":"); AppendUInt64(&body, rtc.minute);
     body.append(",\"second\":"); AppendUInt64(&body, rtc.second);
-    body.append(",\"rtc_int_level\":").append(std::to_string(GetRtcService().ReadInterruptLevel())).append("}}");
+    body.append(",\"rtc_int_level\":").append(std::to_string(GetRtcService().ReadInterruptLevel()));
+    body.append(",\"wake_test\":{\"active\":").append(wake_test.active ? "true" : "false")
+        .append(",\"completed\":").append(std::to_string(wake_test.completed))
+        .append(",\"remaining\":").append(std::to_string(wake_test.remaining)).append("}}}");
     return SendJson(req, body.c_str());
+}
+
+esp_err_t StartRtcWakeVerificationHandler(httpd_req_t* req) {
+    if (req == nullptr || req->content_len > 2) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    }
+    const esp_err_t result = StartRtcWakeVerification();
+    if (result == ESP_ERR_INVALID_STATE) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"rtc_wake_test_busy\"}", "409 Conflict");
+    }
+    if (result != ESP_OK) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"rtc_wake_test_failed\"}", "503 Service Unavailable");
+    }
+    return SendJson(req, "{\"ok\":true,\"code\":\"rtc_wake_test_started\",\"data\":{\"cycles\":10,\"sleep_seconds\":10,\"key_cancels\":true}}");
 }
 
 esp_err_t StartRtcInterruptDiagnostic(httpd_req_t* req) {
@@ -1349,6 +1368,7 @@ esp_err_t RegisterProductApi(httpd_handle_t server) {
         {.uri="/api/v1/time/status", .method=HTTP_GET, .handler=TimeStatus, .user_ctx=nullptr},
         {.uri="/api/v1/time", .method=HTTP_POST, .handler=SetTime, .user_ctx=nullptr},
         {.uri="/api/v1/time/int-test", .method=HTTP_POST, .handler=StartRtcInterruptDiagnostic, .user_ctx=nullptr},
+        {.uri="/api/v1/time/wake-test", .method=HTTP_POST, .handler=StartRtcWakeVerificationHandler, .user_ctx=nullptr},
         {.uri="/api/v1/device/capabilities", .method=HTTP_GET, .handler=Capabilities, .user_ctx=nullptr},
         {.uri="/api/v1/device/status", .method=HTTP_GET, .handler=Status, .user_ctx=nullptr},
         {.uri="/api/v1/mode", .method=HTTP_GET, .handler=GetMode, .user_ctx=nullptr},

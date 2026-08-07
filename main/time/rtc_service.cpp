@@ -4,6 +4,7 @@
 
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
+#include "driver/rtc_io.h"
 #include "esp_log.h"
 #include "user_app.h"
 
@@ -43,6 +44,8 @@ std::uint8_t BinaryToBcd(std::uint8_t value) {
 RtcService g_rtc_service;
 
 esp_err_t RtcService::Initialize() {
+    (void)rtc_gpio_hold_dis(kInterruptPin);
+    (void)rtc_gpio_deinit(kInterruptPin);
     if (g_rtc_device == nullptr) {
         const i2c_device_config_t config = {
             .dev_addr_length = I2C_ADDR_BIT_LEN_7,
