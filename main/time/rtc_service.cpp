@@ -10,6 +10,11 @@
 
 namespace photopainter::product {
 namespace {
+
+// PCF85063 stores the wall-clock fields supplied by the App (China Standard
+// Time). Convert that local calendar to UTC before exposing Unix timestamps.
+// This keeps App formatting and RTC scheduling on the same absolute timeline.
+constexpr std::int64_t kLocalTimezoneOffsetSeconds = 8 * 60 * 60;
 constexpr const char* kTag = "rtc_service";
 constexpr std::uint8_t kAddress = 0x51;
 constexpr std::uint8_t kControl2Register = 0x01;
@@ -26,6 +31,16 @@ std::uint8_t BcdToBinary(std::uint8_t value) {
 
 bool InRange(std::uint8_t value, std::uint8_t min, std::uint8_t max) {
     return value >= min && value <= max;
+}
+
+bool IsLeapYear(std::uint16_t year) {
+    return (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+}
+
+std::uint8_t DaysInMonth(std::uint16_t year, std::uint8_t month) {
+    constexpr std::uint8_t kDays[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (month == 2 && IsLeapYear(year)) return 29;
+    return month >= 1 && month <= 12 ? kDays[month - 1] : 0;
 }
 
 esp_err_t ClearPendingInterrupts() {
@@ -92,6 +107,45 @@ esp_err_t RtcService::ArmInterruptDiagnostic(std::uint8_t seconds) {
     if (result != ESP_OK) return result;
     const std::uint8_t arm[] = {kTimerValueRegister, seconds, 0x16};
     return i2c_master_transmit(g_rtc_device, arm, sizeof(arm), 500);
+}
+
+esp_err_t RtcService::ArmWakeAfterSeconds(std::uint32_t seconds) {
+    if (g_rtc_device == nullptr || seconds == 0) return ESP_ERR_INVALID_ARG;
+    std::uint8_t value = 0;
+    std::uint8_t mode = 0;
+    if (seconds <= 255) {
+        value = static_cast<std::uint8_t>(seconds);
+        mode = 0x16;  // 1 Hz, timer enabled, timer interrupt enabled.
+    } else if (seconds % 60 == 0 && seconds / 60 <= 255) {
+        value = static_cast<std::uint8_t>(seconds / 60);
+        mode = 0x1e;  // 1/60 Hz, timer enabled, timer interrupt enabled.
+    } else {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    const esp_err_t clear = ClearPendingInterrupts();
+    if (clear != ESP_OK) return clear;
+    const std::uint8_t arm[] = {kTimerValueRegister, value, mode};
+    return i2c_master_transmit(g_rtc_device, arm, sizeof(arm), 500);
+}
+
+esp_err_t RtcService::DisarmWakeTimer() {
+    if (g_rtc_device == nullptr) return ESP_ERR_INVALID_STATE;
+    return ClearPendingInterrupts();
+}
+
+bool RtcService::GetUnixTimeSeconds(std::uint64_t* output) const {
+    if (output == nullptr) return false;
+    const RtcSnapshot value = GetSnapshot();
+    if (!value.valid || value.year < 1970 || value.day > DaysInMonth(value.year, value.month)) return false;
+    std::uint64_t days = 0;
+    for (std::uint16_t year = 1970; year < value.year; ++year) days += IsLeapYear(year) ? 366 : 365;
+    for (std::uint8_t month = 1; month < value.month; ++month) days += DaysInMonth(value.year, month);
+    days += value.day - 1;
+    const std::int64_t local_seconds = static_cast<std::int64_t>(days * 86400ULL) +
+        value.hour * 3600LL + value.minute * 60LL + value.second;
+    if (local_seconds < kLocalTimezoneOffsetSeconds) return false;
+    *output = static_cast<std::uint64_t>(local_seconds - kLocalTimezoneOffsetSeconds);
+    return true;
 }
 
 int RtcService::ReadInterruptLevel() const { return gpio_get_level(kInterruptPin); }

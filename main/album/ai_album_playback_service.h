@@ -33,6 +33,7 @@ private:
     void RebuildRandomQueueLocked();
     void ObserveExternalDisplayLocked();
     void HandlePendingCompletionLocked();
+    void ScheduleNextLocked(std::uint32_t delay_seconds);
     PlaybackSnapshot SnapshotLocked() const;
     esp_err_t PersistLocked();
     void LoadPersistedLocked();

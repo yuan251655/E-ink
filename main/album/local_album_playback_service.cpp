@@ -11,6 +11,7 @@
 #include "job_service.h"
 #include "media_library.h"
 #include "mode_manager.h"
+#include "rtc_service.h"
 
 namespace photopainter::product {
 namespace {
@@ -21,6 +22,7 @@ constexpr char kIntervalKey[] = "interval";
 constexpr char kOrderKey[] = "order";
 constexpr char kCurrentKey[] = "current";
 constexpr char kRevisionKey[] = "revision";
+constexpr char kNextEpochKey[] = "next_epoch";
 constexpr std::uint32_t kRetrySeconds = 15;
 
 }  // namespace
@@ -58,8 +60,18 @@ esp_err_t LocalAlbumPlaybackService::Initialize(MediaLibrary* library, DisplaySe
     // esp_timer is monotonic only for this boot.  In always-on mode a reboot
     // starts a fresh interval from boot rather than pretending a wall-clock
     // deadline survived without RTC/NTP participation.
-    snapshot_.next_play_at_ms = snapshot_.config.mode == PlaybackMode::kAuto
-        ? NowMs() + static_cast<EpochMs>(snapshot_.config.interval_seconds) * 1000 : 0;
+    if (snapshot_.config.mode == PlaybackMode::kAuto) {
+        std::uint64_t now = 0;
+        if (GetRtcService().GetUnixTimeSeconds(&now) && snapshot_.next_play_at_epoch_seconds != 0) {
+            snapshot_.next_play_at_ms = snapshot_.next_play_at_epoch_seconds > now
+                ? NowMs() + (snapshot_.next_play_at_epoch_seconds - now) * 1000ULL : NowMs();
+        } else ScheduleNextLocked(snapshot_.config.interval_seconds);
+    }
+    // The active album's deadline above is already restored from RTC/NVS.
+    // Do not let its first worker tick replace it with a fresh full interval.
+    const ModeSnapshot mode = GetModeManager().GetSnapshot();
+    local_mode_was_active_ = mode.active_feature == Feature::kLocalAlbum &&
+                             mode.state == ModeSnapshot::State::kIdle;
     snapshot_.state_revision = 1;
     const BaseType_t created = xTaskCreate(WorkerEntry, "album_playback", 4096, this, 3, &worker_);
     xSemaphoreGive(mutex_);
@@ -109,8 +121,8 @@ esp_err_t LocalAlbumPlaybackService::UpdateConfig(PlaybackMode mode, std::uint32
     ++snapshot_.config.revision;
     ++snapshot_.state_revision;
     random_queue_.clear();
-    snapshot_.next_play_at_ms = mode == PlaybackMode::kAuto
-        ? NowMs() + static_cast<EpochMs>(interval_seconds) * 1000 : 0;
+    if (mode == PlaybackMode::kAuto) ScheduleNextLocked(interval_seconds);
+    else { snapshot_.next_play_at_ms = 0; snapshot_.next_play_at_epoch_seconds = 0; }
     const esp_err_t persisted = PersistLocked();
     if (persisted != ESP_OK) {
         snapshot_ = previous;
@@ -131,9 +143,18 @@ void LocalAlbumPlaybackService::NotifyManualDisplaySuccess(const MediaId& media_
     snapshot_.config.current_media_id = media_id;
     ++snapshot_.state_revision;
     random_queue_.clear();
-    snapshot_.next_play_at_ms = snapshot_.config.mode == PlaybackMode::kAuto
-        ? NowMs() + static_cast<EpochMs>(snapshot_.config.interval_seconds) * 1000 : 0;
+    if (snapshot_.config.mode == PlaybackMode::kAuto) ScheduleNextLocked(snapshot_.config.interval_seconds);
     if (PersistLocked() != ESP_OK) snapshot_.last_error_code = "playback_persist_failed";
+    xSemaphoreGive(mutex_);
+}
+
+void LocalAlbumPlaybackService::TriggerScheduledWake() {
+    if (mutex_ == nullptr) return;
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    if (snapshot_.config.mode == PlaybackMode::kAuto) {
+        snapshot_.next_play_at_ms = NowMs();
+        ++snapshot_.state_revision;
+    }
     xSemaphoreGive(mutex_);
 }
 
@@ -185,8 +206,7 @@ void LocalAlbumPlaybackService::Tick() {
         // replace it merely because the old countdown expired while another
         // feature was active.
         local_mode_was_active_ = true;
-        snapshot_.next_play_at_ms = snapshot_.config.mode == PlaybackMode::kAuto
-            ? NowMs() + static_cast<EpochMs>(snapshot_.config.interval_seconds) * 1000 : 0;
+        if (snapshot_.config.mode == PlaybackMode::kAuto) ScheduleNextLocked(snapshot_.config.interval_seconds);
         ++snapshot_.state_revision;
     }
     if (snapshot_.refresh_pending || snapshot_.config.mode != PlaybackMode::kAuto || NowMs() < snapshot_.next_play_at_ms) {
@@ -197,7 +217,7 @@ void LocalAlbumPlaybackService::Tick() {
     MediaId target;
     if (!SelectNextLocked(&target)) {
         snapshot_.last_error_code = "media_not_found";
-        snapshot_.next_play_at_ms = NowMs() + static_cast<EpochMs>(kRetrySeconds) * 1000;
+        ScheduleNextLocked(kRetrySeconds);
         ++snapshot_.state_revision;
         xSemaphoreGive(mutex_);
         return;
@@ -212,7 +232,7 @@ void LocalAlbumPlaybackService::Tick() {
             (void)jobs_->Update(job.job_id, JobState::kFailed, "rejected", 0, "display_busy");
         }
         snapshot_.last_error_code = "display_busy";
-        snapshot_.next_play_at_ms = NowMs() + static_cast<EpochMs>(kRetrySeconds) * 1000;
+        ScheduleNextLocked(kRetrySeconds);
         ++snapshot_.state_revision;
         xSemaphoreGive(mutex_);
         return;
@@ -239,8 +259,7 @@ void LocalAlbumPlaybackService::ObserveExternalDisplayLocked() {
     snapshot_.config.current_media_id = display.current_media_id;
     ++snapshot_.state_revision;
     random_queue_.clear();
-    snapshot_.next_play_at_ms = snapshot_.config.mode == PlaybackMode::kAuto
-        ? NowMs() + static_cast<EpochMs>(snapshot_.config.interval_seconds) * 1000 : 0;
+    if (snapshot_.config.mode == PlaybackMode::kAuto) ScheduleNextLocked(snapshot_.config.interval_seconds);
     if (PersistLocked() != ESP_OK) snapshot_.last_error_code = "playback_persist_failed";
 }
 
@@ -308,12 +327,12 @@ void LocalAlbumPlaybackService::HandlePendingCompletionLocked() {
             random_queue_.erase(random_queue_.begin());
         }
         snapshot_.last_error_code.clear();
-        snapshot_.next_play_at_ms = NowMs() + static_cast<EpochMs>(snapshot_.config.interval_seconds) * 1000;
+        ScheduleNextLocked(snapshot_.config.interval_seconds);
         if (PersistLocked() != ESP_OK) snapshot_.last_error_code = "playback_persist_failed";
     } else {
         ++snapshot_.state_revision;
         snapshot_.last_error_code = job.error_code.empty() ? "display_failed" : job.error_code;
-        snapshot_.next_play_at_ms = NowMs() + static_cast<EpochMs>(kRetrySeconds) * 1000;
+        ScheduleNextLocked(kRetrySeconds);
     }
     snapshot_.pending_media_id.clear();
 }
@@ -329,6 +348,7 @@ void LocalAlbumPlaybackService::LoadPersistedLocked() {
     (void)nvs_get_u8(handle, kOrderKey, &order);
     (void)nvs_get_u32(handle, kIntervalKey, &interval);
     (void)nvs_get_u32(handle, kRevisionKey, &revision);
+    (void)nvs_get_u64(handle, kNextEpochKey, &snapshot_.next_play_at_epoch_seconds);
     size_t current_size = 0;
     if (nvs_get_str(handle, kCurrentKey, nullptr, &current_size) == ESP_OK && current_size > 0 && current_size <= 65) {
         std::vector<char> current(current_size);
@@ -349,6 +369,7 @@ esp_err_t LocalAlbumPlaybackService::PersistLocked() {
     if (result == ESP_OK) result = nvs_set_u8(handle, kOrderKey, static_cast<std::uint8_t>(snapshot_.config.order));
     if (result == ESP_OK) result = nvs_set_u32(handle, kIntervalKey, snapshot_.config.interval_seconds);
     if (result == ESP_OK) result = nvs_set_u32(handle, kRevisionKey, static_cast<std::uint32_t>(snapshot_.config.revision));
+    if (result == ESP_OK) result = nvs_set_u64(handle, kNextEpochKey, snapshot_.next_play_at_epoch_seconds);
     if (result == ESP_OK) result = nvs_set_str(handle, kCurrentKey, snapshot_.config.current_media_id.c_str());
     if (result == ESP_OK) result = nvs_commit(handle);
     nvs_close(handle);
@@ -357,6 +378,12 @@ esp_err_t LocalAlbumPlaybackService::PersistLocked() {
 
 EpochMs LocalAlbumPlaybackService::NowMs() {
     return static_cast<EpochMs>(esp_timer_get_time() / 1000);
+}
+
+void LocalAlbumPlaybackService::ScheduleNextLocked(std::uint32_t delay_seconds) {
+    snapshot_.next_play_at_ms = NowMs() + static_cast<EpochMs>(delay_seconds) * 1000ULL;
+    std::uint64_t now = 0;
+    snapshot_.next_play_at_epoch_seconds = GetRtcService().GetUnixTimeSeconds(&now) ? now + delay_seconds : 0;
 }
 
 }  // namespace photopainter::product

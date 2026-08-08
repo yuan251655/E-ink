@@ -43,6 +43,7 @@ struct LocalAlbumPlaybackSnapshot {
     // this remaining duration together with their own system clock.
     bool has_next_play = false;
     std::uint32_t next_play_in_seconds = 0;
+    std::uint64_t next_play_at_epoch_seconds = 0;
     bool refresh_pending = false;
     MediaId pending_media_id;
     std::string last_error_code;
@@ -70,6 +71,9 @@ public:
     // Call after a successful user initiated display.  This never changes a
     // paused configuration into automatic playback.
     void NotifyManualDisplaySuccess(const MediaId& media_id);
+    // Called once after an RTC-planned deep-sleep wake. It intentionally does
+    // not run for KEY wakes, so the wake key never doubles as a next action.
+    void TriggerScheduledWake();
     // Keep a persisted cursor and a shuffled queue from retaining IDs whose
     // media transaction was already removed.
     void NotifyMediaDeleted(const MediaId& media_id);
@@ -84,6 +88,7 @@ private:
     void RebuildRandomQueueLocked();
     void ObserveExternalDisplayLocked();
     void HandlePendingCompletionLocked();
+    void ScheduleNextLocked(std::uint32_t delay_seconds);
     PlaybackSnapshot SnapshotLocked() const;
     esp_err_t PersistLocked();
     void LoadPersistedLocked();

@@ -189,8 +189,13 @@ extern "C" void app_main(void) {
     if (product_display_ready) {
         ret = photopainter::product::InitializeLocalAlbumPlaybackService();
         if (ret != ESP_OK) ESP_LOGW(TAG, "Local album playback unavailable; continuing without auto playback");
+        if (photopainter::product::ConsumeScheduledLocalPlaybackWake()) {
+            photopainter::product::GetLocalAlbumPlaybackService().TriggerScheduledWake();
+        }
         ret = photopainter::product::InitializeAiAlbumPlaybackService();
         if (ret != ESP_OK) ESP_LOGW(TAG, "AI album playback unavailable; continuing without auto playback");
+        ret = photopainter::product::InitializeAutomaticSleepService();
+        if (ret != ESP_OK) ESP_LOGW(TAG, "Automatic sleep policy unavailable: %s", esp_err_to_name(ret));
     }
     ServerPort_StartProductLocalApi(SDPort);
     photopainter::product::InitializeXiaozhiRuntime();

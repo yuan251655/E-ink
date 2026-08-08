@@ -35,6 +35,12 @@
 namespace photopainter::product {
 namespace {
 esp_err_t SendJson(httpd_req_t* req, const char* body, const char* status = nullptr) {
+    char activity_header[4]{};
+    if (req != nullptr && req->method == HTTP_POST &&
+        httpd_req_get_hdr_value_str(req, "X-Eink-User-Activity", activity_header, sizeof(activity_header)) == ESP_OK &&
+        std::strcmp(activity_header, "1") == 0) {
+        RecordAutomaticSleepActivity();
+    }
     httpd_resp_set_type(req, "application/json");
     // Every product API call is deliberately one request per connection.  It
     // prevents a completed TF upload from retaining an HTTP socket and starving
@@ -215,6 +221,10 @@ void AppendPlaybackSnapshotJson(std::string* output, const PlaybackSnapshot& sna
     output->append(",\"next_play_in_seconds\":");
     if (snapshot.has_next_play) output->append(std::to_string(snapshot.next_play_in_seconds));
     else output->append("null");
+    output->append(",\"next_play_at_epoch_ms\":");
+    if (snapshot.next_play_at_epoch_seconds != 0) {
+        output->append(std::to_string(snapshot.next_play_at_epoch_seconds * 1000ULL));
+    } else output->append("null");
     output->append(",\"refresh_pending\":").append(snapshot.refresh_pending ? "true" : "false")
         .append(",\"pending_media_id\":");
     AppendJsonString(output, snapshot.pending_media_id);
@@ -490,6 +500,56 @@ esp_err_t PowerStatus(httpd_req_t* req) {
         .append(power.rtc_backup_charge_safe ? "true" : "false")
         .append("},\"policy\":{\"main_battery_charge_policy\":\"fixed_safe_profile\",\"deep_sleep_enabled\":true}}}");
     return SendJson(req, body.c_str());
+}
+
+void AppendAutomaticSleepConfigJson(std::string* body) {
+    const auto config = GetAutomaticSleepConfig();
+    body->append("{\"enabled\":").append(config.enabled ? "true" : "false")
+        .append(",\"idle_timeout_minutes\":").append(std::to_string(config.idle_timeout_minutes))
+        .append(",\"wake_for_playback\":").append(config.wake_for_playback ? "true" : "false")
+        .append("}");
+}
+
+esp_err_t GetAutomaticSleepConfigHandler(httpd_req_t* req) {
+    std::string body = "{\"ok\":true,\"code\":\"ok\",\"data\":";
+    AppendAutomaticSleepConfigJson(&body);
+    body.append("}");
+    return SendJson(req, body.c_str());
+}
+
+esp_err_t GetAutomaticSleepStatusHandler(httpd_req_t* req) {
+    const auto status = GetAutomaticSleepStatus();
+    std::string body = "{\"ok\":true,\"code\":\"ok\",\"data\":{\"enabled\":";
+    body.append(status.enabled ? "true" : "false").append(",\"rtc_valid\":")
+        .append(status.rtc_valid ? "true" : "false").append(",\"busy\":")
+        .append(status.busy ? "true" : "false").append(",\"state\":");
+    AppendJsonString(&body, status.state);
+    body.append(",\"last_activity_at_epoch_ms\":").append(std::to_string(status.last_activity_epoch_seconds * 1000ULL));
+    body.append(",\"idle_sleep_at_epoch_ms\":").append(std::to_string(status.idle_sleep_at_epoch_seconds * 1000ULL));
+    body.append(",\"next_play_at_epoch_ms\":").append(std::to_string(status.next_play_at_epoch_seconds * 1000ULL));
+    body.append("}}");
+    return SendJson(req, body.c_str());
+}
+
+esp_err_t UpdateAutomaticSleepConfigHandler(httpd_req_t* req) {
+    JsonDocument input;
+    if (!ReadBoundedJson(req, &input, 128) || input["enabled"].isNull() ||
+        input["idle_timeout_minutes"].isNull() || input["wake_for_playback"].isNull()) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    }
+    const AutomaticSleepConfig config{
+        .enabled = input["enabled"].as<bool>(),
+        .idle_timeout_minutes = static_cast<std::uint8_t>(input["idle_timeout_minutes"] | 0),
+        .wake_for_playback = input["wake_for_playback"].as<bool>(),
+    };
+    const esp_err_t result = UpdateAutomaticSleepConfig(config);
+    if (result == ESP_ERR_INVALID_ARG) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"invalid_sleep_config\"}", "400 Bad Request");
+    }
+    if (result != ESP_OK) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"sleep_config_save_failed\"}", "503 Service Unavailable");
+    }
+    return GetAutomaticSleepConfigHandler(req);
 }
 
 esp_err_t IndicatorSelfTest(httpd_req_t* req) {
@@ -1364,6 +1424,9 @@ esp_err_t RegisterProductApi(httpd_handle_t server) {
         {.uri="/index.html", .method=HTTP_GET, .handler=ProvisionPage, .user_ctx=nullptr},
         {.uri="/api/v1/health", .method=HTTP_GET, .handler=Health, .user_ctx=nullptr},
         {.uri="/api/v1/power/status", .method=HTTP_GET, .handler=PowerStatus, .user_ctx=nullptr},
+        {.uri="/api/v1/power/sleep-config", .method=HTTP_GET, .handler=GetAutomaticSleepConfigHandler, .user_ctx=nullptr},
+        {.uri="/api/v1/power/sleep-config", .method=HTTP_POST, .handler=UpdateAutomaticSleepConfigHandler, .user_ctx=nullptr},
+        {.uri="/api/v1/power/sleep-status", .method=HTTP_GET, .handler=GetAutomaticSleepStatusHandler, .user_ctx=nullptr},
         {.uri="/api/v1/device/led-test", .method=HTTP_POST, .handler=IndicatorSelfTest, .user_ctx=nullptr},
         {.uri="/api/v1/time/status", .method=HTTP_GET, .handler=TimeStatus, .user_ctx=nullptr},
         {.uri="/api/v1/time", .method=HTTP_POST, .handler=SetTime, .user_ctx=nullptr},
