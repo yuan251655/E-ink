@@ -472,6 +472,7 @@ esp_err_t Health(httpd_req_t* req) {
 
 esp_err_t PowerStatus(httpd_req_t* req) {
     const PowerSnapshot power = GetPowerService().GetSnapshot();
+    const BatteryDisplayConfig battery_display = GetPowerService().GetBatteryDisplayConfig();
     std::string body = "{\"ok\":true,\"code\":\"ok\",\"data\":{\"stage\":\"observation_only\",\"pmic_online\":";
     body.append(power.pmic_online ? "true" : "false");
     body.append(",\"usb\":{\"present\":").append(power.usb_present ? "true" : "false")
@@ -495,11 +496,38 @@ esp_err_t PowerStatus(httpd_req_t* req) {
     if (power.main_charge_termination_current_ma >= 0) body.append(std::to_string(power.main_charge_termination_current_ma));
     else body.append("null");
     body.append(",\"termination_enabled\":").append(power.main_charge_termination_enabled ? "true" : "false");
+    body.append("},\"battery_display\":{\"enabled\":")
+        .append(battery_display.enabled ? "true" : "false")
+        .append(",\"revision\":").append(std::to_string(battery_display.revision))
+        .append(",\"currently_visible\":").append(battery_display.visible ? "true" : "false")
+        .append(",\"mode\":\"low_battery_hysteresis\",\"show_threshold\":30,\"hide_threshold\":35")
+        .append(",\"position\":\"top_left\",\"style\":\"icon_only\"");
     body.append("},\"rtc_backup\":{\"charge_enabled\":")
         .append(power.rtc_backup_charge_enabled ? "true" : "false")
         .append(",\"safe_to_install\":")
         .append(power.rtc_backup_charge_safe ? "true" : "false")
         .append("},\"policy\":{\"main_battery_charge_policy\":\"fixed_safe_profile\",\"deep_sleep_enabled\":true}}}");
+    return SendJson(req, body.c_str());
+}
+
+esp_err_t UpdateBatteryDisplayHandler(httpd_req_t* req) {
+    JsonDocument input;
+    if (!ReadBoundedJson(req, &input, 96) || input["enabled"].isNull() ||
+        input["expected_revision"].isNull()) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    }
+    BatteryDisplayConfig updated;
+    const esp_err_t result = GetPowerService().UpdateBatteryDisplayConfig(
+        input["enabled"].as<bool>(), input["expected_revision"] | 0ULL, &updated);
+    if (result == ESP_ERR_INVALID_STATE) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"revision_conflict\"}", "409 Conflict");
+    }
+    if (result != ESP_OK) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"battery_display_save_failed\"}", "503 Service Unavailable");
+    }
+    std::string body = "{\"ok\":true,\"code\":\"ok\",\"data\":{\"enabled\":";
+    body.append(updated.enabled ? "true" : "false")
+        .append(",\"revision\":").append(std::to_string(updated.revision)).append("}}");
     return SendJson(req, body.c_str());
 }
 
@@ -1479,6 +1507,7 @@ esp_err_t RegisterProductApi(httpd_handle_t server) {
         {.uri="/index.html", .method=HTTP_GET, .handler=ProvisionPage, .user_ctx=nullptr},
         {.uri="/api/v1/health", .method=HTTP_GET, .handler=Health, .user_ctx=nullptr},
         {.uri="/api/v1/power/status", .method=HTTP_GET, .handler=PowerStatus, .user_ctx=nullptr},
+        {.uri="/api/v1/power/battery-display", .method=HTTP_POST, .handler=UpdateBatteryDisplayHandler, .user_ctx=nullptr},
         {.uri="/api/v1/power/sleep-config", .method=HTTP_GET, .handler=GetAutomaticSleepConfigHandler, .user_ctx=nullptr},
         {.uri="/api/v1/power/sleep-config", .method=HTTP_POST, .handler=UpdateAutomaticSleepConfigHandler, .user_ctx=nullptr},
         {.uri="/api/v1/power/sleep-status", .method=HTTP_GET, .handler=GetAutomaticSleepStatusHandler, .user_ctx=nullptr},

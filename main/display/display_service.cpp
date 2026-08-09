@@ -7,9 +7,48 @@
 #include "media_library.h"
 #include "mode_cover_assets.h"
 #include "mode_manager.h"
+#include "power_service.h"
 #include "storage_service.h"
 
 namespace photopainter::product {
+namespace {
+constexpr int kBatteryX = 16;
+constexpr int kBatteryY = 16;
+constexpr int kBatteryBodyWidth = 78;
+constexpr int kBatteryBodyHeight = 36;
+constexpr int kBatteryInnerWidth = 64;
+
+constexpr int BatteryFillWidth(int percent) {
+    return percent <= 0 ? 0 : percent >= 100 ? kBatteryInnerWidth
+                                             : kBatteryInnerWidth * percent / 100;
+}
+
+static_assert(BatteryFillWidth(0) == 0);
+static_assert(BatteryFillWidth(50) == 32);
+static_assert(BatteryFillWidth(100) == 64);
+static_assert(kBatteryX + kBatteryBodyWidth + 10 <= 800);
+static_assert(kBatteryY + kBatteryBodyHeight <= 480);
+
+void FillRect(ePaperPort* display, int x, int y, int width, int height, std::uint8_t color) {
+    for (int row = y; row < y + height; ++row) {
+        for (int column = x; column < x + width; ++column) {
+            display->EPD_SetPixel(column, row, color);
+        }
+    }
+}
+
+void DrawBatteryIcon(ePaperPort* display, int percent) {
+    // Two overlapping rectangles give the body and terminal softly clipped
+    // corners without adding a bitmap asset or graphics dependency.
+    FillRect(display, kBatteryX + 3, kBatteryY, kBatteryBodyWidth - 6, kBatteryBodyHeight, ColorBlack);
+    FillRect(display, kBatteryX, kBatteryY + 3, kBatteryBodyWidth, kBatteryBodyHeight - 6, ColorBlack);
+    FillRect(display, kBatteryX + 5, kBatteryY + 5, kBatteryBodyWidth - 10, kBatteryBodyHeight - 10, ColorWhite);
+    FillRect(display, kBatteryX + kBatteryBodyWidth, kBatteryY + 10, 10, 16, ColorBlack);
+    const int fill_width = BatteryFillWidth(percent);
+    if (fill_width > 0) FillRect(display, kBatteryX + 7, kBatteryY + 7, fill_width, 22, ColorBlack);
+}
+}  // namespace
+
 esp_err_t DisplayService::Initialize(StorageService* storage, MediaLibrary* library, ePaperPort* display, SemaphoreHandle_t legacy_mutex) {
     if (!storage || !library || !display || !legacy_mutex) return ESP_ERR_INVALID_ARG;
     storage_ = storage; library_ = library; display_ = display; legacy_mutex_ = legacy_mutex;
@@ -114,6 +153,10 @@ void DisplayService::WorkerLoop() {
                                                   display_->EPD_GetIMGBuffer(), kDisplayFrameBytes);
         bool refresh_indicator_active = false;
         if (result == ESP_OK) {
+            const PowerSnapshot power = GetPowerService().GetSnapshot();
+            if (GetPowerService().ShouldShowBatteryIcon(power)) {
+                DrawBatteryIcon(display_, power.battery_percent);
+            }
             xSemaphoreTake(state_mutex_, portMAX_DELAY); snapshot_.state = DisplayState::kRefreshing; xSemaphoreGive(state_mutex_);
             if (jobs_) (void)jobs_->Update(job_id, JobState::kRunning, "refreshing", 60);
             GetIndicatorService().SetRefreshActive(true);

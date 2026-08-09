@@ -1,6 +1,7 @@
 #include "power_service.h"
 
 #include "esp_log.h"
+#include "nvs.h"
 #include "XPowersLib.h"
 #include "device_log_service.h"
 #include "power_bsp.h"
@@ -8,6 +9,40 @@
 namespace photopainter::product {
 namespace {
 constexpr const char* kTag = "power_service";
+constexpr const char* kBatteryDisplayNamespace = "batt_display";
+constexpr const char* kBatteryDisplayEnabledKey = "enabled";
+constexpr const char* kBatteryDisplayVisibleKey = "visible";
+constexpr const char* kBatteryDisplayRevisionKey = "revision";
+constexpr int kBatteryDisplayShowPercent = 30;
+constexpr int kBatteryDisplayHidePercent = 35;
+
+constexpr bool BatteryIconVisibleAt(int percent, bool was_visible) {
+    return percent <= kBatteryDisplayShowPercent ? true
+         : percent >= kBatteryDisplayHidePercent ? false
+         : was_visible;
+}
+
+static_assert(BatteryIconVisibleAt(30, false));
+static_assert(BatteryIconVisibleAt(31, true));
+static_assert(!BatteryIconVisibleAt(34, false));
+static_assert(!BatteryIconVisibleAt(35, true));
+
+BatteryDisplayConfig ReadBatteryDisplayConfig() {
+    BatteryDisplayConfig config;
+    nvs_handle_t handle{};
+    if (nvs_open(kBatteryDisplayNamespace, NVS_READONLY, &handle) != ESP_OK) return config;
+    std::uint8_t enabled = config.enabled ? 1 : 0;
+    std::uint8_t visible = config.visible ? 1 : 0;
+    std::uint64_t revision = 0;
+    (void)nvs_get_u8(handle, kBatteryDisplayEnabledKey, &enabled);
+    (void)nvs_get_u8(handle, kBatteryDisplayVisibleKey, &visible);
+    (void)nvs_get_u64(handle, kBatteryDisplayRevisionKey, &revision);
+    nvs_close(handle);
+    config.enabled = enabled != 0;
+    config.visible = visible != 0;
+    config.revision = revision;
+    return config;
+}
 
 PowerChargerState ToChargerState(std::uint8_t state) {
     switch (state) {
@@ -66,6 +101,49 @@ PowerSnapshot PowerService::GetSnapshot() const {
     snapshot.main_charge_termination_current_ma = pmic.main_charge_termination_current_ma;
     snapshot.main_charge_termination_enabled = pmic.main_charge_termination_enabled;
     return snapshot;
+}
+
+BatteryDisplayConfig PowerService::GetBatteryDisplayConfig() const {
+    std::lock_guard<std::mutex> lock(battery_display_mutex_);
+    return ReadBatteryDisplayConfig();
+}
+
+bool PowerService::ShouldShowBatteryIcon(const PowerSnapshot& power) {
+    if (!power.battery_present || power.battery_percent < 0) return false;
+    std::lock_guard<std::mutex> lock(battery_display_mutex_);
+    BatteryDisplayConfig config = ReadBatteryDisplayConfig();
+    const bool visible = BatteryIconVisibleAt(power.battery_percent, config.visible);
+    if (visible != config.visible) {
+        nvs_handle_t handle{};
+        if (nvs_open(kBatteryDisplayNamespace, NVS_READWRITE, &handle) == ESP_OK) {
+            if (nvs_set_u8(handle, kBatteryDisplayVisibleKey, visible ? 1 : 0) == ESP_OK) {
+                (void)nvs_commit(handle);
+            }
+            nvs_close(handle);
+        }
+    }
+    return config.enabled && visible;
+}
+
+esp_err_t PowerService::UpdateBatteryDisplayConfig(bool enabled, Revision expected_revision,
+                                                    BatteryDisplayConfig* updated) {
+    if (!updated) return ESP_ERR_INVALID_ARG;
+    std::lock_guard<std::mutex> lock(battery_display_mutex_);
+    const BatteryDisplayConfig current = ReadBatteryDisplayConfig();
+    if (current.revision != expected_revision) return ESP_ERR_INVALID_STATE;
+
+    nvs_handle_t handle{};
+    esp_err_t result = nvs_open(kBatteryDisplayNamespace, NVS_READWRITE, &handle);
+    if (result == ESP_OK) result = nvs_set_u8(handle, kBatteryDisplayEnabledKey, enabled ? 1 : 0);
+    if (result == ESP_OK) result = nvs_set_u64(handle, kBatteryDisplayRevisionKey, current.revision + 1);
+    if (result == ESP_OK) result = nvs_commit(handle);
+    if (handle) nvs_close(handle);
+    if (result != ESP_OK) return result;
+
+    updated->enabled = enabled;
+    updated->visible = current.visible;
+    updated->revision = current.revision + 1;
+    return ESP_OK;
 }
 
 PowerService& GetPowerService() { return g_power_service; }

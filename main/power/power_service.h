@@ -1,8 +1,10 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
 
 #include "esp_err.h"
+#include "product_types.h"
 
 namespace photopainter::product {
 
@@ -38,10 +40,22 @@ struct PowerSnapshot {
     bool main_charge_termination_enabled = false;
 };
 
+struct BatteryDisplayConfig {
+    bool enabled = true;
+    bool visible = false;
+    Revision revision = 0;
+};
+
 class PowerService {
 public:
     esp_err_t Initialize();
     PowerSnapshot GetSnapshot() const;
+    BatteryDisplayConfig GetBatteryDisplayConfig() const;
+    bool ShouldShowBatteryIcon(const PowerSnapshot& power);
+    esp_err_t UpdateBatteryDisplayConfig(bool enabled, Revision expected_revision,
+                                         BatteryDisplayConfig* updated);
+private:
+    mutable std::mutex battery_display_mutex_;
 };
 
 PowerService& GetPowerService();
