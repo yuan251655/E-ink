@@ -10,7 +10,7 @@ struct XiaozhiRuntimeSnapshot {
     std::string state = "network_unconfigured";
     bool started = false;
     bool wake_word_enabled = false;
-    bool active_only = true;
+    bool active_only = false;
     // Controls only cloud TTS packets. Product prompt sounds remain enabled.
     bool tts_playback_enabled = true;
     std::string activation_code;

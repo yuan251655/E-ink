@@ -71,6 +71,8 @@ public:
     // Call after a successful user initiated display.  This never changes a
     // paused configuration into automatic playback.
     void NotifyManualDisplaySuccess(const MediaId& media_id);
+    // Queue one user-requested page turn using this album's configured order.
+    esp_err_t RequestNext();
     // Called once after an RTC-planned deep-sleep wake. It intentionally does
     // not run for KEY wakes, so the wake key never doubles as a next action.
     void TriggerScheduledWake();
@@ -104,6 +106,7 @@ private:
     std::vector<MediaId> random_queue_;
     std::uint32_t request_sequence_ = 1;
     bool local_mode_was_active_ = true;
+    bool manual_next_requested_ = false;
 };
 
 }  // namespace photopainter::product

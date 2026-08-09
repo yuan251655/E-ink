@@ -22,6 +22,7 @@
 #include "ai_album_playback_runtime.h"
 #include "mode_manager.h"
 #include "xiaozhi_runtime.h"
+#include "voice_generation_service.h"
 
 namespace photopainter::product {
 namespace {
@@ -213,6 +214,12 @@ bool IsAutomaticSleepBusy() {
     if (IsDisplayBusy(display.state) || GetStorageService().HasActiveWriteTransaction()) return true;
     const auto mode = GetModeManager().GetSnapshot();
     if (mode.state != ModeSnapshot::State::kIdle) return true;
+    const auto voice_generation = GetVoiceGenerationService().GetSnapshot();
+    if (voice_generation.state != VoiceGenerationState::kIdle &&
+        voice_generation.state != VoiceGenerationState::kSuccess &&
+        voice_generation.state != VoiceGenerationState::kFailed &&
+        voice_generation.state != VoiceGenerationState::kCancelled &&
+        voice_generation.state != VoiceGenerationState::kExpired) return true;
     if (mode.active_feature == Feature::kAiAlbum) {
         const auto ai = GetXiaozhiRuntimeSnapshot();
         if (ai.state == "listening" || ai.state == "speaking" || ai.state == "connecting" || ai.state == "starting") return true;

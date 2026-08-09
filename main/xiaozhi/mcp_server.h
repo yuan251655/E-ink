@@ -323,6 +323,9 @@ public:
     void AddTool(McpTool* tool);
     void AddTool(const std::string& name, const std::string& description, const PropertyList& properties, std::function<ReturnValue(const PropertyList&)> callback);
     void AddUserOnlyTool(const std::string& name, const std::string& description, const PropertyList& properties, std::function<ReturnValue(const PropertyList&)> callback);
+    // Product firmware keeps the cloud model on an explicit action allowlist.
+    // An empty list retains the upstream behaviour for non-product boards.
+    void SetToolAllowlist(const std::vector<std::string>& names);
     void ParseMessage(const cJSON* json);
     void ParseMessage(const std::string& message);
 
@@ -339,6 +342,7 @@ private:
     void DoToolCall(int id, const std::string& tool_name, const cJSON* tool_arguments);
 
     std::vector<McpTool*> tools_;
+    std::vector<std::string> tool_allowlist_;
 };
 
 #endif // MCP_SERVER_H

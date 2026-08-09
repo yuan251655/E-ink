@@ -326,6 +326,10 @@ void McpServer::AddUserOnlyTool(const std::string& name, const std::string& desc
     AddTool(tool);
 }
 
+void McpServer::SetToolAllowlist(const std::vector<std::string>& names) {
+    tool_allowlist_ = names;
+}
+
 void McpServer::ParseMessage(const std::string& message) {
     cJSON* json = cJSON_Parse(message.c_str());
     if (json == nullptr) {
@@ -480,6 +484,11 @@ void McpServer::GetToolsList(int id, const std::string& cursor, bool list_user_o
             ++it;
             continue;
         }
+        if (!tool_allowlist_.empty() &&
+            std::find(tool_allowlist_.begin(), tool_allowlist_.end(), (*it)->name()) == tool_allowlist_.end()) {
+            ++it;
+            continue;
+        }
         
         // 添加tool前检查大小
         std::string tool_json = (*it)->to_json() + ",";
@@ -522,6 +531,12 @@ void McpServer::DoToolCall(int id, const std::string& tool_name, const cJSON* to
     if (tool_iter == tools_.end()) {
         ESP_LOGE(TAG, "tools/call: Unknown tool: %s", tool_name.c_str());
         ReplyError(id, "Unknown tool: " + tool_name);
+        return;
+    }
+    if (!tool_allowlist_.empty() &&
+        std::find(tool_allowlist_.begin(), tool_allowlist_.end(), tool_name) == tool_allowlist_.end()) {
+        ESP_LOGW(TAG, "tools/call: Rejected disallowed tool: %s", tool_name.c_str());
+        ReplyError(id, "Tool is not permitted on this photo frame");
         return;
     }
 

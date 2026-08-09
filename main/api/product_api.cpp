@@ -23,6 +23,7 @@
 #include "media_library.h"
 #include "media_upload_service.h"
 #include "xiaozhi_runtime.h"
+#include "voice_generation_service.h"
 #include "media_library_runtime.h"
 #include "mode_manager.h"
 #include "product_network.h"
@@ -1410,6 +1411,60 @@ esp_err_t XiaozhiConversation(httpd_req_t* req) {
     return SendJson(req, body.c_str());
 }
 
+void AppendVoiceGenerationTask(std::string* body, const VoiceGenerationTask& task) {
+    body->append("{\"id\":");
+    if (task.id.empty()) body->append("null"); else AppendJsonString(body, task.id);
+    body->append(",\"prompt\":");
+    if (task.prompt.empty()) body->append("null"); else AppendJsonString(body, task.prompt);
+    body->append(",\"state\":"); AppendJsonString(body, VoiceGenerationService::StateName(task.state));
+    body->append(",\"error_code\":");
+    if (task.error_code.empty()) body->append("null"); else AppendJsonString(body, task.error_code);
+    body->append("}");
+}
+
+esp_err_t VoiceGenerationTaskStatus(httpd_req_t* req) {
+    std::string body = "{\"ok\":true,\"code\":\"ok\",\"data\":";
+    AppendVoiceGenerationTask(&body, GetVoiceGenerationService().GetSnapshot()); body.append("}");
+    return SendJson(req, body.c_str());
+}
+
+esp_err_t VoiceGenerationHeartbeat(httpd_req_t* req) {
+    if (req == nullptr || req->content_len > 2) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    GetVoiceGenerationService().RecordAppHeartbeat();
+    return SendJson(req, "{\"ok\":true,\"code\":\"ready\"}");
+}
+
+esp_err_t ClaimVoiceGenerationTask(httpd_req_t* req) {
+    JsonDocument input;
+    if (!ReadBoundedJson(req, &input, 256)) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    const std::string id = input["id"] | ""; VoiceGenerationTask task;
+    const esp_err_t result = GetVoiceGenerationService().Claim(id, &task);
+    if (result == ESP_ERR_NOT_FOUND) return SendJson(req, "{\"ok\":false,\"code\":\"no_voice_task\"}", "404 Not Found");
+    if (result != ESP_OK) return SendJson(req, "{\"ok\":false,\"code\":\"voice_task_not_pending\"}", "409 Conflict");
+    std::string body = "{\"ok\":true,\"code\":\"claimed\",\"data\":"; AppendVoiceGenerationTask(&body, task); body.append("}");
+    return SendJson(req, body.c_str());
+}
+
+VoiceGenerationState ParseVoiceGenerationState(const std::string& value) {
+    if (value == "uploading") return VoiceGenerationState::kUploading;
+    if (value == "displaying") return VoiceGenerationState::kDisplaying;
+    if (value == "success") return VoiceGenerationState::kSuccess;
+    if (value == "failed") return VoiceGenerationState::kFailed;
+    return VoiceGenerationState::kIdle;
+}
+
+esp_err_t UpdateVoiceGenerationTask(httpd_req_t* req) {
+    JsonDocument input;
+    if (!ReadBoundedJson(req, &input, 512)) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    const std::string id = input["id"] | "";
+    const auto state = ParseVoiceGenerationState(input["state"] | "");
+    const std::string error = input["error_code"] | ""; VoiceGenerationTask task;
+    const esp_err_t result = GetVoiceGenerationService().Update(id, state, error, &task);
+    if (result != ESP_OK) return SendJson(req, "{\"ok\":false,\"code\":\"voice_task_update_rejected\"}", "409 Conflict");
+    std::string body = "{\"ok\":true,\"code\":\"updated\",\"data\":"; AppendVoiceGenerationTask(&body, task); body.append("}");
+    return SendJson(req, body.c_str());
+}
+
 esp_err_t ProvisionPage(httpd_req_t* req) {
     static constexpr char page[] = R"HTML(<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>E-ink Wi-Fi Setup</title><style>body{font-family:sans-serif;max-width:420px;margin:48px auto;padding:0 20px;color:#33242c}input,button{box-sizing:border-box;width:100%;padding:13px;margin:8px 0;font-size:16px}button{background:#d95788;color:white;border:0;border-radius:8px}.ok{color:#16803c}.bad{color:#bd263c}</style><h2>墨水屏相册配网</h2><p>仅支持 2.4 GHz Wi-Fi；esp_network 会保留。</p><form id="f"><input name="ssid" placeholder="Wi-Fi 名称 (SSID)" required maxlength="32"><input name="password" type="password" placeholder="Wi-Fi 密码" maxlength="64"><button id="b">连接 Wi-Fi</button></form><p id="r">请输入信息后连接。</p><script>let r=document.querySelector('#r'),b=document.querySelector('#b');f.onsubmit=async e=>{e.preventDefault();b.disabled=true;r.className='';r.textContent='正在连接，最多等待 12 秒…';try{let x=await fetch('/api/v1/network/sta',{method:'POST',body:new URLSearchParams(new FormData(f))}),j=await x.json();if(!x.ok)throw 0;r.className='ok';r.textContent='连接成功，设备局域网地址：'+j.data.sta_ip}catch(e){r.className='bad';r.textContent='连接未成功：请确认 2.4 GHz、名称和密码'}b.disabled=false};</script>)HTML";
     httpd_resp_set_type(req, "text/html; charset=utf-8");
@@ -1457,6 +1512,10 @@ esp_err_t RegisterProductApi(httpd_handle_t server) {
         {.uri="/api/v1/network/ap/restore-default", .method=HTTP_POST, .handler=RestoreDefaultAp, .user_ctx=nullptr},
         {.uri="/api/v1/xiaozhi/status", .method=HTTP_GET, .handler=XiaozhiStatus, .user_ctx=nullptr},
         {.uri="/api/v1/xiaozhi/conversation", .method=HTTP_GET, .handler=XiaozhiConversation, .user_ctx=nullptr},
+        {.uri="/api/v1/voice-generation/task", .method=HTTP_GET, .handler=VoiceGenerationTaskStatus, .user_ctx=nullptr},
+        {.uri="/api/v1/voice-generation/heartbeat", .method=HTTP_POST, .handler=VoiceGenerationHeartbeat, .user_ctx=nullptr},
+        {.uri="/api/v1/voice-generation/task/claim", .method=HTTP_POST, .handler=ClaimVoiceGenerationTask, .user_ctx=nullptr},
+        {.uri="/api/v1/voice-generation/task", .method=HTTP_POST, .handler=UpdateVoiceGenerationTask, .user_ctx=nullptr},
         {.uri="/api/v1/media/upload", .method=HTTP_POST, .handler=UploadMedia, .user_ctx=nullptr},
         {.uri="/api/v1/media", .method=HTTP_GET, .handler=ListMedia, .user_ctx=nullptr},
         {.uri="/api/v1/media/*", .method=HTTP_GET, .handler=GetMediaDetail, .user_ctx=nullptr},

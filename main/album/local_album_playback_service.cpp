@@ -148,6 +148,27 @@ void LocalAlbumPlaybackService::NotifyManualDisplaySuccess(const MediaId& media_
     xSemaphoreGive(mutex_);
 }
 
+esp_err_t LocalAlbumPlaybackService::RequestNext() {
+    if (mutex_ == nullptr) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    HandlePendingCompletionLocked();
+    ObserveExternalDisplayLocked();
+    const auto mode = GetModeManager().GetSnapshot();
+    if (mode.active_feature != Feature::kLocalAlbum || mode.state != ModeSnapshot::State::kIdle ||
+        snapshot_.refresh_pending || manual_next_requested_) {
+        xSemaphoreGive(mutex_);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (library_ == nullptr || library_->Count(MediaCategory::kLocal) <= 1U) {
+        xSemaphoreGive(mutex_);
+        return ESP_ERR_NOT_FOUND;
+    }
+    manual_next_requested_ = true;
+    ++snapshot_.state_revision;
+    xSemaphoreGive(mutex_);
+    return ESP_OK;
+}
+
 void LocalAlbumPlaybackService::TriggerScheduledWake() {
     if (mutex_ == nullptr) return;
     xSemaphoreTake(mutex_, portMAX_DELAY);
@@ -196,6 +217,7 @@ void LocalAlbumPlaybackService::Tick() {
     const bool local_mode_active = mode.active_feature == Feature::kLocalAlbum &&
                                    mode.state == ModeSnapshot::State::kIdle;
     if (!local_mode_active) {
+        manual_next_requested_ = false;
         local_mode_was_active_ = false;
         xSemaphoreGive(mutex_);
         return;
@@ -209,10 +231,13 @@ void LocalAlbumPlaybackService::Tick() {
         if (snapshot_.config.mode == PlaybackMode::kAuto) ScheduleNextLocked(snapshot_.config.interval_seconds);
         ++snapshot_.state_revision;
     }
-    if (snapshot_.refresh_pending || snapshot_.config.mode != PlaybackMode::kAuto || NowMs() < snapshot_.next_play_at_ms) {
+    const bool manual_next = manual_next_requested_;
+    if (snapshot_.refresh_pending ||
+        (!manual_next && (snapshot_.config.mode != PlaybackMode::kAuto || NowMs() < snapshot_.next_play_at_ms))) {
         xSemaphoreGive(mutex_);
         return;
     }
+    manual_next_requested_ = false;
 
     MediaId target;
     if (!SelectNextLocked(&target)) {
@@ -266,7 +291,7 @@ void LocalAlbumPlaybackService::ObserveExternalDisplayLocked() {
 bool LocalAlbumPlaybackService::SelectNextLocked(MediaId* output) {
     if (output == nullptr || library_ == nullptr) return false;
     const std::size_t count = library_->Count(MediaCategory::kLocal);
-    if (count == 0) return false;
+    if (count <= 1) return false;
     const auto items = library_->List(MediaCategory::kLocal, 0, count);
     if (items.empty()) return false;
     if (snapshot_.config.order == PlaybackOrder::kRandom) {

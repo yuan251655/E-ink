@@ -4,6 +4,7 @@
 #include "device_state.h"
 #include "mode_manager.h"
 #include "product_network.h"
+#include "voice_generation_service.h"
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -65,7 +66,7 @@ void RuntimeTask(void*) {
     while (true) {
         const auto network = GetProductNetworkSnapshot();
         const auto mode = GetModeManager().GetSnapshot();
-        const bool ai_active = mode.state == ModeSnapshot::State::kIdle && mode.active_feature == Feature::kAiAlbum;
+        const bool wake_ready = mode.state == ModeSnapshot::State::kIdle;
         auto& app = Application::GetInstance();
 
         if (!network.sta_configured) {
@@ -88,11 +89,11 @@ void RuntimeTask(void*) {
                 // the official WifiStation/SsidManager provisioning path.
                 app.Start(true);
             }
-            app.SetWakeWordEnabled(ai_active);
+            app.SetWakeWordEnabled(wake_ready);
             std::lock_guard<std::mutex> lock(runtime_mutex);
             snapshot.state = StateName(app.GetDeviceState());
             snapshot.started = app.IsStarted();
-            snapshot.wake_word_enabled = ai_active && app.IsWakeWordEnabled();
+            snapshot.wake_word_enabled = wake_ready && app.IsWakeWordEnabled();
             snapshot.activation_code = app.GetActivationCode();
         }
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -103,6 +104,7 @@ void RuntimeTask(void*) {
 void InitializeXiaozhiRuntime() {
     if (initialized) return;
     initialized = true;
+    RegisterVoiceGenerationMcpTools();
     xTaskCreate(RuntimeTask, "xiaozhi_runtime", 8192, nullptr, 3, nullptr);
 }
 

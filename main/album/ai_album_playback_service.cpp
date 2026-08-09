@@ -87,6 +87,21 @@ void AiAlbumPlaybackService::NotifyManualDisplaySuccess(const MediaId& id) {
     if (PersistLocked() != ESP_OK) snapshot_.last_error_code = "playback_persist_failed";
     xSemaphoreGive(mutex_);
 }
+esp_err_t AiAlbumPlaybackService::RequestNext() {
+    if (mutex_ == nullptr) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    HandlePendingCompletionLocked(); ObserveExternalDisplayLocked();
+    const auto mode = GetModeManager().GetSnapshot();
+    if (mode.active_feature != Feature::kAiAlbum || mode.state != ModeSnapshot::State::kIdle ||
+        snapshot_.refresh_pending || manual_next_requested_) {
+        xSemaphoreGive(mutex_); return ESP_ERR_INVALID_STATE;
+    }
+    if (library_ == nullptr || library_->Count(MediaCategory::kAi) <= 1U) {
+        xSemaphoreGive(mutex_); return ESP_ERR_NOT_FOUND;
+    }
+    manual_next_requested_ = true; ++snapshot_.state_revision;
+    xSemaphoreGive(mutex_); return ESP_OK;
+}
 void AiAlbumPlaybackService::NotifyMediaDeleted(const MediaId& id) {
     if (id.empty() || mutex_ == nullptr) return;
     xSemaphoreTake(mutex_, portMAX_DELAY);
@@ -102,9 +117,11 @@ void AiAlbumPlaybackService::Tick() {
     HandlePendingCompletionLocked();
     ObserveExternalDisplayLocked();
     const auto mode = GetModeManager().GetSnapshot(); const bool active = mode.active_feature == Feature::kAiAlbum && mode.state == ModeSnapshot::State::kIdle;
-    if (!active) { ai_mode_was_active_ = false; xSemaphoreGive(mutex_); return; }
+    if (!active) { manual_next_requested_ = false; ai_mode_was_active_ = false; xSemaphoreGive(mutex_); return; }
     if (!ai_mode_was_active_) { ai_mode_was_active_ = true; if (snapshot_.config.mode == PlaybackMode::kAuto) ScheduleNextLocked(snapshot_.config.interval_seconds); ++snapshot_.state_revision; }
-    if (snapshot_.refresh_pending || snapshot_.config.mode != PlaybackMode::kAuto || NowMs() < snapshot_.next_play_at_ms) { xSemaphoreGive(mutex_); return; }
+    const bool manual_next = manual_next_requested_;
+    if (snapshot_.refresh_pending || (!manual_next && (snapshot_.config.mode != PlaybackMode::kAuto || NowMs() < snapshot_.next_play_at_ms))) { xSemaphoreGive(mutex_); return; }
+    manual_next_requested_ = false;
     const auto media_count = library_ == nullptr ? 0U : library_->Count(MediaCategory::kAi);
     if (media_count <= 1U) {
         // Keep automatic playback enabled but do not repeatedly refresh the
