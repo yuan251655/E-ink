@@ -8,6 +8,9 @@
 #include "mode_manager.h"
 #include "local_album_playback_runtime.h"
 #include "ai_album_playback_runtime.h"
+#include "display_runtime.h"
+#include "job_runtime.h"
+#include "job_service.h"
 
 namespace photopainter::product {
 namespace {
@@ -31,6 +34,43 @@ std::string ShowNextPicture() {
     if (result == ESP_ERR_NOT_FOUND) return "当前相册里没有其他可切换的照片。";
     if (result != ESP_OK) return "墨水屏正在刷新，请稍后再试。";
     return "正在切换下一张照片，请等待屏幕刷新完成。";
+}
+
+std::string SwitchMode(const std::string& target_name) {
+    Feature target;
+    const char* display_name = nullptr;
+    if (target_name == "local_album") {
+        target = Feature::kLocalAlbum;
+        display_name = "本地相册";
+    } else if (target_name == "ai_album") {
+        target = Feature::kAiAlbum;
+        display_name = "AI 相册";
+    } else if (target_name == "info_dashboard") {
+        target = Feature::kInfoDashboard;
+        display_name = "信息看板";
+    } else {
+        return "请明确说要切换到本地相册、AI 相册或信息看板。";
+    }
+
+    const auto mode = GetModeManager().GetSnapshot();
+    if (mode.state != ModeSnapshot::State::kIdle) return "相框正在切换模式，请稍后再试。";
+    if (mode.active_feature == target) return std::string("当前已经是") + display_name + "。";
+
+    JobSnapshot job;
+    const RequestId request_id = "voice-mode-" + std::to_string(NowMs());
+    const std::string fingerprint = "voice-mode:" + target_name + ":" + std::to_string(mode.revision);
+    if (GetProductJobService().CreateOrFind(JobKind::kMode, request_id, fingerprint, &job) !=
+        JobRegistrationResult::kCreated) {
+        return "相框正在执行其他任务，请稍后再试。";
+    }
+    const esp_err_t result = GetModeManager().BeginSwitch(
+        target, mode.revision, job.job_id, &GetProductJobService(), &GetDisplayService());
+    if (result != ESP_OK) {
+        (void)GetProductJobService().Update(job.job_id, JobState::kFailed, "failed", 0,
+                                            result == ESP_ERR_NOT_FOUND ? "mode_cover_unavailable" : "mode_switch_busy");
+        return result == ESP_ERR_NOT_FOUND ? "目标模式画面不可用，未执行切换。" : "墨水屏正在刷新，请稍后再试。";
+    }
+    return std::string("正在切换到") + display_name + "，请等待屏幕刷新完成。";
 }
 }  // namespace
 
@@ -77,6 +117,11 @@ esp_err_t VoiceGenerationService::Confirm(VoiceGenerationTask* output) {
     if (mutex_ == nullptr) return ESP_ERR_NOT_FOUND;
     xSemaphoreTake(static_cast<SemaphoreHandle_t>(mutex_), portMAX_DELAY); ExpireLocked(NowMs());
     if (task_.state != VoiceGenerationState::kAwaitingConfirm) { xSemaphoreGive(static_cast<SemaphoreHandle_t>(mutex_)); return ESP_ERR_INVALID_STATE; }
+    const auto mode = GetModeManager().GetSnapshot();
+    if (mode.state != ModeSnapshot::State::kIdle || mode.active_feature != Feature::kAiAlbum) {
+        xSemaphoreGive(static_cast<SemaphoreHandle_t>(mutex_));
+        return ESP_ERR_NOT_SUPPORTED;
+    }
     if (app_heartbeat_at_ms_ == 0 || NowMs() - app_heartbeat_at_ms_ > kAppHeartbeatTimeoutMs) {
         xSemaphoreGive(static_cast<SemaphoreHandle_t>(mutex_));
         return ESP_ERR_NOT_FOUND;
@@ -147,9 +192,12 @@ VoiceGenerationService& GetVoiceGenerationService() { static VoiceGenerationServ
 void RegisterVoiceGenerationMcpTools() {
     static bool registered = false; if (registered) return; registered = true;
     auto& mcp = McpServer::GetInstance();
-    mcp.SetToolAllowlist({"self.photo_frame.next_picture", "self.photo_frame.create_image", "self.photo_frame.confirm_image", "self.photo_frame.cancel_image"});
+    mcp.SetToolAllowlist({"self.photo_frame.next_picture", "self.photo_frame.switch_mode", "self.photo_frame.create_image", "self.photo_frame.confirm_image", "self.photo_frame.cancel_image"});
     mcp.AddTool("self.photo_frame.next_picture", "Show the next photo in the currently active local or AI album. Never switch device mode.", PropertyList(), [](const PropertyList&) -> ReturnValue {
         return ShowNextPicture();
+    });
+    mcp.AddTool("self.photo_frame.switch_mode", "Switch to exactly one requested photo-frame mode. target must be local_album, ai_album, or info_dashboard. If the user did not name a target, ask which mode instead of calling this tool.", PropertyList({Property("target", kPropertyTypeString)}), [](const PropertyList& args) -> ReturnValue {
+        return SwitchMode(args["target"].value<std::string>());
     });
     mcp.AddTool("self.photo_frame.create_image", "Create one image only while AI album is active. Call this when the user requests image generation; pass the exact Chinese image description. The result asks the user to confirm.", PropertyList({Property("prompt", kPropertyTypeString)}), [](const PropertyList& args) -> ReturnValue {
         VoiceGenerationTask task; const auto result = GetVoiceGenerationService().CreateAwaitingConfirm(args["prompt"].value<std::string>(), &task);
@@ -161,6 +209,7 @@ void RegisterVoiceGenerationMcpTools() {
         VoiceGenerationTask task;
         const auto result = GetVoiceGenerationService().Confirm(&task);
         if (result == ESP_ERR_NOT_FOUND) return std::string("手机语音生图服务未连接，请先在手机上开启该服务。");
+        if (result == ESP_ERR_NOT_SUPPORTED) return std::string("当前不是 AI 相册模式，不能确认语音生图。");
         return result == ESP_OK ? std::string("已确认，正在生成图片，请等待。") : std::string("没有等待确认的生成请求。");
     });
     mcp.AddTool("self.photo_frame.cancel_image", "Cancel the one pending image request before generation starts.", PropertyList(), [](const PropertyList&) -> ReturnValue {
