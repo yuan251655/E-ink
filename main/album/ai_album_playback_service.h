@@ -22,7 +22,7 @@ public:
                            PlaybackOrder order, Revision expected_revision,
                            PlaybackSnapshot* output);
     void NotifyManualDisplaySuccess(const MediaId& media_id);
-    esp_err_t RequestNext();
+    esp_err_t RequestNext(bool announce_completion = false);
     void NotifyMediaDeleted(const MediaId& media_id);
     static bool IsAllowedInterval(std::uint32_t seconds);
 
@@ -51,6 +51,7 @@ private:
     std::uint32_t request_sequence_ = 1;
     bool ai_mode_was_active_ = false;
     bool manual_next_requested_ = false;
+    bool announce_manual_next_ = false;
 };
 
 }  // namespace photopainter::product

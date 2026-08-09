@@ -201,6 +201,62 @@ namespace Lang {
         static_cast<size_t>(ogg_vibration_end - ogg_vibration_start)
         };
 
+        extern const char ogg_voice_generation_displayed_start[] asm("_binary_voice_generation_displayed_ogg_start");
+        extern const char ogg_voice_generation_displayed_end[] asm("_binary_voice_generation_displayed_ogg_end");
+        static const std::string_view OGG_VOICE_GENERATION_DISPLAYED {
+        static_cast<const char*>(ogg_voice_generation_displayed_start),
+        static_cast<size_t>(ogg_voice_generation_displayed_end - ogg_voice_generation_displayed_start)
+        };
+
+        extern const char ogg_voice_generation_failed_start[] asm("_binary_voice_generation_failed_ogg_start");
+        extern const char ogg_voice_generation_failed_end[] asm("_binary_voice_generation_failed_ogg_end");
+        static const std::string_view OGG_VOICE_GENERATION_FAILED {
+        static_cast<const char*>(ogg_voice_generation_failed_start),
+        static_cast<size_t>(ogg_voice_generation_failed_end - ogg_voice_generation_failed_start)
+        };
+
+        extern const char ogg_voice_generation_saved_start[] asm("_binary_voice_generation_saved_ogg_start");
+        extern const char ogg_voice_generation_saved_end[] asm("_binary_voice_generation_saved_ogg_end");
+        static const std::string_view OGG_VOICE_GENERATION_SAVED {
+        static_cast<const char*>(ogg_voice_generation_saved_start),
+        static_cast<size_t>(ogg_voice_generation_saved_end - ogg_voice_generation_saved_start)
+        };
+
+        extern const char ogg_voice_mode_ai_start[] asm("_binary_voice_mode_ai_ogg_start");
+        extern const char ogg_voice_mode_ai_end[] asm("_binary_voice_mode_ai_ogg_end");
+        static const std::string_view OGG_VOICE_MODE_AI {
+        static_cast<const char*>(ogg_voice_mode_ai_start),
+        static_cast<size_t>(ogg_voice_mode_ai_end - ogg_voice_mode_ai_start)
+        };
+
+        extern const char ogg_voice_mode_dashboard_start[] asm("_binary_voice_mode_dashboard_ogg_start");
+        extern const char ogg_voice_mode_dashboard_end[] asm("_binary_voice_mode_dashboard_ogg_end");
+        static const std::string_view OGG_VOICE_MODE_DASHBOARD {
+        static_cast<const char*>(ogg_voice_mode_dashboard_start),
+        static_cast<size_t>(ogg_voice_mode_dashboard_end - ogg_voice_mode_dashboard_start)
+        };
+
+        extern const char ogg_voice_mode_local_start[] asm("_binary_voice_mode_local_ogg_start");
+        extern const char ogg_voice_mode_local_end[] asm("_binary_voice_mode_local_ogg_end");
+        static const std::string_view OGG_VOICE_MODE_LOCAL {
+        static_cast<const char*>(ogg_voice_mode_local_start),
+        static_cast<size_t>(ogg_voice_mode_local_end - ogg_voice_mode_local_start)
+        };
+
+        extern const char ogg_voice_next_failed_start[] asm("_binary_voice_next_failed_ogg_start");
+        extern const char ogg_voice_next_failed_end[] asm("_binary_voice_next_failed_ogg_end");
+        static const std::string_view OGG_VOICE_NEXT_FAILED {
+        static_cast<const char*>(ogg_voice_next_failed_start),
+        static_cast<size_t>(ogg_voice_next_failed_end - ogg_voice_next_failed_start)
+        };
+
+        extern const char ogg_voice_next_success_start[] asm("_binary_voice_next_success_ogg_start");
+        extern const char ogg_voice_next_success_end[] asm("_binary_voice_next_success_ogg_end");
+        static const std::string_view OGG_VOICE_NEXT_SUCCESS {
+        static_cast<const char*>(ogg_voice_next_success_start),
+        static_cast<size_t>(ogg_voice_next_success_end - ogg_voice_next_success_start)
+        };
+
         extern const char ogg_welcome_start[] asm("_binary_welcome_ogg_start");
         extern const char ogg_welcome_end[] asm("_binary_welcome_ogg_end");
         static const std::string_view OGG_WELCOME {

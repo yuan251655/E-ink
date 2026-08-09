@@ -12,6 +12,7 @@
 #include "media_library.h"
 #include "mode_manager.h"
 #include "rtc_service.h"
+#include "voice_announcement_service.h"
 
 namespace photopainter::product {
 namespace {
@@ -148,7 +149,7 @@ void LocalAlbumPlaybackService::NotifyManualDisplaySuccess(const MediaId& media_
     xSemaphoreGive(mutex_);
 }
 
-esp_err_t LocalAlbumPlaybackService::RequestNext() {
+esp_err_t LocalAlbumPlaybackService::RequestNext(bool announce_completion) {
     if (mutex_ == nullptr) return ESP_ERR_INVALID_STATE;
     xSemaphoreTake(mutex_, portMAX_DELAY);
     HandlePendingCompletionLocked();
@@ -164,6 +165,7 @@ esp_err_t LocalAlbumPlaybackService::RequestNext() {
         return ESP_ERR_NOT_FOUND;
     }
     manual_next_requested_ = true;
+    announce_manual_next_ = announce_completion;
     ++snapshot_.state_revision;
     xSemaphoreGive(mutex_);
     return ESP_OK;
@@ -218,6 +220,7 @@ void LocalAlbumPlaybackService::Tick() {
                                    mode.state == ModeSnapshot::State::kIdle;
     if (!local_mode_active) {
         manual_next_requested_ = false;
+        announce_manual_next_ = false;
         local_mode_was_active_ = false;
         xSemaphoreGive(mutex_);
         return;
@@ -232,15 +235,18 @@ void LocalAlbumPlaybackService::Tick() {
         ++snapshot_.state_revision;
     }
     const bool manual_next = manual_next_requested_;
+    const bool announce_completion = manual_next && announce_manual_next_;
     if (snapshot_.refresh_pending ||
         (!manual_next && (snapshot_.config.mode != PlaybackMode::kAuto || NowMs() < snapshot_.next_play_at_ms))) {
         xSemaphoreGive(mutex_);
         return;
     }
     manual_next_requested_ = false;
+    announce_manual_next_ = false;
 
     MediaId target;
     if (!SelectNextLocked(&target)) {
+        if (announce_completion) (void)GetVoiceAnnouncementService().Enqueue(VoiceAnnouncement::kNextFailed);
         snapshot_.last_error_code = "media_not_found";
         ScheduleNextLocked(kRetrySeconds);
         ++snapshot_.state_revision;
@@ -257,6 +263,7 @@ void LocalAlbumPlaybackService::Tick() {
             (void)jobs_->Update(job.job_id, JobState::kFailed, "rejected", 0, "display_busy");
         }
         snapshot_.last_error_code = "display_busy";
+        if (announce_completion) (void)GetVoiceAnnouncementService().Enqueue(VoiceAnnouncement::kNextFailed);
         ScheduleNextLocked(kRetrySeconds);
         ++snapshot_.state_revision;
         xSemaphoreGive(mutex_);
@@ -265,6 +272,10 @@ void LocalAlbumPlaybackService::Tick() {
     snapshot_.refresh_pending = true;
     snapshot_.pending_media_id = target;
     pending_job_id_ = job.job_id;
+    if (announce_completion) {
+        (void)GetVoiceAnnouncementService().WatchJob(
+            job.job_id, VoiceAnnouncement::kNextSuccess, VoiceAnnouncement::kNextFailed);
+    }
     snapshot_.last_error_code.clear();
     ++snapshot_.state_revision;
     xSemaphoreGive(mutex_);

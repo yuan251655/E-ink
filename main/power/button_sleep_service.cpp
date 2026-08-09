@@ -23,6 +23,7 @@
 #include "mode_manager.h"
 #include "xiaozhi_runtime.h"
 #include "voice_generation_service.h"
+#include "voice_announcement_service.h"
 
 namespace photopainter::product {
 namespace {
@@ -220,10 +221,9 @@ bool IsAutomaticSleepBusy() {
         voice_generation.state != VoiceGenerationState::kFailed &&
         voice_generation.state != VoiceGenerationState::kCancelled &&
         voice_generation.state != VoiceGenerationState::kExpired) return true;
-    if (mode.active_feature == Feature::kAiAlbum) {
-        const auto ai = GetXiaozhiRuntimeSnapshot();
-        if (ai.state == "listening" || ai.state == "speaking" || ai.state == "connecting" || ai.state == "starting") return true;
-    }
+    if (GetVoiceAnnouncementService().IsBusy()) return true;
+    const auto ai = GetXiaozhiRuntimeSnapshot();
+    if (ai.state == "listening" || ai.state == "speaking" || ai.state == "connecting" || ai.state == "starting") return true;
     return false;
 }
 
