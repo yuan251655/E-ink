@@ -26,6 +26,7 @@
 namespace photopainter::product {
 namespace {
 constexpr const char* kTag = "button_sleep";
+// GPIO5 is the board SYS_OUT power-control line, not a button input.
 constexpr gpio_num_t kBootPin = GPIO_NUM_0;
 constexpr gpio_num_t kKeyWakePin = GPIO_NUM_4;
 constexpr gpio_num_t kRtcWakePin = GPIO_NUM_6;
@@ -142,7 +143,6 @@ void EnterSleepTask(void*) {
                                   "BOOT sleep ignored while display or TF is busy");
         return;
     }
-
     const esp_err_t wake = ConfigureWakeSources(false);
     if (wake != ESP_OK) {
         g_sleep_pending = false;
