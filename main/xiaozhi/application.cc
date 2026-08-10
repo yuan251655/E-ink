@@ -12,6 +12,7 @@
 
 #include <cstring>
 #include <esp_log.h>
+#include <esp_system.h>
 #include <cJSON.h>
 #include <driver/gpio.h>
 #include <arpa/inet.h>
@@ -557,8 +558,11 @@ void Application::Start(bool reuse_existing_network) {
         std::string message = std::string(Lang::Strings::VERSION) + ota.GetCurrentVersion();
         display->ShowNotification(message.c_str());
         display->SetChatMessage("system", "");
-        // Play the success sound to indicate the device is ready
-        audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS);
+        // PWR cold boot keeps the ready sound. KEY/RTC deep-sleep wake is a
+        // resume path and must stay silent.
+        if (esp_reset_reason() != ESP_RST_DEEPSLEEP) {
+            audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS);
+        }
     }
 
     // Start the main event loop task with priority 3

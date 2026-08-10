@@ -107,8 +107,10 @@ std::string GetStatus(const std::string& scope) {
         const auto config = GetAutomaticSleepConfig();
         const auto status = GetAutomaticSleepStatus();
         if (!config.enabled) return "自动休眠未开启。";
-        return "自动休眠已开启，未操作 " + std::to_string(config.idle_timeout_minutes) +
-               " 分钟后休眠，当前状态为" + SleepStateName(status.state) + "。";
+        const std::string timeout = config.idle_timeout_seconds < 60
+            ? std::to_string(config.idle_timeout_seconds) + " 秒"
+            : std::to_string(config.idle_timeout_seconds / 60) + " 分钟";
+        return "自动休眠已开启，未操作 " + timeout + "后休眠，当前状态为" + SleepStateName(status.state) + "。";
     }
     if (scope == "voice_service") {
         const auto task = GetVoiceGenerationService().GetSnapshot();

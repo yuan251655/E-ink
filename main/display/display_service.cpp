@@ -7,6 +7,7 @@
 #include "media_library.h"
 #include "mode_cover_assets.h"
 #include "mode_manager.h"
+#include "button_sleep_service.h"
 #include "power_service.h"
 #include "storage_service.h"
 
@@ -194,6 +195,7 @@ void DisplayService::WorkerLoop() {
                 if (jobs_) (void)jobs_->CompleteSuccess(job_id, media_id);
             }
             xSemaphoreTake(state_mutex_, portMAX_DELAY); snapshot_.state = DisplayState::kSuccess; xSemaphoreGive(state_mutex_);
+            RecordAutomaticSleepActivity();
         } else {
             const std::string error = result == ESP_ERR_TIMEOUT ? "display_timeout" : "display_failed";
             if (mode_cover) {

@@ -38,6 +38,7 @@ constexpr std::uint8_t kRtcTestSeconds = 10;
 constexpr char kSleepConfigNamespace[] = "sleep_config";
 constexpr char kSleepEnabledKey[] = "enabled";
 constexpr char kSleepTimeoutKey[] = "idle_min";
+constexpr char kSleepTimeoutSecondsKey[] = "idle_sec";
 constexpr char kSleepPlaybackKey[] = "playback";
 constexpr char kScheduledNamespace[] = "sleep_schedule";
 constexpr char kScheduledLocalKey[] = "local";
@@ -58,6 +59,14 @@ std::uint64_t g_last_activity_epoch_seconds = 0;
 bool IsRtcWake() {
     if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT1) return false;
     return (esp_sleep_get_ext1_wakeup_status() & (1ULL << static_cast<unsigned>(kRtcWakePin))) != 0;
+}
+
+const char* WakeReasonName() {
+    if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT1) return "none";
+    const std::uint64_t pins = esp_sleep_get_ext1_wakeup_status();
+    if ((pins & (1ULL << static_cast<unsigned>(kRtcWakePin))) != 0) return "rtc";
+    if ((pins & (1ULL << static_cast<unsigned>(kKeyWakePin))) != 0) return "key";
+    return "ext1";
 }
 
 void PersistScheduledLocalPlayback(bool pending) {
@@ -83,14 +92,18 @@ void LoadAutomaticSleepConfig() {
     nvs_handle_t handle;
     if (nvs_open(kSleepConfigNamespace, NVS_READONLY, &handle) != ESP_OK) return;
     std::uint8_t enabled = 0;
-    std::uint8_t timeout = g_automatic_sleep_config.idle_timeout_minutes;
+    std::uint32_t timeout = g_automatic_sleep_config.idle_timeout_seconds;
     std::uint8_t playback = 1;
     (void)nvs_get_u8(handle, kSleepEnabledKey, &enabled);
-    (void)nvs_get_u8(handle, kSleepTimeoutKey, &timeout);
+    if (nvs_get_u32(handle, kSleepTimeoutSecondsKey, &timeout) != ESP_OK) {
+        std::uint8_t legacy_minutes = 15;
+        (void)nvs_get_u8(handle, kSleepTimeoutKey, &legacy_minutes);
+        timeout = static_cast<std::uint32_t>(legacy_minutes) * 60;
+    }
     (void)nvs_get_u8(handle, kSleepPlaybackKey, &playback);
     nvs_close(handle);
     g_automatic_sleep_config.enabled = enabled != 0;
-    g_automatic_sleep_config.idle_timeout_minutes = IsAllowedAutomaticSleepTimeout(timeout) ? timeout : 15;
+    g_automatic_sleep_config.idle_timeout_seconds = IsAllowedAutomaticSleepTimeout(timeout) ? timeout : 15 * 60;
     g_automatic_sleep_config.wake_for_playback = playback != 0;
 }
 
@@ -121,9 +134,22 @@ void CancelRtcTest(const char* code, const char* message) {
 
 esp_err_t ConfigureWakeSources(bool include_rtc) {
     (void)esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+    esp_err_t result = rtc_gpio_init(kKeyWakePin);
+    if (result != ESP_OK) return result;
+    result = rtc_gpio_set_direction(kKeyWakePin, RTC_GPIO_MODE_INPUT_ONLY);
+    if (result != ESP_OK) return result;
+    (void)rtc_gpio_pulldown_dis(kKeyWakePin);
+    result = rtc_gpio_pullup_en(kKeyWakePin);
+    if (result != ESP_OK) return result;
+    const int key_level = rtc_gpio_get_level(kKeyWakePin);
+    const int rtc_level = include_rtc ? GetRtcService().ReadInterruptLevel() : 1;
+    if (key_level == 0 || rtc_level == 0) {
+        ESP_LOGW(kTag, "Wake source asserted before sleep: KEY=%d RTC=%d", key_level, rtc_level);
+        return ESP_ERR_INVALID_STATE;
+    }
     std::uint64_t mask = 1ULL << static_cast<unsigned>(kKeyWakePin);
     if (include_rtc) {
-        esp_err_t result = rtc_gpio_init(kRtcWakePin);
+        result = rtc_gpio_init(kRtcWakePin);
         if (result != ESP_OK) return result;
         result = rtc_gpio_set_direction(kRtcWakePin, RTC_GPIO_MODE_INPUT_ONLY);
         if (result != ESP_OK) return result;
@@ -143,6 +169,7 @@ void EnterSleepTask(void*) {
         g_sleep_pending = false;
         GetDeviceLogService().Add(DeviceLogSeverity::kWarning, "button", "sleep_rejected_busy",
                                   "BOOT sleep ignored while display or TF is busy");
+        vTaskDelete(nullptr);
         return;
     }
     const esp_err_t wake = ConfigureWakeSources(false);
@@ -151,6 +178,7 @@ void EnterSleepTask(void*) {
         ESP_LOGE(kTag, "KEY wake configuration failed: %s", esp_err_to_name(wake));
         GetDeviceLogService().Add(DeviceLogSeverity::kError, "button", "sleep_wake_config_failed",
                                   "KEY wake source could not be configured");
+        vTaskDelete(nullptr);
         return;
     }
 
@@ -166,13 +194,16 @@ void EnterRtcTestSleepTask(void*) {
     const auto display = GetDisplayService().GetSnapshot();
     if (IsDisplayBusy(display.state) || GetStorageService().HasActiveWriteTransaction()) {
         CancelRtcTest("rtc_wake_test_busy", "RTC wake verification stopped because display or TF is busy");
+        vTaskDelete(nullptr);
         return;
     }
     esp_err_t result = GetRtcService().ArmInterruptDiagnostic(kRtcTestSeconds);
     if (result == ESP_OK) result = ConfigureWakeSources(true);
     if (result != ESP_OK) {
+        (void)GetRtcService().DisarmWakeTimer();
         ESP_LOGE(kTag, "RTC wake test setup failed: %s", esp_err_to_name(result));
         CancelRtcTest("rtc_wake_test_setup_failed", "RTC wake verification setup failed");
+        vTaskDelete(nullptr);
         return;
     }
     GetDeviceLogService().Add(DeviceLogSeverity::kInfo, "rtc", "rtc_wake_test_sleep",
@@ -193,6 +224,7 @@ void EnterScheduledLocalPlaybackSleepTask(void*) {
         IsDisplayBusy(display.state) || GetStorageService().HasActiveWriteTransaction()) {
         GetDeviceLogService().Add(DeviceLogSeverity::kWarning, "power", "scheduled_sleep_rejected",
                                   "Local playback sleep rejected because configuration, RTC, display, or TF is not ready");
+        vTaskDelete(nullptr);
         return;
     }
     esp_err_t result = GetRtcService().ArmWakeAfterSeconds(g_scheduled_sleep_delay_seconds);
@@ -201,6 +233,7 @@ void EnterScheduledLocalPlaybackSleepTask(void*) {
         (void)GetRtcService().DisarmWakeTimer();
         GetDeviceLogService().Add(DeviceLogSeverity::kWarning, "power", "scheduled_sleep_setup_failed",
                                   "Local playback stays awake because RTC wake could not be configured");
+        vTaskDelete(nullptr);
         return;
     }
     PersistScheduledLocalPlayback(true);
@@ -223,7 +256,7 @@ bool IsAutomaticSleepBusy() {
         voice_generation.state != VoiceGenerationState::kExpired) return true;
     if (GetVoiceAnnouncementService().IsBusy()) return true;
     const auto ai = GetXiaozhiRuntimeSnapshot();
-    if (ai.state == "listening" || ai.state == "speaking" || ai.state == "connecting" || ai.state == "starting") return true;
+    if (ai.state == "listening" || ai.state == "speaking") return true;
     return false;
 }
 
@@ -246,21 +279,43 @@ void EnterAutomaticSleepTask(void*) {
     g_automatic_sleep_pending = false;
     const auto config = GetAutomaticSleepConfig();
     std::uint64_t now = 0;
-    if (!config.enabled || !GetRtcService().GetUnixTimeSeconds(&now) || IsAutomaticSleepBusy()) return;
-    if (g_last_activity_epoch_seconds == 0 || now < g_last_activity_epoch_seconds + config.idle_timeout_minutes * 60ULL) return;
+    if (!config.enabled || !GetRtcService().GetUnixTimeSeconds(&now) || IsAutomaticSleepBusy()) {
+        vTaskDelete(nullptr);
+        return;
+    }
+    if (g_last_activity_epoch_seconds == 0 || now < g_last_activity_epoch_seconds + config.idle_timeout_seconds) {
+        vTaskDelete(nullptr);
+        return;
+    }
     const std::uint64_t deadline = config.wake_for_playback ? ActivePlaybackDeadlineEpoch() : 0;
-    if (deadline != 0 && deadline <= now) return;
+    if (deadline != 0 && deadline <= now) {
+        vTaskDelete(nullptr);
+        return;
+    }
     const std::uint64_t remaining = deadline == 0 ? 0 : deadline - now;
     // PCF85063 timer supports at most 255 minutes. If a later playback cannot
     // be armed exactly, remain awake rather than losing its saved schedule.
-    if (remaining > 255ULL * 60ULL) return;
+    if (remaining > 255ULL * 60ULL) {
+        vTaskDelete(nullptr);
+        return;
+    }
+    // PCF85063 can count at most 255 seconds in its seconds mode.  For a
+    // longer non-minute-aligned deadline, wake early on the last full minute;
+    // the persisted playback deadline makes the next boot sleep the remainder
+    // without refreshing the display early.
+    const std::uint32_t wake_delay = remaining > 255 && remaining % 60 != 0
+        ? static_cast<std::uint32_t>((remaining / 60) * 60)
+        : static_cast<std::uint32_t>(remaining);
     esp_err_t result = deadline == 0 ? ConfigureWakeSources(false)
-                                      : GetRtcService().ArmWakeAfterSeconds(static_cast<std::uint32_t>(remaining));
+                                      : GetRtcService().ArmWakeAfterSeconds(wake_delay);
     if (result == ESP_OK && deadline != 0) result = ConfigureWakeSources(true);
     if (result != ESP_OK) {
         if (deadline != 0) (void)GetRtcService().DisarmWakeTimer();
+        ESP_LOGW(kTag, "Automatic sleep wake setup failed: %s", esp_err_to_name(result));
         GetDeviceLogService().Add(DeviceLogSeverity::kWarning, "power", "automatic_sleep_setup_failed",
                                   "Global automatic sleep stayed awake because wake setup failed");
+        RecordAutomaticSleepActivity();
+        vTaskDelete(nullptr);
         return;
     }
     GetDeviceLogService().Add(DeviceLogSeverity::kInfo, "power", "automatic_sleep_entering",
@@ -278,7 +333,7 @@ void AutomaticSleepWorker(void*) {
                 g_last_activity_epoch_seconds = now;
                 PersistActivityEpoch(now);
             }
-            if (now >= g_last_activity_epoch_seconds + config.idle_timeout_minutes * 60ULL && !IsAutomaticSleepBusy()) {
+            if (now >= g_last_activity_epoch_seconds + config.idle_timeout_seconds && !IsAutomaticSleepBusy()) {
                 g_automatic_sleep_pending = true;
                 if (xTaskCreate(EnterAutomaticSleepTask, "auto_sleep", 4096, nullptr, 3, nullptr) != pdPASS) {
                     g_automatic_sleep_pending = false;
@@ -342,8 +397,9 @@ AutomaticSleepStatus GetAutomaticSleepStatus() {
     status.rtc_valid = GetRtcService().GetUnixTimeSeconds(&now);
     status.last_activity_epoch_seconds = g_last_activity_epoch_seconds;
     status.idle_sleep_at_epoch_seconds = g_last_activity_epoch_seconds == 0 ? 0
-        : g_last_activity_epoch_seconds + config.idle_timeout_minutes * 60ULL;
+        : g_last_activity_epoch_seconds + config.idle_timeout_seconds;
     status.next_play_at_epoch_seconds = ActivePlaybackDeadlineEpoch();
+    status.wake_reason = WakeReasonName();
     status.busy = IsAutomaticSleepBusy();
     if (!status.enabled) status.state = "disabled";
     else if (!status.rtc_valid) status.state = "rtc_unavailable";
@@ -354,8 +410,9 @@ AutomaticSleepStatus GetAutomaticSleepStatus() {
     return status;
 }
 
-bool IsAllowedAutomaticSleepTimeout(std::uint8_t minutes) {
-    return minutes == 1 || minutes == 2 || minutes == 5 || minutes == 10 || minutes == 15 || minutes == 30 || minutes == 60;
+bool IsAllowedAutomaticSleepTimeout(std::uint32_t seconds) {
+    return seconds == 10 || seconds == 60 || seconds == 120 || seconds == 300 ||
+           seconds == 600 || seconds == 900 || seconds == 1800 || seconds == 3600;
 }
 
 AutomaticSleepConfig GetAutomaticSleepConfig() {
@@ -363,12 +420,12 @@ AutomaticSleepConfig GetAutomaticSleepConfig() {
 }
 
 esp_err_t UpdateAutomaticSleepConfig(const AutomaticSleepConfig& config) {
-    if (!IsAllowedAutomaticSleepTimeout(config.idle_timeout_minutes)) return ESP_ERR_INVALID_ARG;
+    if (!IsAllowedAutomaticSleepTimeout(config.idle_timeout_seconds)) return ESP_ERR_INVALID_ARG;
     nvs_handle_t handle;
     esp_err_t result = nvs_open(kSleepConfigNamespace, NVS_READWRITE, &handle);
     if (result != ESP_OK) return result;
     result = nvs_set_u8(handle, kSleepEnabledKey, config.enabled ? 1 : 0);
-    if (result == ESP_OK) result = nvs_set_u8(handle, kSleepTimeoutKey, config.idle_timeout_minutes);
+    if (result == ESP_OK) result = nvs_set_u32(handle, kSleepTimeoutSecondsKey, config.idle_timeout_seconds);
     if (result == ESP_OK) result = nvs_set_u8(handle, kSleepPlaybackKey, config.wake_for_playback ? 1 : 0);
     if (result == ESP_OK) result = nvs_commit(handle);
     nvs_close(handle);

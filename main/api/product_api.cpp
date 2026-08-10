@@ -534,7 +534,8 @@ esp_err_t UpdateBatteryDisplayHandler(httpd_req_t* req) {
 void AppendAutomaticSleepConfigJson(std::string* body) {
     const auto config = GetAutomaticSleepConfig();
     body->append("{\"enabled\":").append(config.enabled ? "true" : "false")
-        .append(",\"idle_timeout_minutes\":").append(std::to_string(config.idle_timeout_minutes))
+        .append(",\"idle_timeout_seconds\":").append(std::to_string(config.idle_timeout_seconds))
+        .append(",\"idle_timeout_minutes\":").append(std::to_string(config.idle_timeout_seconds / 60))
         .append(",\"wake_for_playback\":").append(config.wake_for_playback ? "true" : "false")
         .append("}");
 }
@@ -556,19 +557,24 @@ esp_err_t GetAutomaticSleepStatusHandler(httpd_req_t* req) {
     body.append(",\"last_activity_at_epoch_ms\":").append(std::to_string(status.last_activity_epoch_seconds * 1000ULL));
     body.append(",\"idle_sleep_at_epoch_ms\":").append(std::to_string(status.idle_sleep_at_epoch_seconds * 1000ULL));
     body.append(",\"next_play_at_epoch_ms\":").append(std::to_string(status.next_play_at_epoch_seconds * 1000ULL));
+    body.append(",\"wake_reason\":"); AppendJsonString(&body, status.wake_reason);
     body.append("}}");
     return SendJson(req, body.c_str());
 }
 
 esp_err_t UpdateAutomaticSleepConfigHandler(httpd_req_t* req) {
     JsonDocument input;
-    if (!ReadBoundedJson(req, &input, 128) || input["enabled"].isNull() ||
-        input["idle_timeout_minutes"].isNull() || input["wake_for_playback"].isNull()) {
+    if (!ReadBoundedJson(req, &input, 160) || input["enabled"].isNull() ||
+        (input["idle_timeout_seconds"].isNull() && input["idle_timeout_minutes"].isNull()) ||
+        input["wake_for_playback"].isNull()) {
         return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
     }
+    const std::uint32_t idle_timeout_seconds = input["idle_timeout_seconds"].isNull()
+        ? static_cast<std::uint32_t>(input["idle_timeout_minutes"] | 0) * 60
+        : static_cast<std::uint32_t>(input["idle_timeout_seconds"] | 0);
     const AutomaticSleepConfig config{
         .enabled = input["enabled"].as<bool>(),
-        .idle_timeout_minutes = static_cast<std::uint8_t>(input["idle_timeout_minutes"] | 0),
+        .idle_timeout_seconds = idle_timeout_seconds,
         .wake_for_playback = input["wake_for_playback"].as<bool>(),
     };
     const esp_err_t result = UpdateAutomaticSleepConfig(config);

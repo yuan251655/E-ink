@@ -16,13 +16,13 @@ esp_err_t InitializeButtonSleepService();
 // passed hardware validation.
 struct AutomaticSleepConfig {
     bool enabled = false;
-    std::uint8_t idle_timeout_minutes = 15;
+    std::uint32_t idle_timeout_seconds = 15 * 60;
     bool wake_for_playback = true;
 };
 
 AutomaticSleepConfig GetAutomaticSleepConfig();
 esp_err_t UpdateAutomaticSleepConfig(const AutomaticSleepConfig& config);
-bool IsAllowedAutomaticSleepTimeout(std::uint8_t minutes);
+bool IsAllowedAutomaticSleepTimeout(std::uint32_t seconds);
 
 // Global low-power policy. Playback modules expose their own next deadline;
 // this service only observes it and never mutates playback mode, order, or
@@ -38,6 +38,7 @@ struct AutomaticSleepStatus {
     std::uint64_t last_activity_epoch_seconds = 0;
     std::uint64_t idle_sleep_at_epoch_seconds = 0;
     std::uint64_t next_play_at_epoch_seconds = 0;
+    std::string wake_reason;
     std::string state;
 };
 
