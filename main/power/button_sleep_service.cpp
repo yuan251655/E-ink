@@ -321,6 +321,11 @@ void EnterAutomaticSleepTask(void*) {
     GetDeviceLogService().Add(DeviceLogSeverity::kInfo, "power", "automatic_sleep_entering",
                               deadline == 0 ? "Idle sleep entered; KEY wakes" : "Idle sleep entered; RTC preserves playback deadline");
     vTaskDelay(pdMS_TO_TICKS(120));
+    if (!GetAutomaticSleepConfig().enabled) {
+        if (deadline != 0) (void)GetRtcService().DisarmWakeTimer();
+        vTaskDelete(nullptr);
+        return;
+    }
     esp_deep_sleep_start();
 }
 
