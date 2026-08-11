@@ -464,6 +464,7 @@ void McpServer::ReplyError(int id, const std::string& message) {
 void McpServer::GetToolsList(int id, const std::string& cursor, bool list_user_only_tools) {
     const int max_payload_size = 8000;
     std::string json = "{\"tools\":[";
+    bool birthday_easter_egg_listed = false;
     
     bool found_cursor = cursor.empty();
     auto it = tools_.begin();
@@ -499,6 +500,9 @@ void McpServer::GetToolsList(int id, const std::string& cursor, bool list_user_o
         }
         
         json += tool_json;
+        if ((*it)->name() == "self.photo_frame.play_birthday_easter_egg") {
+            birthday_easter_egg_listed = true;
+        }
         ++it;
     }
     
@@ -518,6 +522,9 @@ void McpServer::GetToolsList(int id, const std::string& cursor, bool list_user_o
     } else {
         json += "],\"nextCursor\":\"" + next_cursor + "\"}";
     }
+    ESP_LOGI(TAG, "tools/list response: birthday_easter_egg=%s bytes=%u next=%s",
+             birthday_easter_egg_listed ? "yes" : "no", static_cast<unsigned>(json.size()),
+             next_cursor.empty() ? "none" : next_cursor.c_str());
     
     ReplyResult(id, json);
 }

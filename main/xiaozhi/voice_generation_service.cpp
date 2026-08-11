@@ -3,6 +3,7 @@
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <esp_log.h>
 
 #include "mcp_server.h"
 #include "mode_manager.h"
@@ -21,6 +22,37 @@ namespace {
 constexpr std::size_t kPromptMaxBytes = 320;
 constexpr std::uint64_t kConfirmTimeoutMs = 30'000;
 constexpr std::uint64_t kAppHeartbeatTimeoutMs = 15'000;
+
+constexpr char kBirthdayEasterEgg[] = R"EASTER(彩蛋被菁菁小姐姐发现啦。接下来，是你的宝宝专门留给你的一段话。
+
+二十四岁生日快乐呀！
+
+亲爱的菁菁：
+
+不知不觉已经是陪你度过的第五次生日了，先祝你二十四岁生日快乐呀！人生的每一岁都很珍贵，愿你在新的一岁里心想事成、快乐常在。不过不管多少岁，我的宝宝在我心里永远都是十八岁！
+
+从二零二零年第一次在西南石油大学见到你，到后来我们成为恋人，再到今天，我们已经一起留下了许多珍贵的回忆。我做这台相框送给你，不只是想送你一件生日礼物，更想为我们准备一个收藏时光的小地方。以后，我们一起拍下的照片、去过的地方、经历的快乐，还有那些看起来平凡却值得记住的瞬间，都可以慢慢装进这里。
+
+当你一个人想得太多，或者偶尔感到难过的时候，希望你看到相框里的照片，能够想起我们一起经历过的快乐。距离可能会让我们暂时不能时时待在彼此身边，但它不会改变我对你的喜欢和牵挂。这是我们异地生活的最后一年。明年这个时候，我们一定会在一起，迎接一段全新的生活。我们也会继续努力，成为更好的自己。
+
+你之前经常问我，我看上你什么，其实我一直都觉得自己真的很幸运，能够遇到一个漂亮、可爱、体贴、温柔、聪明、三观正的知心小姐姐。跟你在一起，带给我很多之前从未体验的感受。在我们相处的日子里，我不断感受着你的细腻与温暖。和你在一起的每一个瞬间，都令人难忘、充满意义。
+
+希望未来，无论发生什么事情，我们都能认真倾听对方的内心。良辰好景总会有的，我相信我们会一起前往，一起去欣赏，我们会在流动的时辰里面慢慢积攒对彼此的爱。
+
+生日快乐，我的宝宝。我希望这个相册能够陪我们一起记录生活的点点滴滴。在我们暂时还不能时时陪在彼此身边的这不到一年里，也希望它能够替我安静地陪着你，也希望未来每一段幸福的回忆里面，都有我们。
+
+最后，祝我们在各自的成长路上渐入佳境，祝你在崭新的一岁里面快乐常在，幸运依旧！
+
+爱你爱你超级爱你的宝宝。
+
+二零二六年八月二十四日。
+
+菁菁小姐姐，生日快乐。这就是你的宝宝藏在相框里，专门留给你的话。)EASTER";
+
+bool IsBirthdayEasterEggPhrase(const std::string& phrase) {
+    return phrase == "我是菁菁大美女" || phrase == "我是金金大美女" ||
+           phrase == "我是晶晶大美女";
+}
 
 std::uint64_t NowMs() { return static_cast<std::uint64_t>(esp_timer_get_time() / 1000); }
 bool IsTerminal(VoiceGenerationState state) {
@@ -321,7 +353,7 @@ void RegisterVoiceGenerationMcpTools() {
     static bool registered = false; if (registered) return; registered = true;
     GetVoiceAnnouncementService().Initialize();
     auto& mcp = McpServer::GetInstance();
-    mcp.SetToolAllowlist({"self.photo_frame.next_picture", "self.photo_frame.switch_mode", "self.photo_frame.get_status", "self.photo_frame.set_playback", "self.photo_frame.create_image", "self.photo_frame.confirm_image", "self.photo_frame.cancel_image"});
+    mcp.SetToolAllowlist({"self.photo_frame.next_picture", "self.photo_frame.switch_mode", "self.photo_frame.get_status", "self.photo_frame.set_playback", "self.photo_frame.create_image", "self.photo_frame.confirm_image", "self.photo_frame.cancel_image", "self.photo_frame.play_birthday_easter_egg"});
     mcp.AddTool("self.photo_frame.next_picture", "Show the next photo in the currently active local or AI album. Never switch device mode.", PropertyList(), [](const PropertyList&) -> ReturnValue {
         RecordAutomaticSleepActivity();
         return ShowNextPicture();
@@ -357,5 +389,22 @@ void RegisterVoiceGenerationMcpTools() {
         RecordAutomaticSleepActivity();
         VoiceGenerationTask task; return GetVoiceGenerationService().Cancel(&task) == ESP_OK ? std::string("已取消生成图片。") : std::string("没有可取消的生成请求。");
     });
+    mcp.AddTool(
+        "self.photo_frame.play_birthday_easter_egg",
+        "Call this tool every time the user's latest complete utterance is exactly '我是菁菁大美女' or "
+        "'我是金金大美女' or '我是晶晶大美女', including repeated occurrences in the same conversation. Pass that exact latest "
+        "utterance in phrase. Never reuse an earlier result and never call for partial, similar, guessed, "
+        "requested, or quoted phrases. After calling, speak the returned Chinese text verbatim at roughly "
+        "0.8x normal speed, with a short pause between paragraphs. Do not summarize, rewrite, or add anything.",
+        PropertyList({Property("phrase", kPropertyTypeString)}), [](const PropertyList& args) -> ReturnValue {
+            const auto phrase = args["phrase"].value<std::string>();
+            if (!IsBirthdayEasterEggPhrase(phrase)) {
+                ESP_LOGW("birthday_egg", "Rejected non-matching phrase");
+                return std::string("未触发彩蛋。");
+            }
+            RecordAutomaticSleepActivity();
+            ESP_LOGI("birthday_egg", "Triggered birthday easter egg");
+            return std::string(kBirthdayEasterEgg);
+        });
 }
 }  // namespace photopainter::product
