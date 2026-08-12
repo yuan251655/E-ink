@@ -154,6 +154,7 @@ void ePaperPort::EPD_Sendbuffera(uint8_t *Data, int len) {
 bool ePaperPort::EPD_TurnOnDisplay(uint32_t timeout_ms) {
 
     EPD_SendCommand(0x04); // POWER_ON
+    vTaskDelay(pdMS_TO_TICKS(100));
     if (!EPD_LoopBusy(timeout_ms)) return false;
 
     // Second setting
@@ -165,10 +166,12 @@ bool ePaperPort::EPD_TurnOnDisplay(uint32_t timeout_ms) {
 
     EPD_SendCommand(0x12); // DISPLAY_REFRESH
     EPD_SendData(0x00);
+    vTaskDelay(pdMS_TO_TICKS(100));
     if (!EPD_LoopBusy(timeout_ms)) return false;
 
     EPD_SendCommand(0x02); // POWER_OFF
     EPD_SendData(0X00);
+    vTaskDelay(pdMS_TO_TICKS(100));
     return EPD_LoopBusy(timeout_ms);
 }
 

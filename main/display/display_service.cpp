@@ -8,6 +8,9 @@
 #include "mode_cover_assets.h"
 #include "mode_manager.h"
 #include "button_sleep_service.h"
+#include "dashboard_data_service.h"
+#include "dashboard_renderer.h"
+#include "dashboard_weather_service.h"
 #include "power_service.h"
 #include "storage_service.h"
 
@@ -105,6 +108,28 @@ esp_err_t DisplayService::SubmitModeCover(Feature feature, const JobId& job_id, 
     xSemaphoreGive(state_mutex_);
     return xQueueOverwrite(queue_, &item) == pdPASS ? ESP_OK : ESP_FAIL;
 }
+esp_err_t DisplayService::SubmitDashboard(const JobId& job_id, JobService* jobs) {
+    if (!queue_ || !state_mutex_ || !jobs || job_id.empty() || job_id.size() >= 65) return ESP_ERR_INVALID_ARG;
+    const auto mode = GetModeManager().GetSnapshot();
+    if (mode.state != ModeSnapshot::State::kIdle || mode.active_feature != Feature::kInfoDashboard) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(state_mutex_, portMAX_DELAY);
+    if (snapshot_.state == DisplayState::kQueued || snapshot_.state == DisplayState::kLoading ||
+        snapshot_.state == DisplayState::kRefreshing || snapshot_.state == DisplayState::kFinalizing) {
+        xSemaphoreGive(state_mutex_);
+        return ESP_ERR_INVALID_STATE;
+    }
+    WorkItem item{};
+    item.kind = WorkKind::kDashboard;
+    item.feature = Feature::kInfoDashboard;
+    std::strncpy(item.media_id, "dashboard-latest", sizeof(item.media_id) - 1);
+    std::strncpy(item.job_id, job_id.c_str(), sizeof(item.job_id) - 1);
+    jobs_ = jobs;
+    snapshot_.state = DisplayState::kQueued;
+    snapshot_.queued_target_media_id = "dashboard-latest";
+    snapshot_.active_job_id = job_id;
+    xSemaphoreGive(state_mutex_);
+    return xQueueOverwrite(queue_, &item) == pdPASS ? ESP_OK : ESP_FAIL;
+}
 DisplaySnapshot DisplayService::GetSnapshot() const {
     DisplaySnapshot result;
     if (!state_mutex_) return result;
@@ -121,6 +146,7 @@ void DisplayService::WorkerLoop() {
         const MediaId media_id(item.media_id); const JobId job_id(item.job_id);
         xSemaphoreTake(state_mutex_, portMAX_DELAY); snapshot_.state = DisplayState::kLoading; xSemaphoreGive(state_mutex_);
         const bool mode_cover = item.kind == WorkKind::kModeCover;
+        const bool dashboard = item.kind == WorkKind::kDashboard;
         if (mode_cover) {
             GetDeviceLogService().Add(DeviceLogSeverity::kInfo, "display", "mode_cover_loading",
                                       "Mode cover is being prepared for refresh");
@@ -129,7 +155,7 @@ void DisplayService::WorkerLoop() {
         ModeCoverAsset asset;
         const esp_err_t asset_result = mode_cover ? GetModeCoverAsset(item.feature, &asset) : ESP_OK;
         MediaItem media;
-        const bool media_valid = mode_cover ||
+        const bool media_valid = mode_cover || dashboard ||
             (library_->Find(media_id, &media) && media.feature == item.feature && media.category == item.category &&
              library_->ValidateFrameForDisplay(media_id) == ESP_OK);
         if (!media_valid || (mode_cover && asset_result != ESP_OK) ||
@@ -150,8 +176,15 @@ void DisplayService::WorkerLoop() {
         display_->EPD_Init();
         esp_err_t result = ESP_OK;
         if (mode_cover) std::memcpy(display_->EPD_GetIMGBuffer(), asset.data, asset.size);
-        else result = storage_->ReadCommittedFile(media.storage_relative_directory + "/image.bin",
-                                                  display_->EPD_GetIMGBuffer(), kDisplayFrameBytes);
+        else if (dashboard) {
+            result = RenderDashboardFrame(display_, GetDashboardDataService().GetSnapshot(),
+                                          GetDashboardWeatherService().GetSnapshot());
+            if (result == ESP_OK) {
+                result = storage_->WriteStateBlobAtomic("dashboard_latest.bin", display_->EPD_GetIMGBuffer(),
+                                                        kDisplayFrameBytes);
+            }
+        } else result = storage_->ReadCommittedFile(media.storage_relative_directory + "/image.bin",
+                                                    display_->EPD_GetIMGBuffer(), kDisplayFrameBytes);
         bool refresh_indicator_active = false;
         if (result == ESP_OK) {
             const PowerSnapshot power = GetPowerService().GetSnapshot();
@@ -190,6 +223,10 @@ void DisplayService::WorkerLoop() {
             snapshot_.last_error_code.clear();
             xSemaphoreGive(state_mutex_);
             if (mode_cover) GetModeManager().CompleteSwitch(job_id, item.feature, asset.system_asset_id);
+            else if (dashboard) {
+                GetModeManager().RecordDisplayedMedia(Feature::kInfoDashboard, MediaCategory::kDashboard, media_id);
+                if (jobs_) (void)jobs_->CompleteSuccess(job_id, media_id);
+            }
             else {
                 GetModeManager().RecordDisplayedMedia(media.feature, media.category, media_id);
                 if (jobs_) (void)jobs_->CompleteSuccess(job_id, media_id);

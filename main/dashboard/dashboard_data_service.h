@@ -5,6 +5,8 @@
 #include <vector>
 
 #include "esp_err.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 namespace photopainter::product {
 
@@ -22,8 +24,13 @@ struct DashboardDataSnapshot {
     std::string layout_id = "weather_memo_todo";
     std::string timezone = "Asia/Shanghai";
     std::string city_name;
+    bool has_coordinates = false;
+    double latitude = 0.0;
+    double longitude = 0.0;
     std::string memo;
     std::vector<DashboardTodoState> todos;
+    bool auto_refresh_enabled = false;
+    std::uint32_t auto_refresh_interval_seconds = 3 * 60 * 60;
 };
 
 class DashboardDataService {
@@ -40,6 +47,7 @@ private:
 
     StorageService* storage_ = nullptr;
     DashboardDataSnapshot snapshot_;
+    mutable SemaphoreHandle_t mutex_ = nullptr;
 };
 
 DashboardDataService& GetDashboardDataService();

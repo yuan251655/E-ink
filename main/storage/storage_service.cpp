@@ -570,6 +570,34 @@ esp_err_t StorageService::WriteStateTextAtomic(const std::string& name, const st
     return ESP_OK;
 }
 
+esp_err_t StorageService::WriteStateBlobAtomic(const std::string& name, const void* data, std::size_t bytes) {
+    if (!IsSafeStateName(name) || data == nullptr || bytes == 0 || bytes > kDisplayFrameBytes) return ESP_ERR_INVALID_ARG;
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    const esp_err_t ready = EnsureReadyLocked();
+    if (ready != ESP_OK || !active_transaction_id_.empty()) { xSemaphoreGive(mutex_); return ready == ESP_OK ? ESP_ERR_INVALID_STATE : ready; }
+    const std::string target = mount_point_ + "/state/" + name;
+    const std::string temporary = target + ".tmp";
+    const std::string backup = target + ".bak";
+    FILE* file = fopen(temporary.c_str(), "wb");
+    if (file == nullptr) { SetErrorLocked("storage_write_failed"); xSemaphoreGive(mutex_); return ESP_FAIL; }
+    const std::size_t written = fwrite(data, 1, bytes, file);
+    const int flushed = fflush(file);
+    fclose(file);
+    if (written != bytes || flushed != 0) { SetErrorLocked("storage_write_failed"); xSemaphoreGive(mutex_); return ESP_FAIL; }
+    (void)unlink(backup.c_str());
+    const bool had_target = access(target.c_str(), F_OK) == 0;
+    if ((had_target && rename(target.c_str(), backup.c_str()) != 0) || rename(temporary.c_str(), target.c_str()) != 0) {
+        if (had_target && access(target.c_str(), F_OK) != 0) (void)rename(backup.c_str(), target.c_str());
+        SetErrorLocked("storage_write_failed");
+        xSemaphoreGive(mutex_);
+        return ESP_FAIL;
+    }
+    (void)unlink(backup.c_str());
+    snapshot_.revision++;
+    xSemaphoreGive(mutex_);
+    return ESP_OK;
+}
+
 esp_err_t StorageService::GetCommittedFileSize(const std::string& relative_path,
                                                std::uint64_t* output_bytes) {
     if (mutex_ == nullptr || output_bytes == nullptr || !IsSafeRelativePath(relative_path) ||

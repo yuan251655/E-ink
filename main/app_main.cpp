@@ -18,6 +18,8 @@
 #include "user_app.h"
 #include "storage_runtime.h"
 #include "dashboard_data_service.h"
+#include "dashboard_weather_service.h"
+#include "dashboard_auto_refresh_service.h"
 #include "media_library_runtime.h"
 #include "local_album_playback_runtime.h"
 #include "ai_album_playback_runtime.h"
@@ -194,10 +196,22 @@ extern "C" void app_main(void) {
         }
         ret = photopainter::product::InitializeAiAlbumPlaybackService();
         if (ret != ESP_OK) ESP_LOGW(TAG, "AI album playback unavailable; continuing without auto playback");
+    }
+    ServerPort_StartProductLocalApi(SDPort);
+    ret = photopainter::product::InitializeDashboardWeatherService();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Dashboard weather service unavailable: %s", esp_err_to_name(ret));
+    }
+    if (product_display_ready && ret == ESP_OK) {
+        ret = photopainter::product::InitializeDashboardAutoRefreshService();
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Dashboard auto refresh unavailable: %s", esp_err_to_name(ret));
+        }
+    }
+    if (product_display_ready) {
         ret = photopainter::product::InitializeAutomaticSleepService();
         if (ret != ESP_OK) ESP_LOGW(TAG, "Automatic sleep policy unavailable: %s", esp_err_to_name(ret));
     }
-    ServerPort_StartProductLocalApi(SDPort);
     photopainter::product::InitializeXiaozhiRuntime();
     photopainter::product::ResumeRtcWakeVerification();
 }

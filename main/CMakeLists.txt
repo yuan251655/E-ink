@@ -35,6 +35,7 @@ set(FONT_AWESOME_30_4 font_awesome_30_4)
 
 # Define source files
 set(SOURCES "xiaozhi/audio/audio_codec.cc"
+            "audio/audio_config_service.cpp"
             "xiaozhi/audio/audio_service.cc"
             "xiaozhi/audio/codecs/no_audio_codec.cc"
             "xiaozhi/audio/codecs/box_audio_codec.cc"
@@ -95,6 +96,9 @@ set(SOURCES "xiaozhi/audio/audio_codec.cc"
             "storage/storage_service.cpp"
             "storage/storage_runtime.cpp"
             "dashboard/dashboard_data_service.cpp"
+            "dashboard/dashboard_weather_service.cpp"
+            "dashboard/dashboard_renderer.cpp"
+            "dashboard/dashboard_auto_refresh_service.cpp"
             "user_app_bsp/user_app.cpp"
             "user_app_bsp/mode_manager.cpp"
             "user_app_bsp/mode_cover_assets.cpp"
@@ -107,7 +111,7 @@ set(SOURCES "xiaozhi/audio/audio_codec.cc"
 
 set(INCLUDE_DIRS "." "xiaozhi" "xiaozhi/ui" "xiaozhi/ui/lvgl_display"
                  "xiaozhi/audio" "xiaozhi/protocols" "xiaozhi/official" "system" "network"
-                 "api" "album" "storage" "dashboard" "display" "user_app_bsp"
+                  "api" "album" "audio" "storage" "dashboard" "display" "user_app_bsp"
                  "input" "led" "power" "time" "network" "sensors" "board" "common")
 
 # Add board common files

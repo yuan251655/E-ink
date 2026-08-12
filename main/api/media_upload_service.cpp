@@ -25,7 +25,10 @@ constexpr std::size_t kMaxMetadataBytes = 4U * 1024U;
 constexpr std::size_t kMaxParts = 2;
 constexpr std::size_t kReadBufferBytes = 2048;
 constexpr std::size_t kHeaderLineBytes = 512;
-constexpr std::size_t kWriteBufferBytes = 16U * 1024U;
+// Keep enough internal SRAM for Wi-Fi/audio/weather while a slow phone upload
+// is back-pressured by TF writes. Four KiB is still large enough for efficient
+// sequential FatFs writes on the fixed 192 KiB frame.
+constexpr std::size_t kWriteBufferBytes = 4U * 1024U;
 constexpr char kTag[] = "MediaUpload";
 
 struct Metadata {
@@ -95,7 +98,9 @@ public:
     }
 
 private:
-    static constexpr std::uint8_t kMaximumReceiveTimeoutRetries = 10;
+    // A disappeared phone must release the single HTTP server task promptly;
+    // two 30-second receive windows are sufficient for a transient Wi-Fi gap.
+    static constexpr std::uint8_t kMaximumReceiveTimeoutRetries = 2;
     httpd_req_t* request_ = nullptr;
     int remaining_ = 0;
     char buffer_[kReadBufferBytes]{};
@@ -325,6 +330,7 @@ MediaUploadResult ReceiveBinOnlyMultipart(httpd_req_t* request,
         result.error = ESP_ERR_INVALID_SIZE;
         return result;
     }
+    ESP_LOGI(kTag, "request started bytes=%d", request->content_len);
     std::string boundary;
     if (!ExtractBoundary(request, &boundary)) { result.code = "invalid_request"; result.error = ESP_ERR_INVALID_ARG; return result; }
     RequestReader reader(request);
@@ -404,6 +410,7 @@ MediaUploadResult ReceiveBinOnlyMultipart(httpd_req_t* request,
                 ESP_LOGE(kTag, "frame rejected recv=%d final=%d hash=%d bytes=%llu/%u finalize=%s write=%s", received, final_boundary, finished && HexDigest(digest) == metadata.frame_sha256, static_cast<unsigned long long>(bytes), static_cast<unsigned>(kDisplayFrameBytes), esp_err_to_name(finalized), esp_err_to_name(write_error));
                 failure_code = write_error == ESP_OK ? ((bytes == kDisplayFrameBytes && finished && HexDigest(digest) != metadata.frame_sha256) ? "checksum_mismatch" : "media_incomplete") : "storage_write_failed"; failure = write_error == ESP_OK ? ESP_ERR_INVALID_SIZE : write_error; break; }
             if (!reader.FinishAfterFinalBoundary()) { failure = ESP_ERR_INVALID_ARG; break; }
+            ESP_LOGI(kTag, "frame received bytes=%llu", static_cast<unsigned long long>(bytes));
             frame_received = true;
             break;
         } else {

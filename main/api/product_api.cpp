@@ -15,6 +15,8 @@
 #include "display_service.h"
 #include "device_log_service.h"
 #include "dashboard_data_service.h"
+#include "dashboard_weather_service.h"
+#include "dashboard_auto_refresh_service.h"
 #include "job_service.h"
 #include "job_runtime.h"
 #include "indicator_service.h"
@@ -29,6 +31,8 @@
 #include "product_network.h"
 #include "power_service.h"
 #include "button_sleep_service.h"
+#include "audio_config_service.h"
+#include "application.h"
 #include "rtc_service.h"
 #include "storage_runtime.h"
 #include "storage_service.h"
@@ -587,6 +591,59 @@ esp_err_t UpdateAutomaticSleepConfigHandler(httpd_req_t* req) {
     return GetAutomaticSleepConfigHandler(req);
 }
 
+void AppendAudioConfigJson(std::string* body, const AudioConfigSnapshot& audio) {
+    body->append("{\"master_volume\":").append(std::to_string(audio.master_volume))
+        .append(",\"muted\":").append(audio.muted ? "true" : "false")
+        .append(",\"output_enabled\":").append(audio.output_enabled ? "true" : "false")
+        .append(",\"playing\":").append(audio.playing ? "true" : "false")
+        .append(",\"source\":");
+    AppendJsonString(body, audio.source);
+    body->append("}");
+}
+
+esp_err_t AudioStatusHandler(httpd_req_t* req) {
+    std::string body = "{\"ok\":true,\"code\":\"ok\",\"data\":";
+    AppendAudioConfigJson(&body, GetAudioConfigSnapshot());
+    body.append("}");
+    return SendJson(req, body.c_str());
+}
+
+esp_err_t UpdateAudioConfigHandler(httpd_req_t* req) {
+    JsonDocument input;
+    if (!ReadBoundedJson(req, &input, 96) || input["master_volume"].isNull() || input["muted"].isNull()) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    }
+    AudioConfigSnapshot updated;
+    const esp_err_t result = UpdateAudioConfig(input["master_volume"].as<int>(), input["muted"].as<bool>(), &updated);
+    if (result == ESP_ERR_INVALID_ARG) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"invalid_audio_config\"}", "400 Bad Request");
+    }
+    if (result != ESP_OK) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"audio_config_save_failed\"}", "503 Service Unavailable");
+    }
+    std::string body = "{\"ok\":true,\"code\":\"ok\",\"data\":";
+    AppendAudioConfigJson(&body, updated);
+    body.append("}");
+    return SendJson(req, body.c_str());
+}
+
+esp_err_t SpeakerTestHandler(httpd_req_t* req) {
+    if (req == nullptr || req->content_len > 2) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    }
+    const esp_err_t result = StartSpeakerTest();
+    if (result == ESP_ERR_INVALID_STATE) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"audio_muted\"}", "409 Conflict");
+    }
+    if (result == ESP_ERR_TIMEOUT) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"audio_busy\"}", "409 Conflict");
+    }
+    if (result != ESP_OK) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"speaker_test_unavailable\"}", "503 Service Unavailable");
+    }
+    return SendJson(req, "{\"ok\":true,\"code\":\"speaker_test_started\"}");
+}
+
 esp_err_t IndicatorSelfTest(httpd_req_t* req) {
     if (req == nullptr || req->content_len > 2) {
         return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
@@ -1086,7 +1143,12 @@ void AppendDashboardSnapshotJson(std::string* body, const DashboardDataSnapshot&
     body->append("{\"revision\":"); AppendUInt64(body, snapshot.revision);
     body->append(",\"layout_id\":"); AppendJsonString(body, snapshot.layout_id);
     body->append(",\"timezone\":"); AppendJsonString(body, snapshot.timezone);
-    body->append(",\"location\":{\"city_name\":"); AppendJsonString(body, snapshot.city_name); body->append("}");
+    body->append(",\"location\":{\"city_name\":"); AppendJsonString(body, snapshot.city_name);
+    body->append(",\"latitude\":");
+    if (snapshot.has_coordinates) body->append(std::to_string(snapshot.latitude)); else body->append("null");
+    body->append(",\"longitude\":");
+    if (snapshot.has_coordinates) body->append(std::to_string(snapshot.longitude)); else body->append("null");
+    body->append("}");
     body->append(",\"memo\":{\"text\":"); AppendJsonString(body, snapshot.memo); body->append("}");
     body->append(",\"todos\":[");
     for (std::size_t index = 0; index < snapshot.todos.size(); ++index) {
@@ -1097,7 +1159,34 @@ void AppendDashboardSnapshotJson(std::string* body, const DashboardDataSnapshot&
         body->append(",\"completed\":").append(todo.completed ? "true" : "false")
             .append(",\"position\":").append(std::to_string(todo.position)).append("}");
     }
-    body->append("],\"display\":{\"state\":\"stale\",\"rendered_revision\":null,\"refresh_job_id\":null}}");
+    body->append("],\"weather\":");
+    const DashboardWeatherSnapshot weather = GetDashboardWeatherService().GetSnapshot();
+    body->append("{\"revision\":"); AppendUInt64(body, weather.revision);
+    body->append(",\"state\":"); AppendJsonString(body, weather.state);
+    body->append(",\"provider\":"); AppendJsonString(body, weather.provider);
+    body->append(",\"update_interval_seconds\":3600,\"refreshing\":").append(weather.refreshing ? "true" : "false");
+    body->append(",\"last_success_at\":");
+    if (weather.last_success_at == 0) body->append("null"); else AppendUInt64(body, weather.last_success_at);
+    body->append(",\"last_error_code\":");
+    if (weather.last_error_code.empty()) body->append("null"); else AppendJsonString(body, weather.last_error_code);
+    body->append(",\"forecast\":[");
+    if (weather.last_success_at != 0) {
+        for (std::size_t index = 0; index < weather.days.size(); ++index) {
+            if (index != 0) body->push_back(',');
+            const auto& day = weather.days[index];
+            body->append("{\"date\":"); AppendJsonString(body, day.date);
+            body->append(",\"weather_code\":").append(std::to_string(day.weather_code));
+            body->append(",\"temperature_min_c\":").append(std::to_string(day.temperature_min_c));
+            body->append(",\"temperature_max_c\":").append(std::to_string(day.temperature_max_c)).append("}");
+        }
+    }
+    body->append("],\"city_name\":"); AppendJsonString(body, weather.city_name);
+    body->append("},\"auto_refresh\":{\"enabled\":").append(snapshot.auto_refresh_enabled ? "true" : "false");
+    body->append(",\"interval_seconds\":").append(std::to_string(snapshot.auto_refresh_interval_seconds));
+    body->append(",\"next_refresh_at\":");
+    const std::uint64_t next_dashboard_refresh = DashboardAutoRefreshDeadlineEpoch();
+    if (next_dashboard_refresh == 0) body->append("null"); else AppendUInt64(body, next_dashboard_refresh);
+    body->append("},\"display\":{\"state\":\"stale\",\"rendered_revision\":null,\"refresh_job_id\":null}}");
 }
 
 esp_err_t GetDashboard(httpd_req_t* req) {
@@ -1119,8 +1208,31 @@ esp_err_t UpdateDashboard(httpd_req_t* req) {
     if (patch.isNull()) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
     if (!patch["layout_id"].isNull()) candidate.layout_id = patch["layout_id"] | "";
     if (!patch["timezone"].isNull()) candidate.timezone = patch["timezone"] | "";
-    if (!patch["location"].isNull()) candidate.city_name = patch["location"]["city_name"] | "";
+    if (!patch["location"].isNull()) {
+        const JsonObjectConst location = patch["location"].as<JsonObjectConst>();
+        const std::string previous_city = candidate.city_name;
+        candidate.city_name = location["city_name"] | "";
+        const bool has_latitude = !location["latitude"].isNull();
+        const bool has_longitude = !location["longitude"].isNull();
+        if (has_latitude != has_longitude) return SendJson(req, "{\"ok\":false,\"code\":\"invalid_location\"}", "400 Bad Request");
+        if (has_latitude) {
+            candidate.has_coordinates = true;
+            candidate.latitude = location["latitude"].as<double>();
+            candidate.longitude = location["longitude"].as<double>();
+        } else if (candidate.city_name != previous_city) {
+            candidate.has_coordinates = false;
+            candidate.latitude = 0.0;
+            candidate.longitude = 0.0;
+        }
+    }
     if (!patch["memo"].isNull()) candidate.memo = patch["memo"]["text"] | "";
+    if (!patch["auto_refresh"].isNull()) {
+        const JsonObjectConst auto_refresh = patch["auto_refresh"].as<JsonObjectConst>();
+        if (!auto_refresh["enabled"].isNull()) candidate.auto_refresh_enabled = auto_refresh["enabled"] | false;
+        if (!auto_refresh["interval_seconds"].isNull()) {
+            candidate.auto_refresh_interval_seconds = auto_refresh["interval_seconds"] | 0U;
+        }
+    }
     if (!patch["todos"].isNull()) {
         candidate.todos.clear();
         for (JsonObjectConst value : patch["todos"].as<JsonArrayConst>()) {
@@ -1517,6 +1629,9 @@ esp_err_t RegisterProductApi(httpd_handle_t server) {
         {.uri="/api/v1/power/sleep-config", .method=HTTP_GET, .handler=GetAutomaticSleepConfigHandler, .user_ctx=nullptr},
         {.uri="/api/v1/power/sleep-config", .method=HTTP_POST, .handler=UpdateAutomaticSleepConfigHandler, .user_ctx=nullptr},
         {.uri="/api/v1/power/sleep-status", .method=HTTP_GET, .handler=GetAutomaticSleepStatusHandler, .user_ctx=nullptr},
+        {.uri="/api/v1/audio/status", .method=HTTP_GET, .handler=AudioStatusHandler, .user_ctx=nullptr},
+        {.uri="/api/v1/audio/config", .method=HTTP_POST, .handler=UpdateAudioConfigHandler, .user_ctx=nullptr},
+        {.uri="/api/v1/audio/speaker-test", .method=HTTP_POST, .handler=SpeakerTestHandler, .user_ctx=nullptr},
         {.uri="/api/v1/device/led-test", .method=HTTP_POST, .handler=IndicatorSelfTest, .user_ctx=nullptr},
         {.uri="/api/v1/time/status", .method=HTTP_GET, .handler=TimeStatus, .user_ctx=nullptr},
         {.uri="/api/v1/time", .method=HTTP_POST, .handler=SetTime, .user_ctx=nullptr},

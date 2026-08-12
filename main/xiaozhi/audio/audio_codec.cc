@@ -3,6 +3,7 @@
 #include "settings.h"
 
 #include <esp_log.h>
+#include <algorithm>
 #include <cstring>
 #include <driver/i2s_common.h>
 
@@ -28,11 +29,9 @@ bool AudioCodec::InputData(std::vector<int16_t>& data) {
 
 void AudioCodec::Start() {
     Settings settings("audio", false);
-    output_volume_ = settings.GetInt("output_volume", output_volume_);
-    if (output_volume_ <= 0) {
-        ESP_LOGW(TAG, "Output volume value (%d) is too small, setting to default (10)", output_volume_);
-        output_volume_ = 10;
-    }
+    const int master_volume = std::clamp<int>(
+        settings.GetInt("master_volume", settings.GetInt("output_volume", output_volume_)), 1, 100);
+    output_volume_ = settings.GetBool("muted", false) ? 0 : master_volume;
 
     if (tx_handle_ != nullptr) {
         ESP_ERROR_CHECK(i2s_channel_enable(tx_handle_));
@@ -48,11 +47,13 @@ void AudioCodec::Start() {
 }
 
 void AudioCodec::SetOutputVolume(int volume) {
-    output_volume_ = volume;
+    output_volume_ = std::clamp(volume, 0, 100);
     ESP_LOGI(TAG, "Set output volume to %d", output_volume_);
     
     Settings settings("audio", true);
     settings.SetInt("output_volume", output_volume_);
+    if (output_volume_ > 0) settings.SetInt("master_volume", output_volume_);
+    settings.SetBool("muted", output_volume_ == 0);
 }
 
 void AudioCodec::EnableInput(bool enable) {

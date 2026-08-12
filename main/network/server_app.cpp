@@ -289,7 +289,7 @@ static void ServerPort_Start(CustomSDPort *SDPort, bool enable_legacy_upload) {
     // aborts startup and causes a reboot loop before the App can reconnect.
     // Storage status/remount keep two short-lived legacy aliases while App
     // clients migrate to the frozen /api/v1 contract.
-    config.max_uri_handlers = 48;
+    config.max_uri_handlers = 56;
     // The phone App uses a fresh connection for each API call.  Purge a stale
     // keep-alive socket under memory pressure instead of leaving a completed
     // multipart upload to block the next sequential upload.

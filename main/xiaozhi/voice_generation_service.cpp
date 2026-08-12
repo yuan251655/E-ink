@@ -16,6 +16,7 @@
 #include "power_service.h"
 #include "button_sleep_service.h"
 #include "voice_announcement_service.h"
+#include "audio_config_service.h"
 
 namespace photopainter::product {
 namespace {
@@ -144,6 +145,11 @@ std::string GetStatus(const std::string& scope) {
             : std::to_string(config.idle_timeout_seconds / 60) + " 分钟";
         return "自动休眠已开启，未操作 " + timeout + "后休眠，当前状态为" + SleepStateName(status.state) + "。";
     }
+    if (scope == "audio") {
+        const auto audio = GetAudioConfigSnapshot();
+        if (audio.muted) return "相框当前已静音，保留音量为 " + std::to_string(audio.master_volume) + "%。";
+        return "相框当前音量为 " + std::to_string(audio.master_volume) + "%。";
+    }
     if (scope == "voice_service") {
         const auto task = GetVoiceGenerationService().GetSnapshot();
         return std::string("手机语音生图服务") +
@@ -151,6 +157,19 @@ std::string GetStatus(const std::string& scope) {
                "，生成任务状态为" + GenerationStateName(task.state) + "。";
     }
     return "状态范围只支持 summary、power、playback、sleep 或 voice_service。";
+}
+
+std::string SetAudioVolume(int volume) {
+    if (volume < 1 || volume > 100) return "音量只支持 1 到 100。";
+    if (UpdateAudioConfig(volume, false) != ESP_OK) return "音量设置失败，请稍后再试。";
+    return "已将音量调到 " + std::to_string(volume) + "%。";
+}
+
+std::string SetAudioMuted(bool muted) {
+    const auto current = GetAudioConfigSnapshot();
+    if (current.muted == muted) return muted ? "当前已经静音。" : "当前已经取消静音。";
+    if (UpdateAudioConfig(current.master_volume, muted) != ESP_OK) return "静音设置失败，请稍后再试。";
+    return muted ? "已静音。" : "已取消静音，恢复到之前的音量。";
 }
 
 std::string SetPlayback(const std::string& action) {
@@ -353,7 +372,7 @@ void RegisterVoiceGenerationMcpTools() {
     static bool registered = false; if (registered) return; registered = true;
     GetVoiceAnnouncementService().Initialize();
     auto& mcp = McpServer::GetInstance();
-    mcp.SetToolAllowlist({"self.photo_frame.next_picture", "self.photo_frame.switch_mode", "self.photo_frame.get_status", "self.photo_frame.set_playback", "self.photo_frame.set_automatic_sleep", "self.photo_frame.create_image", "self.photo_frame.confirm_image", "self.photo_frame.cancel_image", "self.photo_frame.play_birthday_easter_egg"});
+    mcp.SetToolAllowlist({"self.photo_frame.next_picture", "self.photo_frame.switch_mode", "self.photo_frame.get_status", "self.photo_frame.set_playback", "self.photo_frame.set_automatic_sleep", "self.photo_frame.set_volume", "self.photo_frame.set_mute", "self.photo_frame.create_image", "self.photo_frame.confirm_image", "self.photo_frame.cancel_image", "self.photo_frame.play_birthday_easter_egg"});
     mcp.AddTool("self.photo_frame.next_picture", "Show the next photo in the currently active local or AI album. Never switch device mode.", PropertyList(), [](const PropertyList&) -> ReturnValue {
         RecordAutomaticSleepActivity();
         return ShowNextPicture();
@@ -362,7 +381,7 @@ void RegisterVoiceGenerationMcpTools() {
         RecordAutomaticSleepActivity();
         return SwitchMode(args["target"].value<std::string>());
     });
-    mcp.AddTool("self.photo_frame.get_status", "Read photo-frame status without changing settings or refreshing the screen. scope must be summary, power, playback, sleep, or voice_service.", PropertyList({Property("scope", kPropertyTypeString)}), [](const PropertyList& args) -> ReturnValue {
+    mcp.AddTool("self.photo_frame.get_status", "Read photo-frame status without changing settings or refreshing the screen. scope must be summary, power, playback, sleep, audio, or voice_service.", PropertyList({Property("scope", kPropertyTypeString)}), [](const PropertyList& args) -> ReturnValue {
         RecordAutomaticSleepActivity();
         return GetStatus(args["scope"].value<std::string>());
     });
@@ -383,6 +402,14 @@ void RegisterVoiceGenerationMcpTools() {
         if (enabled) RecordAutomaticSleepActivity();
         return enabled ? std::string("已开启自动休眠，并从现在重新开始空闲计时。")
                        : std::string("已关闭自动休眠。");
+    });
+    mcp.AddTool("self.photo_frame.set_volume", "Set the photo-frame speaker volume to an exact value from 1 to 100. This also cancels mute. Use only when the user explicitly requests a volume value.", PropertyList({Property("volume", kPropertyTypeInteger, 1, 100)}), [](const PropertyList& args) -> ReturnValue {
+        RecordAutomaticSleepActivity();
+        return SetAudioVolume(args["volume"].value<int>());
+    });
+    mcp.AddTool("self.photo_frame.set_mute", "Mute or unmute the photo-frame speaker. Muting preserves the saved volume and unmuting restores it. Use only when the user explicitly requests mute or unmute.", PropertyList({Property("muted", kPropertyTypeBoolean)}), [](const PropertyList& args) -> ReturnValue {
+        RecordAutomaticSleepActivity();
+        return SetAudioMuted(args["muted"].value<bool>());
     });
     mcp.AddTool("self.photo_frame.create_image", "Create one image only while AI album is active. Call this when the user requests image generation; pass the exact Chinese image description. The result asks the user to confirm.", PropertyList({Property("prompt", kPropertyTypeString)}), [](const PropertyList& args) -> ReturnValue {
         RecordAutomaticSleepActivity();

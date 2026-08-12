@@ -84,6 +84,7 @@ public:
     esp_err_t ReadStateText(const std::string& name, std::size_t maximum_bytes,
                             std::string* output);
     esp_err_t WriteStateTextAtomic(const std::string& name, const std::string& content);
+    esp_err_t WriteStateBlobAtomic(const std::string& name, const void* data, std::size_t bytes);
     esp_err_t GetCommittedFileSize(const std::string& relative_path,
                                    std::uint64_t* output_bytes);
     // Enumerates categorized media plus legacy flat media/<id> entries. New

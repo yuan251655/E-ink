@@ -14,6 +14,7 @@
 #include "display.h"
 #include "oled_display.h"
 #include "board.h"
+#include "audio_config_service.h"
 #include "settings.h"
 #include "lvgl_theme.h"
 #include "lvgl_display.h"
@@ -58,9 +59,8 @@ void McpServer::AddCommonTools() {
             Property("volume", kPropertyTypeInteger, 0, 100)
         }), 
         [&board](const PropertyList& properties) -> ReturnValue {
-            auto codec = board.GetAudioCodec();
-            codec->SetOutputVolume(properties["volume"].value<int>());
-            return true;
+            return photopainter::product::UpdateAudioConfig(
+                properties["volume"].value<int>(), false) == ESP_OK;
         });
     
     auto backlight = board.GetBacklight();

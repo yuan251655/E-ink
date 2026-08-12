@@ -1,5 +1,6 @@
 #include "button_sleep_service.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 
@@ -24,6 +25,8 @@
 #include "xiaozhi_runtime.h"
 #include "voice_generation_service.h"
 #include "voice_announcement_service.h"
+#include "audio_config_service.h"
+#include "dashboard_auto_refresh_service.h"
 
 namespace photopainter::product {
 namespace {
@@ -255,6 +258,7 @@ bool IsAutomaticSleepBusy() {
         voice_generation.state != VoiceGenerationState::kCancelled &&
         voice_generation.state != VoiceGenerationState::kExpired) return true;
     if (GetVoiceAnnouncementService().IsBusy()) return true;
+    if (IsProductAudioBusy()) return true;
     const auto ai = GetXiaozhiRuntimeSnapshot();
     if (ai.state == "listening" || ai.state == "speaking") return true;
     return false;
@@ -271,6 +275,7 @@ std::uint64_t ActivePlaybackDeadlineEpoch() {
         const auto playback = GetAiAlbumPlaybackService().GetSnapshot();
         return playback.config.mode == PlaybackMode::kAuto ? playback.next_play_at_epoch_seconds : 0;
     }
+    if (mode.active_feature == Feature::kInfoDashboard) return DashboardAutoRefreshDeadlineEpoch();
     return 0;
 }
 
@@ -293,19 +298,17 @@ void EnterAutomaticSleepTask(void*) {
         return;
     }
     const std::uint64_t remaining = deadline == 0 ? 0 : deadline - now;
-    // PCF85063 timer supports at most 255 minutes. If a later playback cannot
-    // be armed exactly, remain awake rather than losing its saved schedule.
-    if (remaining > 255ULL * 60ULL) {
-        vTaskDelete(nullptr);
-        return;
-    }
-    // PCF85063 can count at most 255 seconds in its seconds mode.  For a
+    // PCF85063 can count at most 255 minutes. Longer dashboard intervals use
+    // safe segmented wakeups; the persisted absolute deadline prevents an
+    // intermediate wake from refreshing the display early.
+    const std::uint64_t rtc_remaining = std::min<std::uint64_t>(remaining, 255ULL * 60ULL);
+    // PCF85063 can count at most 255 seconds in its seconds mode. For a
     // longer non-minute-aligned deadline, wake early on the last full minute;
     // the persisted playback deadline makes the next boot sleep the remainder
     // without refreshing the display early.
-    const std::uint32_t wake_delay = remaining > 255 && remaining % 60 != 0
-        ? static_cast<std::uint32_t>((remaining / 60) * 60)
-        : static_cast<std::uint32_t>(remaining);
+    const std::uint32_t wake_delay = rtc_remaining > 255 && rtc_remaining % 60 != 0
+        ? static_cast<std::uint32_t>((rtc_remaining / 60) * 60)
+        : static_cast<std::uint32_t>(rtc_remaining);
     esp_err_t result = deadline == 0 ? ConfigureWakeSources(false)
                                       : GetRtcService().ArmWakeAfterSeconds(wake_delay);
     if (result == ESP_OK && deadline != 0) result = ConfigureWakeSources(true);
