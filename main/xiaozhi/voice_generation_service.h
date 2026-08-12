@@ -46,5 +46,9 @@ private:
 
 VoiceGenerationService& GetVoiceGenerationService();
 void RegisterVoiceGenerationMcpTools();
+// Returns true when the complete STT utterance is the private birthday
+// phrase. The display request is deterministic; cloud MCP remains responsible
+// for reading the long message aloud.
+bool HandleBirthdayEasterEggStt(const std::string& phrase);
 
 }  // namespace photopainter::product

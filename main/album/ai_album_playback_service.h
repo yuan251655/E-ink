@@ -22,6 +22,7 @@ public:
                            PlaybackOrder order, Revision expected_revision,
                            PlaybackSnapshot* output);
     void NotifyManualDisplaySuccess(const MediaId& media_id);
+    void NotifyTemporarySystemDisplaySuccess();
     esp_err_t RequestNext(bool announce_completion = false);
     void NotifyMediaDeleted(const MediaId& media_id);
     static bool IsAllowedInterval(std::uint32_t seconds);

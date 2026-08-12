@@ -24,10 +24,11 @@ public:
     // The worker reports completion back to ModeManager, which commits the
     // new active feature only after the physical refresh succeeds.
     esp_err_t SubmitModeCover(Feature feature, const JobId& job_id, JobService* jobs);
+    esp_err_t SubmitBirthdayEasterEgg(Feature feature, const JobId& job_id, JobService* jobs);
     esp_err_t SubmitDashboard(const JobId& job_id, JobService* jobs);
     DisplaySnapshot GetSnapshot() const;
 private:
-    enum class WorkKind : std::uint8_t { kMedia, kModeCover, kDashboard };
+    enum class WorkKind : std::uint8_t { kMedia, kModeCover, kDashboard, kBirthdayEasterEgg };
     struct WorkItem {
         WorkKind kind = WorkKind::kMedia;
         Feature feature = Feature::kLocalAlbum;

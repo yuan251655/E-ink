@@ -149,6 +149,17 @@ void LocalAlbumPlaybackService::NotifyManualDisplaySuccess(const MediaId& media_
     xSemaphoreGive(mutex_);
 }
 
+void LocalAlbumPlaybackService::NotifyTemporarySystemDisplaySuccess() {
+    if (mutex_ == nullptr) return;
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    if (snapshot_.config.mode == PlaybackMode::kAuto) {
+        ScheduleNextLocked(snapshot_.config.interval_seconds);
+        ++snapshot_.state_revision;
+        if (PersistLocked() != ESP_OK) snapshot_.last_error_code = "playback_persist_failed";
+    }
+    xSemaphoreGive(mutex_);
+}
+
 esp_err_t LocalAlbumPlaybackService::RequestNext(bool announce_completion) {
     if (mutex_ == nullptr) return ESP_ERR_INVALID_STATE;
     xSemaphoreTake(mutex_, portMAX_DELAY);

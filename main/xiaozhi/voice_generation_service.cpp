@@ -51,8 +51,15 @@ constexpr char kBirthdayEasterEgg[] = R"EASTER(彩蛋被菁菁小姐姐发现啦
 菁菁小姐姐，生日快乐。这就是你的宝宝藏在相框里，专门留给你的话。)EASTER";
 
 bool IsBirthdayEasterEggPhrase(const std::string& phrase) {
-    return phrase == "我是菁菁大美女" || phrase == "我是金金大美女" ||
-           phrase == "我是晶晶大美女";
+    std::string normalized;
+    normalized.reserve(phrase.size());
+    for (const unsigned char value : phrase) {
+        if (value != ' ' && value != '\t' && value != '\r' && value != '\n') normalized.push_back(value);
+    }
+    for (const std::string suffix : {"。", "！", "!", "？", "?", "，", ","}) {
+        if (normalized.ends_with(suffix)) normalized.resize(normalized.size() - suffix.size());
+    }
+    return normalized == "生日快乐";
 }
 
 std::uint64_t NowMs() { return static_cast<std::uint64_t>(esp_timer_get_time() / 1000); }
@@ -93,6 +100,33 @@ const char* GenerationStateName(VoiceGenerationState state) {
         case VoiceGenerationState::kExpired: return "已超时";
     }
     return "未知";
+}
+
+bool RequestBirthdayEasterEggDisplay() {
+    const auto display = GetDisplayService().GetSnapshot();
+    if (display.current_media_id == "birthday_easter_egg") {
+        ESP_LOGI("birthday_egg", "Display already visible; skipped duplicate refresh");
+        return true;
+    }
+    const auto mode = GetModeManager().GetSnapshot();
+    JobSnapshot job;
+    const RequestId request_id = "birthday-egg-" + std::to_string(NowMs());
+    if (GetProductJobService().CreateOrFind(JobKind::kDisplay, request_id,
+                                            "birthday-easter-egg", &job) !=
+        JobRegistrationResult::kCreated) {
+        ESP_LOGW("birthday_egg", "Job admission failed; skipped birthday refresh");
+        return false;
+    }
+    const esp_err_t submitted = GetDisplayService().SubmitBirthdayEasterEgg(
+        mode.active_feature, job.job_id, &GetProductJobService());
+    if (submitted == ESP_OK) {
+        ESP_LOGI("birthday_egg", "Submitted birthday easter egg display");
+        return true;
+    }
+    (void)GetProductJobService().Update(job.job_id, JobState::kFailed, "failed", 0,
+                                        "display_busy");
+    ESP_LOGW("birthday_egg", "Display busy; skipped birthday refresh");
+    return false;
 }
 
 std::string PlaybackStatus(const PlaybackSnapshot& playback) {
@@ -245,6 +279,14 @@ std::string SwitchMode(const std::string& target_name) {
     return std::string("正在切换到") + display_name + "，请等待屏幕刷新完成。";
 }
 }  // namespace
+
+bool HandleBirthdayEasterEggStt(const std::string& phrase) {
+    if (!IsBirthdayEasterEggPhrase(phrase)) return false;
+    RecordAutomaticSleepActivity();
+    ESP_LOGI("birthday_egg", "Matched birthday phrase directly from STT");
+    (void)RequestBirthdayEasterEggDisplay();
+    return true;
+}
 
 VoiceGenerationService::VoiceGenerationService() : mutex_(xSemaphoreCreateMutex()) {}
 
@@ -432,8 +474,8 @@ void RegisterVoiceGenerationMcpTools() {
     });
     mcp.AddTool(
         "self.photo_frame.play_birthday_easter_egg",
-        "Call this tool every time the user's latest complete utterance is exactly '我是菁菁大美女' or "
-        "'我是金金大美女' or '我是晶晶大美女', including repeated occurrences in the same conversation. Pass that exact latest "
+        "Call this tool every time the user's latest complete utterance is exactly '生日快乐', including repeated occurrences "
+        "in the same conversation. Pass that exact latest "
         "utterance in phrase. Never reuse an earlier result and never call for partial, similar, guessed, "
         "requested, or quoted phrases. After calling, speak the returned Chinese text verbatim at roughly "
         "0.8x normal speed, with a short pause between paragraphs. Do not summarize, rewrite, or add anything.",
@@ -444,7 +486,7 @@ void RegisterVoiceGenerationMcpTools() {
                 return std::string("未触发彩蛋。");
             }
             RecordAutomaticSleepActivity();
-            ESP_LOGI("birthday_egg", "Triggered birthday easter egg");
+            (void)RequestBirthdayEasterEggDisplay();
             return std::string(kBirthdayEasterEgg);
         });
 }

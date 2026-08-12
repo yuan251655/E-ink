@@ -657,6 +657,7 @@ idf_component_register(SRCS ${SOURCES}
                                 "user_app_bsp/assets/mode_covers/mode_cover_local_album.bin"
                                 "user_app_bsp/assets/mode_covers/mode_cover_ai_album.bin"
                                 "user_app_bsp/assets/mode_covers/mode_cover_info_dashboard.bin"
+                                "user_app_bsp/assets/easter_eggs/birthday_easter_egg.bin"
                     INCLUDE_DIRS ${INCLUDE_DIRS}
                     PRIV_REQUIRES app_bsp port_bsp codec_board pmicpower
                     esp_http_client esp_http_server esp_wifi espressif__cjson espressif__mdns

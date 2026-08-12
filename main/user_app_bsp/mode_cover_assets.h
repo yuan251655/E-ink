@@ -16,5 +16,6 @@ struct ModeCoverAsset {
 };
 
 esp_err_t GetModeCoverAsset(Feature feature, ModeCoverAsset* output);
+esp_err_t GetBirthdayEasterEggAsset(ModeCoverAsset* output);
 
 }  // namespace photopainter::product

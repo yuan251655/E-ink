@@ -71,6 +71,7 @@ public:
     // Call after a successful user initiated display.  This never changes a
     // paused configuration into automatic playback.
     void NotifyManualDisplaySuccess(const MediaId& media_id);
+    void NotifyTemporarySystemDisplaySuccess();
     // Queue one user-requested page turn using this album's configured order.
     esp_err_t RequestNext(bool announce_completion = false);
     // Called once after an RTC-planned deep-sleep wake. It intentionally does

@@ -14,6 +14,7 @@ import numpy as np
 from PIL import Image, ImageOps
 
 PORTRAIT_WIDTH, PORTRAIT_HEIGHT = 480, 800
+LANDSCAPE_WIDTH, LANDSCAPE_HEIGHT = 800, 480
 PALETTE = np.array([
     (0, 0, 0),       # black
     (255, 255, 255), # white
@@ -62,8 +63,28 @@ def main() -> None:
     parser.add_argument('source', type=Path)
     parser.add_argument('output_bin', type=Path)
     parser.add_argument('--preview', type=Path)
+    parser.add_argument('--landscape-contain', action='store_true')
     args = parser.parse_args()
     image = ImageOps.exif_transpose(Image.open(args.source)).convert('RGB')
+    if args.landscape_contain:
+        contained = ImageOps.contain(
+            image, (LANDSCAPE_WIDTH, LANDSCAPE_HEIGHT), Image.Resampling.LANCZOS)
+        # Use the source corner as the padding color so the added bands blend
+        # into paper-textured artwork instead of introducing stark white bars.
+        background = image.getpixel((0, 0))
+        landscape = Image.new('RGB', (LANDSCAPE_WIDTH, LANDSCAPE_HEIGHT), background)
+        landscape.paste(contained, ((LANDSCAPE_WIDTH - contained.width) // 2,
+                                    (LANDSCAPE_HEIGHT - contained.height) // 2))
+        landscape_indices = official_dither(np.asarray(landscape))
+        payload = pack(landscape_indices)
+        if len(payload) != 192000:
+            raise RuntimeError(f'unexpected frame length: {len(payload)}')
+        args.output_bin.parent.mkdir(parents=True, exist_ok=True)
+        args.output_bin.write_bytes(payload)
+        if args.preview:
+            args.preview.parent.mkdir(parents=True, exist_ok=True)
+            Image.fromarray(PALETTE[landscape_indices].astype(np.uint8), 'RGB').save(args.preview)
+        return
     # Match the official portrait path: resize to 480x800, then the BSP's
     # Rotation=3 path turns it into the physical 800x480 controller frame.
     portrait = image.resize((PORTRAIT_WIDTH, PORTRAIT_HEIGHT), Image.Resampling.BILINEAR)

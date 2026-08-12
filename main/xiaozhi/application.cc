@@ -21,6 +21,7 @@
 #include "user_app.h"
 #include "device_log_service.h"
 #include "xiaozhi_runtime.h"
+#include "voice_generation_service.h"
 
 #define TAG "Application"
 
@@ -494,6 +495,7 @@ void Application::Start(bool reuse_existing_network) {
                 if (cJSON_IsString(text)) {
                     ESP_LOGI(TAG, ">> %s", text->valuestring);
                     photopainter::product::RecordXiaozhiMessageEvent("user", text->valuestring);
+                    (void)photopainter::product::HandleBirthdayEasterEggStt(text->valuestring);
                 Schedule([this, display, message = std::string(text->valuestring)]() {
                     display->SetChatMessage("user", message.c_str());
                 });

@@ -423,6 +423,18 @@ void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t
         timestamp_queue_.pop_front();
     }
 
+    // Live microphone audio is only useful while it is current. Blocking the
+    // AFE output task here makes its feed ringbuffer fill permanently when the
+    // network send path stalls. Drop the late frame and let listening recover.
+    if (type == kAudioTaskTypeEncodeToSendQueue &&
+        audio_encode_queue_.size() >= MAX_ENCODE_TASKS_IN_QUEUE) {
+        static std::uint32_t dropped_frames = 0;
+        if ((++dropped_frames % 100U) == 1U) {
+            ESP_LOGW(TAG, "Audio upload congested; dropped %lu late microphone frames",
+                     static_cast<unsigned long>(dropped_frames));
+        }
+        return;
+    }
     audio_queue_cv_.wait(lock, [this]() { return audio_encode_queue_.size() < MAX_ENCODE_TASKS_IN_QUEUE; });
     audio_encode_queue_.push_back(std::move(task));
     audio_queue_cv_.notify_all();

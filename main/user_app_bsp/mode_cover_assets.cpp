@@ -7,6 +7,8 @@ extern const std::uint8_t ai_start[] asm("_binary_mode_cover_ai_album_bin_start"
 extern const std::uint8_t ai_end[] asm("_binary_mode_cover_ai_album_bin_end");
 extern const std::uint8_t dashboard_start[] asm("_binary_mode_cover_info_dashboard_bin_start");
 extern const std::uint8_t dashboard_end[] asm("_binary_mode_cover_info_dashboard_bin_end");
+extern const std::uint8_t birthday_start[] asm("_binary_birthday_easter_egg_bin_start");
+extern const std::uint8_t birthday_end[] asm("_binary_birthday_easter_egg_bin_end");
 }
 
 namespace photopainter::product {
@@ -29,6 +31,18 @@ esp_err_t GetModeCoverAsset(Feature feature, ModeCoverAsset* output) {
     output->data = start;
     output->size = static_cast<std::size_t>(end - start);
     output->system_asset_id = id;
+    return ESP_OK;
+}
+
+esp_err_t GetBirthdayEasterEggAsset(ModeCoverAsset* output) {
+    if (output == nullptr) return ESP_ERR_INVALID_ARG;
+    if (&birthday_end[0] < &birthday_start[0] ||
+        static_cast<std::size_t>(birthday_end - birthday_start) != kDisplayFrameBytes) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    output->data = birthday_start;
+    output->size = static_cast<std::size_t>(birthday_end - birthday_start);
+    output->system_asset_id = "birthday_easter_egg";
     return ESP_OK;
 }
 
