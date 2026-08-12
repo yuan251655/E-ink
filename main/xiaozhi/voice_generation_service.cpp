@@ -353,7 +353,7 @@ void RegisterVoiceGenerationMcpTools() {
     static bool registered = false; if (registered) return; registered = true;
     GetVoiceAnnouncementService().Initialize();
     auto& mcp = McpServer::GetInstance();
-    mcp.SetToolAllowlist({"self.photo_frame.next_picture", "self.photo_frame.switch_mode", "self.photo_frame.get_status", "self.photo_frame.set_playback", "self.photo_frame.create_image", "self.photo_frame.confirm_image", "self.photo_frame.cancel_image", "self.photo_frame.play_birthday_easter_egg"});
+    mcp.SetToolAllowlist({"self.photo_frame.next_picture", "self.photo_frame.switch_mode", "self.photo_frame.get_status", "self.photo_frame.set_playback", "self.photo_frame.set_automatic_sleep", "self.photo_frame.create_image", "self.photo_frame.confirm_image", "self.photo_frame.cancel_image", "self.photo_frame.play_birthday_easter_egg"});
     mcp.AddTool("self.photo_frame.next_picture", "Show the next photo in the currently active local or AI album. Never switch device mode.", PropertyList(), [](const PropertyList&) -> ReturnValue {
         RecordAutomaticSleepActivity();
         return ShowNextPicture();
@@ -369,6 +369,20 @@ void RegisterVoiceGenerationMcpTools() {
     mcp.AddTool("self.photo_frame.set_playback", "Pause or resume only the currently active local or AI album. action must be pause or resume. Never change interval or order.", PropertyList({Property("action", kPropertyTypeString)}), [](const PropertyList& args) -> ReturnValue {
         RecordAutomaticSleepActivity();
         return SetPlayback(args["action"].value<std::string>());
+    });
+    mcp.AddTool("self.photo_frame.set_automatic_sleep", "Enable or disable automatic sleep only when the user explicitly asks to turn automatic sleep on or off. Set enabled true to enable and false to disable. This never enters sleep immediately and never changes the saved idle timeout or any album playback setting.", PropertyList({Property("enabled", kPropertyTypeBoolean)}), [](const PropertyList& args) -> ReturnValue {
+        auto config = GetAutomaticSleepConfig();
+        const bool enabled = args["enabled"].value<bool>();
+        if (config.enabled == enabled) {
+            if (enabled) RecordAutomaticSleepActivity();
+            return enabled ? std::string("自动休眠已经开启，已重新开始空闲计时。")
+                           : std::string("自动休眠已经关闭。");
+        }
+        config.enabled = enabled;
+        if (UpdateAutomaticSleepConfig(config) != ESP_OK) return std::string("自动休眠设置保存失败，请稍后再试。");
+        if (enabled) RecordAutomaticSleepActivity();
+        return enabled ? std::string("已开启自动休眠，并从现在重新开始空闲计时。")
+                       : std::string("已关闭自动休眠。");
     });
     mcp.AddTool("self.photo_frame.create_image", "Create one image only while AI album is active. Call this when the user requests image generation; pass the exact Chinese image description. The result asks the user to confirm.", PropertyList({Property("prompt", kPropertyTypeString)}), [](const PropertyList& args) -> ReturnValue {
         RecordAutomaticSleepActivity();
