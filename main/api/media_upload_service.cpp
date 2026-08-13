@@ -15,6 +15,7 @@
 #include "job_service.h"
 #include "mbedtls/sha256.h"
 #include "media_library.h"
+#include "rtc_service.h"
 #include "storage_service.h"
 
 namespace photopainter::product {
@@ -35,6 +36,7 @@ struct Metadata {
     RequestId request_id;
     MediaCategory category = MediaCategory::kLocal;
     std::string display_name;
+    EpochMs created_at_ms = 0;
     std::string frame_sha256;
     DisplayProfile profile;
 };
@@ -206,6 +208,11 @@ bool ParseMetadata(const std::string& json, Metadata* output, std::string* code)
     if (parsed.display_name.size() > 128 || !IsValidUtf8(parsed.display_name)) { *code = "invalid_request"; return false; }
     for (const unsigned char c : parsed.display_name) {
         if (c < 0x20U || c == 0x7fU) { *code = "invalid_request"; return false; }
+    }
+    parsed.created_at_ms = root["created_at_ms"] | 0ULL;
+    if (parsed.created_at_ms != 0 && parsed.created_at_ms < 1577836800000ULL) {
+        *code = "invalid_request";
+        return false;
     }
     JsonObjectConst frame = root["image_bin"].as<JsonObjectConst>();
     if (frame.isNull()) frame = root["files"]["frame"].as<JsonObjectConst>();
@@ -424,7 +431,9 @@ MediaUploadResult ReceiveBinOnlyMultipart(httpd_req_t* request,
         const char* category_name = metadata.category == MediaCategory::kAi ? "ai" :
             (metadata.category == MediaCategory::kDashboard ? "dashboard" : "local");
         const MediaId media_id = NewSafeId(category_name);
-        const EpochMs now = static_cast<EpochMs>(esp_timer_get_time() / 1000);
+        std::uint64_t rtc_seconds = 0;
+        const EpochMs now = metadata.created_at_ms != 0 ? metadata.created_at_ms :
+            (GetRtcService().GetUnixTimeSeconds(&rtc_seconds) ? rtc_seconds * 1000ULL : 0ULL);
         JsonDocument manifest;
         manifest["media_id"] = media_id;
         manifest["display_name"] = metadata.display_name;
