@@ -1,6 +1,7 @@
 #include "button_sleep_service.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 
@@ -49,15 +50,19 @@ constexpr char kActivityNamespace[] = "sleep_activity";
 constexpr char kActivityEpochKey[] = "last_epoch";
 
 std::unique_ptr<Button> g_boot_button;
-bool g_sleep_pending = false;
+std::atomic_bool g_sleep_pending{false};
 RTC_DATA_ATTR std::uint8_t g_rtc_test_remaining = 0;
 RTC_DATA_ATTR std::uint8_t g_rtc_test_completed = 0;
 AutomaticSleepConfig g_automatic_sleep_config;
-bool g_scheduled_sleep_pending = false;
-std::uint32_t g_scheduled_sleep_delay_seconds = 0;
+std::atomic_bool g_scheduled_sleep_pending{false};
+std::atomic<std::uint32_t> g_scheduled_sleep_delay_seconds{0};
 TaskHandle_t g_automatic_sleep_worker = nullptr;
-bool g_automatic_sleep_pending = false;
-std::uint64_t g_last_activity_epoch_seconds = 0;
+std::atomic_bool g_automatic_sleep_pending{false};
+std::atomic<std::uint64_t> g_last_activity_epoch_seconds{0};
+SemaphoreHandle_t g_sleep_state_mutex = nullptr;
+std::atomic<std::uint32_t> g_sleep_policy_revision{1};
+std::atomic<std::uint32_t> g_pending_automatic_sleep_revision{0};
+std::atomic<std::uint32_t> g_pending_scheduled_sleep_revision{0};
 
 bool IsRtcWake() {
     if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT1) return false;
@@ -105,9 +110,14 @@ void LoadAutomaticSleepConfig() {
     }
     (void)nvs_get_u8(handle, kSleepPlaybackKey, &playback);
     nvs_close(handle);
-    g_automatic_sleep_config.enabled = enabled != 0;
-    g_automatic_sleep_config.idle_timeout_seconds = IsAllowedAutomaticSleepTimeout(timeout) ? timeout : 15 * 60;
-    g_automatic_sleep_config.wake_for_playback = playback != 0;
+    const AutomaticSleepConfig loaded{
+        .enabled = enabled != 0,
+        .idle_timeout_seconds = IsAllowedAutomaticSleepTimeout(timeout) ? timeout : 15 * 60,
+        .wake_for_playback = playback != 0,
+    };
+    xSemaphoreTake(g_sleep_state_mutex, portMAX_DELAY);
+    g_automatic_sleep_config = loaded;
+    xSemaphoreGive(g_sleep_state_mutex);
 }
 
 void PersistActivityEpoch(std::uint64_t value) {
@@ -121,7 +131,9 @@ void PersistActivityEpoch(std::uint64_t value) {
 void LoadActivityEpoch() {
     nvs_handle_t handle;
     if (nvs_open(kActivityNamespace, NVS_READONLY, &handle) != ESP_OK) return;
-    (void)nvs_get_u64(handle, kActivityEpochKey, &g_last_activity_epoch_seconds);
+    std::uint64_t value = 0;
+    (void)nvs_get_u64(handle, kActivityEpochKey, &value);
+    g_last_activity_epoch_seconds.store(value);
     nvs_close(handle);
 }
 
@@ -221,9 +233,11 @@ void EnterScheduledLocalPlaybackSleepTask(void*) {
     vTaskDelay(pdMS_TO_TICKS(700));
     g_scheduled_sleep_pending = false;
     const auto config = GetAutomaticSleepConfig();
+    const std::uint32_t revision = g_pending_scheduled_sleep_revision.load();
     const auto display = GetDisplayService().GetSnapshot();
     const auto rtc = GetRtcService().GetSnapshot();
-    if (!config.enabled || !config.wake_for_playback || !rtc.present || !rtc.valid ||
+    if (!config.enabled || !config.wake_for_playback || revision != g_sleep_policy_revision.load() ||
+        !rtc.present || !rtc.valid ||
         IsDisplayBusy(display.state) || GetStorageService().HasActiveWriteTransaction()) {
         GetDeviceLogService().Add(DeviceLogSeverity::kWarning, "power", "scheduled_sleep_rejected",
                                   "Local playback sleep rejected because configuration, RTC, display, or TF is not ready");
@@ -243,6 +257,12 @@ void EnterScheduledLocalPlaybackSleepTask(void*) {
     GetDeviceLogService().Add(DeviceLogSeverity::kInfo, "power", "scheduled_sleep_entering",
                               "Local playback is sleeping until the next RTC refresh");
     vTaskDelay(pdMS_TO_TICKS(120));
+    if (revision != g_sleep_policy_revision.load() || !GetAutomaticSleepConfig().enabled) {
+        PersistScheduledLocalPlayback(false);
+        (void)GetRtcService().DisarmWakeTimer();
+        vTaskDelete(nullptr);
+        return;
+    }
     esp_deep_sleep_start();
 }
 
@@ -283,8 +303,10 @@ void EnterAutomaticSleepTask(void*) {
     vTaskDelay(pdMS_TO_TICKS(250));
     g_automatic_sleep_pending = false;
     const auto config = GetAutomaticSleepConfig();
+    const std::uint32_t revision = g_pending_automatic_sleep_revision.load();
     std::uint64_t now = 0;
-    if (!config.enabled || !GetRtcService().GetUnixTimeSeconds(&now) || IsAutomaticSleepBusy()) {
+    if (!config.enabled || revision != g_sleep_policy_revision.load() ||
+        !GetRtcService().GetUnixTimeSeconds(&now) || IsAutomaticSleepBusy()) {
         vTaskDelete(nullptr);
         return;
     }
@@ -324,7 +346,7 @@ void EnterAutomaticSleepTask(void*) {
     GetDeviceLogService().Add(DeviceLogSeverity::kInfo, "power", "automatic_sleep_entering",
                               deadline == 0 ? "Idle sleep entered; KEY wakes" : "Idle sleep entered; RTC preserves playback deadline");
     vTaskDelay(pdMS_TO_TICKS(120));
-    if (!GetAutomaticSleepConfig().enabled) {
+    if (revision != g_sleep_policy_revision.load() || !GetAutomaticSleepConfig().enabled) {
         if (deadline != 0) (void)GetRtcService().DisarmWakeTimer();
         vTaskDelete(nullptr);
         return;
@@ -343,6 +365,7 @@ void AutomaticSleepWorker(void*) {
             }
             if (now >= g_last_activity_epoch_seconds + config.idle_timeout_seconds && !IsAutomaticSleepBusy()) {
                 g_automatic_sleep_pending = true;
+                g_pending_automatic_sleep_revision.store(g_sleep_policy_revision.load());
                 if (xTaskCreate(EnterAutomaticSleepTask, "auto_sleep", 4096, nullptr, 3, nullptr) != pdPASS) {
                     g_automatic_sleep_pending = false;
                 }
@@ -370,6 +393,8 @@ void RequestSleep() {
 
 esp_err_t InitializeButtonSleepService() {
     if (g_boot_button) return ESP_OK;
+    if (g_sleep_state_mutex == nullptr) g_sleep_state_mutex = xSemaphoreCreateMutex();
+    if (g_sleep_state_mutex == nullptr) return ESP_ERR_NO_MEM;
     LoadAutomaticSleepConfig();
     g_boot_button = std::make_unique<Button>(kBootPin, false, kLongPressMs);
     g_boot_button->OnLongPress(RequestSleep);
@@ -424,7 +449,11 @@ bool IsAllowedAutomaticSleepTimeout(std::uint32_t seconds) {
 }
 
 AutomaticSleepConfig GetAutomaticSleepConfig() {
-    return g_automatic_sleep_config;
+    if (g_sleep_state_mutex == nullptr) return g_automatic_sleep_config;
+    xSemaphoreTake(g_sleep_state_mutex, portMAX_DELAY);
+    const AutomaticSleepConfig config = g_automatic_sleep_config;
+    xSemaphoreGive(g_sleep_state_mutex);
+    return config;
 }
 
 esp_err_t UpdateAutomaticSleepConfig(const AutomaticSleepConfig& config) {
@@ -438,7 +467,20 @@ esp_err_t UpdateAutomaticSleepConfig(const AutomaticSleepConfig& config) {
     if (result == ESP_OK) result = nvs_commit(handle);
     nvs_close(handle);
     if (result != ESP_OK) return result;
+    g_sleep_policy_revision.fetch_add(1);
+    xSemaphoreTake(g_sleep_state_mutex, portMAX_DELAY);
     g_automatic_sleep_config = config;
+    g_automatic_sleep_pending = false;
+    if (!config.enabled) {
+        g_scheduled_sleep_pending = false;
+        g_sleep_pending = false;
+    }
+    xSemaphoreGive(g_sleep_state_mutex);
+    if (!config.enabled) {
+        PersistScheduledLocalPlayback(false);
+        (void)GetRtcService().DisarmWakeTimer();
+    }
+    RecordAutomaticSleepActivity();
     GetDeviceLogService().Add(DeviceLogSeverity::kInfo, "power", "automatic_sleep_config_saved",
                               config.enabled ? "Automatic sleep configuration enabled" : "Automatic sleep configuration disabled");
     return ESP_OK;
@@ -449,6 +491,7 @@ esp_err_t RequestScheduledLocalPlaybackSleep(std::uint32_t delay_seconds) {
     if (!config.enabled || !config.wake_for_playback || delay_seconds == 0) return ESP_ERR_INVALID_STATE;
     if (g_scheduled_sleep_pending) return ESP_ERR_INVALID_STATE;
     g_scheduled_sleep_pending = true;
+    g_pending_scheduled_sleep_revision.store(g_sleep_policy_revision.load());
     g_scheduled_sleep_delay_seconds = delay_seconds;
     if (xTaskCreate(EnterScheduledLocalPlaybackSleepTask, "local_sleep", 4096, nullptr, 3, nullptr) != pdPASS) {
         g_scheduled_sleep_pending = false;

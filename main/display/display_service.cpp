@@ -1,5 +1,8 @@
 #include "display_service.h"
+#include <algorithm>
 #include <cstring>
+#include "esp_attr.h"
+#include "esp_timer.h"
 #include "display_bsp.h"
 #include "device_log_service.h"
 #include "job_service.h"
@@ -14,6 +17,7 @@
 #include "local_album_playback_runtime.h"
 #include "ai_album_playback_runtime.h"
 #include "power_service.h"
+#include "rtc_service.h"
 #include "storage_service.h"
 
 namespace photopainter::product {
@@ -23,6 +27,9 @@ constexpr int kBatteryY = 16;
 constexpr int kBatteryBodyWidth = 78;
 constexpr int kBatteryBodyHeight = 36;
 constexpr int kBatteryInnerWidth = 64;
+constexpr std::int64_t kRefreshCooldownUs = 60LL * 1000LL * 1000LL;
+RTC_DATA_ATTR std::uint64_t g_refresh_cooldown_until_epoch = 0;
+RTC_DATA_ATTR std::uint64_t g_cooldown_rejection_sequence = 0;
 
 constexpr int BatteryFillWidth(int percent) {
     return percent <= 0 ? 0 : percent >= 100 ? kBatteryInnerWidth
@@ -55,6 +62,46 @@ void DrawBatteryIcon(ePaperPort* display, int percent) {
 }
 }  // namespace
 
+std::uint32_t DisplayService::CooldownRemainingSecondsLocked() const {
+    std::uint32_t remaining_seconds = 0;
+    if (last_refresh_completed_us_ > 0) {
+        const std::int64_t remaining_us = kRefreshCooldownUs - (esp_timer_get_time() - last_refresh_completed_us_);
+        if (remaining_us > 0) {
+            remaining_seconds = static_cast<std::uint32_t>((remaining_us + 999999) / 1000000);
+        }
+    }
+    std::uint64_t now = 0;
+    if (g_refresh_cooldown_until_epoch > 0 && GetRtcService().GetUnixTimeSeconds(&now) &&
+        now < g_refresh_cooldown_until_epoch) {
+        remaining_seconds = std::max<std::uint32_t>(
+            remaining_seconds, static_cast<std::uint32_t>(g_refresh_cooldown_until_epoch - now));
+    }
+    return remaining_seconds;
+}
+
+bool DisplayService::AdmitLocked() {
+    if (snapshot_.state == DisplayState::kQueued || snapshot_.state == DisplayState::kLoading ||
+        snapshot_.state == DisplayState::kRefreshing || snapshot_.state == DisplayState::kFinalizing) {
+        snapshot_.last_error_code = "display_busy";
+        return false;
+    }
+    const std::uint32_t remaining_seconds = CooldownRemainingSecondsLocked();
+    if (remaining_seconds > 0) {
+        snapshot_.last_error_code = "display_cooldown";
+        snapshot_.cooldown_remaining_seconds = remaining_seconds;
+        if (!cooldown_rejection_recorded_) {
+            snapshot_.cooldown_rejection_sequence = ++g_cooldown_rejection_sequence;
+            cooldown_rejection_recorded_ = true;
+            GetDeviceLogService().Add(DeviceLogSeverity::kWarning, "display", "display_cooldown",
+                                      "Refresh rejected during the 60-second panel cooldown");
+        }
+        return false;
+    }
+    snapshot_.cooldown_remaining_seconds = 0;
+    snapshot_.last_error_code.clear();
+    return true;
+}
+
 esp_err_t DisplayService::Initialize(StorageService* storage, MediaLibrary* library, ePaperPort* display, SemaphoreHandle_t legacy_mutex) {
     if (!storage || !library || !display || !legacy_mutex) return ESP_ERR_INVALID_ARG;
     storage_ = storage; library_ = library; display_ = display; legacy_mutex_ = legacy_mutex;
@@ -76,8 +123,7 @@ esp_err_t DisplayService::SubmitMedia(Feature feature, MediaCategory category, c
     if (!valid_owner) return ESP_ERR_INVALID_ARG;
     if (!queue_ || !state_mutex_ || !jobs || media_id.empty() || job_id.empty() || media_id.size() >= 65 || job_id.size() >= 65) return ESP_ERR_INVALID_ARG;
     xSemaphoreTake(state_mutex_, portMAX_DELAY);
-    if (snapshot_.state == DisplayState::kQueued || snapshot_.state == DisplayState::kLoading ||
-        snapshot_.state == DisplayState::kRefreshing || snapshot_.state == DisplayState::kFinalizing) {
+    if (!AdmitLocked()) {
         xSemaphoreGive(state_mutex_);
         return ESP_ERR_INVALID_STATE;
     }
@@ -94,8 +140,7 @@ esp_err_t DisplayService::SubmitModeCover(Feature feature, const JobId& job_id, 
     ModeCoverAsset asset;
     if (GetModeCoverAsset(feature, &asset) != ESP_OK) return ESP_ERR_NOT_FOUND;
     xSemaphoreTake(state_mutex_, portMAX_DELAY);
-    if (snapshot_.state == DisplayState::kQueued || snapshot_.state == DisplayState::kLoading ||
-        snapshot_.state == DisplayState::kRefreshing || snapshot_.state == DisplayState::kFinalizing) {
+    if (!AdmitLocked()) {
         xSemaphoreGive(state_mutex_);
         return ESP_ERR_INVALID_STATE;
     }
@@ -115,9 +160,7 @@ esp_err_t DisplayService::SubmitBirthdayEasterEgg(Feature feature, const JobId& 
     ModeCoverAsset asset;
     if (GetBirthdayEasterEggAsset(&asset) != ESP_OK) return ESP_ERR_NOT_FOUND;
     xSemaphoreTake(state_mutex_, portMAX_DELAY);
-    if (snapshot_.current_media_id == asset.system_asset_id ||
-        snapshot_.state == DisplayState::kQueued || snapshot_.state == DisplayState::kLoading ||
-        snapshot_.state == DisplayState::kRefreshing || snapshot_.state == DisplayState::kFinalizing) {
+    if (snapshot_.current_media_id == asset.system_asset_id || !AdmitLocked()) {
         xSemaphoreGive(state_mutex_);
         return ESP_ERR_INVALID_STATE;
     }
@@ -137,8 +180,7 @@ esp_err_t DisplayService::SubmitDashboard(const JobId& job_id, JobService* jobs)
     const auto mode = GetModeManager().GetSnapshot();
     if (mode.state != ModeSnapshot::State::kIdle || mode.active_feature != Feature::kInfoDashboard) return ESP_ERR_INVALID_STATE;
     xSemaphoreTake(state_mutex_, portMAX_DELAY);
-    if (snapshot_.state == DisplayState::kQueued || snapshot_.state == DisplayState::kLoading ||
-        snapshot_.state == DisplayState::kRefreshing || snapshot_.state == DisplayState::kFinalizing) {
+    if (!AdmitLocked()) {
         xSemaphoreGive(state_mutex_);
         return ESP_ERR_INVALID_STATE;
     }
@@ -159,6 +201,8 @@ DisplaySnapshot DisplayService::GetSnapshot() const {
     if (!state_mutex_) return result;
     xSemaphoreTake(state_mutex_, portMAX_DELAY);
     result = snapshot_;
+    result.cooldown_rejection_sequence = g_cooldown_rejection_sequence;
+    result.cooldown_remaining_seconds = CooldownRemainingSecondsLocked();
     xSemaphoreGive(state_mutex_);
     return result;
 }
@@ -244,7 +288,12 @@ void DisplayService::WorkerLoop() {
             // the queue after the cover refresh but before active_feature is
             // changed by ModeManager.
             xSemaphoreTake(state_mutex_, portMAX_DELAY);
+            last_refresh_completed_us_ = esp_timer_get_time();
+            std::uint64_t now = 0;
+            if (GetRtcService().GetUnixTimeSeconds(&now)) g_refresh_cooldown_until_epoch = now + 60;
+            cooldown_rejection_recorded_ = false;
             snapshot_.state = DisplayState::kFinalizing;
+            snapshot_.cooldown_remaining_seconds = 60;
             snapshot_.current_media_id = (mode_cover || birthday) ? asset.system_asset_id : media_id;
             snapshot_.last_successful_media_id = snapshot_.current_media_id;
             snapshot_.last_error_code.clear();

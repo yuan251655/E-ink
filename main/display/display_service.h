@@ -37,11 +37,15 @@ private:
         char job_id[65];
     };
     static void WorkerEntry(void* context);
+    bool AdmitLocked();
+    std::uint32_t CooldownRemainingSecondsLocked() const;
     void WorkerLoop();
     StorageService* storage_ = nullptr; MediaLibrary* library_ = nullptr; ePaperPort* display_ = nullptr;
     JobService* jobs_ = nullptr;
     SemaphoreHandle_t legacy_mutex_ = nullptr; SemaphoreHandle_t state_mutex_ = nullptr;
     QueueHandle_t queue_ = nullptr; TaskHandle_t worker_ = nullptr;
+    std::int64_t last_refresh_completed_us_ = 0;
+    bool cooldown_rejection_recorded_ = false;
     DisplaySnapshot snapshot_;
 };
 }  // namespace photopainter::product

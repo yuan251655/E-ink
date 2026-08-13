@@ -337,7 +337,17 @@ esp_err_t SubmitMediaDisplay(httpd_req_t* req, const MediaId& media_id, const Re
     if (registration != JobRegistrationResult::kCreated && registration != JobRegistrationResult::kExisting) return SendJson(req, "{\"ok\":false,\"code\":\"display_busy\"}", "503 Service Unavailable");
     if (registration == JobRegistrationResult::kCreated &&
         GetDisplayService().SubmitMedia(owner, item.category, media_id, job.job_id, &GetProductJobService()) != ESP_OK) {
-        (void)GetProductJobService().Update(job.job_id, JobState::kFailed, "failed", 0, "display_busy");
+        const DisplaySnapshot display = GetDisplayService().GetSnapshot();
+        const bool cooldown = display.last_error_code == "display_cooldown";
+        const char* code = cooldown ? "display_cooldown" : "display_busy";
+        (void)GetProductJobService().Update(job.job_id, JobState::kFailed, "failed", 0, code);
+        if (cooldown) {
+            char response[160];
+            std::snprintf(response, sizeof(response),
+                          "{\"ok\":false,\"code\":\"display_cooldown\",\"data\":{\"remaining_seconds\":%u}}",
+                          static_cast<unsigned>(display.cooldown_remaining_seconds));
+            return SendJson(req, response, "429 Too Many Requests");
+        }
         return SendJson(req, "{\"ok\":false,\"code\":\"display_busy\"}", "503 Service Unavailable");
     }
     (void)GetProductJobService().Get(job.job_id, &job);
@@ -1089,12 +1099,13 @@ esp_err_t Status(httpd_req_t* req) {
     const auto storage = GetStorageService().GetSnapshot();
     const auto mode = GetModeManager().GetSnapshot();
     const auto display = GetDisplayService().GetSnapshot();
-    char mode_revision[21], total_bytes[21], free_bytes[21];
+    char mode_revision[21], total_bytes[21], free_bytes[21], cooldown_sequence[21];
     FormatUInt64(mode.revision, mode_revision);
     FormatUInt64(storage.total_bytes, total_bytes);
     FormatUInt64(storage.free_bytes, free_bytes);
-    char body[512];
-    std::snprintf(body, sizeof(body), "{\"ok\":true,\"code\":\"ok\",\"data\":{\"api_version\":\"v1\",\"mode\":{\"active_feature\":%u,\"revision\":%s},\"storage\":{\"state\":%u,\"total_bytes\":%s,\"free_bytes\":%s},\"display\":{\"state\":%u,\"current_media_id\":\"%s\"}}}", static_cast<unsigned>(mode.active_feature), mode_revision, static_cast<unsigned>(storage.state), total_bytes, free_bytes, static_cast<unsigned>(display.state), display.current_media_id.c_str());
+    FormatUInt64(display.cooldown_rejection_sequence, cooldown_sequence);
+    char body[640];
+    std::snprintf(body, sizeof(body), "{\"ok\":true,\"code\":\"ok\",\"data\":{\"api_version\":\"v1\",\"mode\":{\"active_feature\":%u,\"revision\":%s},\"storage\":{\"state\":%u,\"total_bytes\":%s,\"free_bytes\":%s},\"display\":{\"state\":%u,\"current_media_id\":\"%s\",\"cooldown_remaining_seconds\":%u,\"cooldown_rejection_sequence\":%s}}}", static_cast<unsigned>(mode.active_feature), mode_revision, static_cast<unsigned>(storage.state), total_bytes, free_bytes, static_cast<unsigned>(display.state), display.current_media_id.c_str(), static_cast<unsigned>(display.cooldown_remaining_seconds), cooldown_sequence);
     return SendJson(req, body);
 }
 
@@ -1290,8 +1301,10 @@ esp_err_t RemountStorage(httpd_req_t* req) {
 
 esp_err_t DisplayStatus(httpd_req_t* req) {
     const auto display = GetDisplayService().GetSnapshot();
-    char body[256];
-    std::snprintf(body, sizeof(body), "{\"ok\":true,\"code\":\"ok\",\"data\":{\"state\":%u,\"current_media_id\":\"%s\",\"last_error_code\":\"%s\"}}", static_cast<unsigned>(display.state), display.current_media_id.c_str(), display.last_error_code.c_str());
+    char cooldown_sequence[21];
+    FormatUInt64(display.cooldown_rejection_sequence, cooldown_sequence);
+    char body[384];
+    std::snprintf(body, sizeof(body), "{\"ok\":true,\"code\":\"ok\",\"data\":{\"state\":%u,\"current_media_id\":\"%s\",\"last_error_code\":\"%s\",\"cooldown_remaining_seconds\":%u,\"cooldown_rejection_sequence\":%s}}", static_cast<unsigned>(display.state), display.current_media_id.c_str(), display.last_error_code.c_str(), static_cast<unsigned>(display.cooldown_remaining_seconds), cooldown_sequence);
     return SendJson(req, body);
 }
 

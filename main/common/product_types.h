@@ -199,6 +199,8 @@ struct DisplaySnapshot {
     JobId active_job_id;
     MediaId queued_target_media_id;
     std::string last_error_code;
+    std::uint32_t cooldown_remaining_seconds = 0;
+    std::uint64_t cooldown_rejection_sequence = 0;
     EpochMs updated_at_ms = 0;
 };
 
