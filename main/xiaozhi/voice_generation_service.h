@@ -50,5 +50,8 @@ void RegisterVoiceGenerationMcpTools();
 // phrase. The display request is deterministic; cloud MCP remains responsible
 // for reading the long message aloud.
 bool HandleBirthdayEasterEggStt(const std::string& phrase);
+// App fallback for unreliable speech recognition. It uses the same display
+// path and asks the connected Xiaozhi session to handle the trigger phrase.
+esp_err_t TriggerBirthdayEasterEggFromApp(bool* already_visible);
 
 }  // namespace photopainter::product

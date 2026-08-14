@@ -1570,6 +1570,34 @@ esp_err_t XiaozhiConversation(httpd_req_t* req) {
     return SendJson(req, body.c_str());
 }
 
+esp_err_t TriggerBirthdayEasterEgg(httpd_req_t* req) {
+    if (req == nullptr || req->content_len > 2) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"invalid_request\"}", "400 Bad Request");
+    }
+    bool already_visible = false;
+    const esp_err_t result = TriggerBirthdayEasterEggFromApp(&already_visible);
+    if (result == ESP_OK) {
+        return SendJson(
+            req,
+            already_visible
+                ? "{\"ok\":true,\"code\":\"easter_egg_already_visible\",\"data\":{\"already_visible\":true}}"
+                : "{\"ok\":true,\"code\":\"easter_egg_started\",\"data\":{\"already_visible\":false}}",
+            already_visible ? nullptr : "202 Accepted");
+    }
+    const auto display = GetDisplayService().GetSnapshot();
+    if (display.last_error_code == "display_cooldown") {
+        char body[160];
+        std::snprintf(body, sizeof(body),
+                      "{\"ok\":false,\"code\":\"display_cooldown\",\"data\":{\"remaining_seconds\":%u}}",
+                      static_cast<unsigned>(display.cooldown_remaining_seconds));
+        return SendJson(req, body, "429 Too Many Requests");
+    }
+    if (result == ESP_ERR_NOT_FOUND) {
+        return SendJson(req, "{\"ok\":false,\"code\":\"easter_egg_unavailable\"}", "503 Service Unavailable");
+    }
+    return SendJson(req, "{\"ok\":false,\"code\":\"display_busy\"}", "409 Conflict");
+}
+
 void AppendVoiceGenerationTask(std::string* body, const VoiceGenerationTask& task) {
     body->append("{\"id\":");
     if (task.id.empty()) body->append("null"); else AppendJsonString(body, task.id);
@@ -1674,6 +1702,7 @@ esp_err_t RegisterProductApi(httpd_handle_t server) {
         {.uri="/api/v1/network/ap", .method=HTTP_POST, .handler=ConfigureAp, .user_ctx=nullptr},
         {.uri="/api/v1/network/ap/restore-default", .method=HTTP_POST, .handler=RestoreDefaultAp, .user_ctx=nullptr},
         {.uri="/api/v1/xiaozhi/status", .method=HTTP_GET, .handler=XiaozhiStatus, .user_ctx=nullptr},
+        {.uri="/api/v1/xiaozhi/birthday-easter-egg", .method=HTTP_POST, .handler=TriggerBirthdayEasterEgg, .user_ctx=nullptr},
         {.uri="/api/v1/xiaozhi/conversation", .method=HTTP_GET, .handler=XiaozhiConversation, .user_ctx=nullptr},
         {.uri="/api/v1/voice-generation/task", .method=HTTP_GET, .handler=VoiceGenerationTaskStatus, .user_ctx=nullptr},
         {.uri="/api/v1/voice-generation/heartbeat", .method=HTTP_POST, .handler=VoiceGenerationHeartbeat, .user_ctx=nullptr},

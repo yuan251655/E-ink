@@ -17,6 +17,8 @@
 #include "button_sleep_service.h"
 #include "voice_announcement_service.h"
 #include "audio_config_service.h"
+#include "application.h"
+#include "xiaozhi_runtime.h"
 
 namespace photopainter::product {
 namespace {
@@ -102,11 +104,13 @@ const char* GenerationStateName(VoiceGenerationState state) {
     return "未知";
 }
 
-bool RequestBirthdayEasterEggDisplay() {
+esp_err_t RequestBirthdayEasterEggDisplay(bool* already_visible = nullptr) {
+    if (already_visible != nullptr) *already_visible = false;
     const auto display = GetDisplayService().GetSnapshot();
     if (display.current_media_id == "birthday_easter_egg") {
+        if (already_visible != nullptr) *already_visible = true;
         ESP_LOGI("birthday_egg", "Display already visible; skipped duplicate refresh");
-        return true;
+        return ESP_OK;
     }
     const auto mode = GetModeManager().GetSnapshot();
     JobSnapshot job;
@@ -115,18 +119,18 @@ bool RequestBirthdayEasterEggDisplay() {
                                             "birthday-easter-egg", &job) !=
         JobRegistrationResult::kCreated) {
         ESP_LOGW("birthday_egg", "Job admission failed; skipped birthday refresh");
-        return false;
+        return ESP_ERR_INVALID_STATE;
     }
     const esp_err_t submitted = GetDisplayService().SubmitBirthdayEasterEgg(
         mode.active_feature, job.job_id, &GetProductJobService());
     if (submitted == ESP_OK) {
         ESP_LOGI("birthday_egg", "Submitted birthday easter egg display");
-        return true;
+        return ESP_OK;
     }
     (void)GetProductJobService().Update(job.job_id, JobState::kFailed, "failed", 0,
                                         "display_busy");
     ESP_LOGW("birthday_egg", "Display busy; skipped birthday refresh");
-    return false;
+    return submitted;
 }
 
 std::string PlaybackStatus(const PlaybackSnapshot& playback) {
@@ -279,6 +283,17 @@ std::string SwitchMode(const std::string& target_name) {
     return std::string("正在切换到") + display_name + "，请等待屏幕刷新完成。";
 }
 }  // namespace
+
+esp_err_t TriggerBirthdayEasterEggFromApp(bool* already_visible) {
+    if (already_visible == nullptr) return ESP_ERR_INVALID_ARG;
+    const esp_err_t result = RequestBirthdayEasterEggDisplay(already_visible);
+    if (result != ESP_OK) return result;
+    const auto runtime = GetXiaozhiRuntimeSnapshot();
+    if (runtime.started && runtime.state == "ready") {
+        Application::GetInstance().WakeWordInvoke("生日快乐");
+    }
+    return ESP_OK;
+}
 
 bool HandleBirthdayEasterEggStt(const std::string& phrase) {
     if (!IsBirthdayEasterEggPhrase(phrase)) return false;
