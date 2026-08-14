@@ -69,6 +69,11 @@ bool IsRtcWake() {
     return (esp_sleep_get_ext1_wakeup_status() & (1ULL << static_cast<unsigned>(kRtcWakePin))) != 0;
 }
 
+bool IsKeyWake() {
+    if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT1) return false;
+    return (esp_sleep_get_ext1_wakeup_status() & (1ULL << static_cast<unsigned>(kKeyWakePin))) != 0;
+}
+
 const char* WakeReasonName() {
     if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT1) return "none";
     const std::uint64_t pins = esp_sleep_get_ext1_wakeup_status();
@@ -396,6 +401,20 @@ esp_err_t InitializeButtonSleepService() {
     if (g_sleep_state_mutex == nullptr) g_sleep_state_mutex = xSemaphoreCreateMutex();
     if (g_sleep_state_mutex == nullptr) return ESP_ERR_NO_MEM;
     LoadAutomaticSleepConfig();
+    if (IsKeyWake() && GetAutomaticSleepConfig().enabled) {
+        auto config = GetAutomaticSleepConfig();
+        config.enabled = false;
+        const esp_err_t result = UpdateAutomaticSleepConfig(config);
+        if (result != ESP_OK) {
+            ESP_LOGE(kTag, "KEY sleep recovery failed: %s", esp_err_to_name(result));
+            GetDeviceLogService().Add(DeviceLogSeverity::kError, "power", "automatic_sleep_key_recovery_failed",
+                                      "KEY wake could not disable automatic sleep");
+            return result;
+        }
+        GetDeviceLogService().Add(DeviceLogSeverity::kWarning, "power", "automatic_sleep_key_recovery",
+                                  "KEY wake disabled automatic sleep and cancelled RTC sleep");
+        ESP_LOGW(kTag, "KEY wake disabled automatic sleep");
+    }
     g_boot_button = std::make_unique<Button>(kBootPin, false, kLongPressMs);
     g_boot_button->OnLongPress(RequestSleep);
     GetDeviceLogService().Add(DeviceLogSeverity::kInfo, "button", "boot_sleep_ready",
