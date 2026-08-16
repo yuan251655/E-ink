@@ -23,6 +23,7 @@ constexpr std::uint8_t kApChannel = 1;
 constexpr std::uint8_t kMaxStaReconnectAttempts = 5;
 constexpr std::uint32_t kReconnectBaseDelayMs = 1000;
 constexpr std::uint32_t kReconnectMaxDelayMs = 16000;
+constexpr std::uint32_t kReconnectRecoveryDelayMs = 30000;
 
 NetworkSnapshot snapshot;
 bool initialized = false;
@@ -122,8 +123,9 @@ void OnReconnectTimer(TimerHandle_t) {
 void ScheduleStaReconnect() {
     if (configuration_in_progress || sta_test_pending || reconnect_timer == nullptr || !snapshot.sta_configured || snapshot.sta_connected) return;
     if (reconnect_attempts >= kMaxStaReconnectAttempts) {
-        snapshot.last_error_code = "sta_reconnect_exhausted";
+        snapshot.last_error_code = "sta_reconnect_slow_retry";
         ++snapshot.revision;
+        (void)xTimerChangePeriod(reconnect_timer, pdMS_TO_TICKS(kReconnectRecoveryDelayMs), 0);
         return;
     }
     const std::uint32_t delay = std::min(kReconnectBaseDelayMs << reconnect_attempts, kReconnectMaxDelayMs);
