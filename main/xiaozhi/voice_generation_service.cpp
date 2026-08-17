@@ -286,13 +286,7 @@ std::string SwitchMode(const std::string& target_name) {
 
 esp_err_t TriggerBirthdayEasterEggFromApp(bool* already_visible) {
     if (already_visible == nullptr) return ESP_ERR_INVALID_ARG;
-    const esp_err_t result = RequestBirthdayEasterEggDisplay(already_visible);
-    if (result != ESP_OK) return result;
-    const auto runtime = GetXiaozhiRuntimeSnapshot();
-    if (runtime.started && runtime.state == "ready") {
-        Application::GetInstance().WakeWordInvoke("生日快乐");
-    }
-    return ESP_OK;
+    return RequestBirthdayEasterEggDisplay(already_visible);
 }
 
 bool HandleBirthdayEasterEggStt(const std::string& phrase) {
