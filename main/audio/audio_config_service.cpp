@@ -39,6 +39,8 @@ AudioConfigSnapshot GetAudioConfigSnapshot() {
         if (app.GetDeviceState() == kDeviceStateListening) snapshot.source = "xiaozhi_listening";
         else if (app.GetDeviceState() == kDeviceStateSpeaking) snapshot.source = "xiaozhi";
         else if (snapshot.playing) snapshot.source = "system_audio";
+        snapshot.cloud_tts = app.GetCloudTtsDiagnostics();
+        snapshot.playback = app.GetAudioService().GetPlaybackDiagnostics();
     }
     return snapshot;
 }

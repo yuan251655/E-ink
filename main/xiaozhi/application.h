@@ -33,6 +33,12 @@ enum AecMode {
     kAecOnServerSide,
 };
 
+struct CloudTtsDiagnostics {
+    std::uint32_t received_packets = 0;
+    std::uint32_t dropped_before_speaking = 0;
+    std::uint32_t queue_rejections = 0;
+};
+
 typedef void (*StateCallback_t)(const char *);
 
 class Application {
@@ -76,6 +82,7 @@ public:
     std::string GetActivationCode() const;
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
+    CloudTtsDiagnostics GetCloudTtsDiagnostics() const;
 
 private:
     Application();
@@ -97,6 +104,10 @@ private:
     bool started_ = false;
     bool wake_word_enabled_ = false;
     std::atomic<bool> tts_playback_enabled_{true};
+    std::atomic<bool> tts_start_pending_{false};
+    std::atomic<std::uint32_t> cloud_tts_received_packets_{0};
+    std::atomic<std::uint32_t> cloud_tts_dropped_before_speaking_{0};
+    std::atomic<std::uint32_t> cloud_tts_queue_rejections_{0};
     bool reuse_existing_network_ = false;
     std::string activation_code_;
     int clock_ticks_ = 0;

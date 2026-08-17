@@ -439,8 +439,12 @@ void Application::Start(bool reuse_existing_network) {
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
         // This is the single cloud-TTS discard point. System prompt sounds use
         // AudioService::PlaySound() and never traverse this packet path.
-        if (tts_playback_enabled_ && device_state_ == kDeviceStateSpeaking) {
-            audio_service_.PushPacketToDecodeQueue(std::move(packet));
+        ++cloud_tts_received_packets_;
+        if (tts_playback_enabled_ &&
+            (device_state_ == kDeviceStateSpeaking || tts_start_pending_.load())) {
+            if (!audio_service_.PushPacketToDecodeQueue(std::move(packet))) ++cloud_tts_queue_rejections_;
+        } else {
+            ++cloud_tts_dropped_before_speaking_;
         }
     });
     protocol_->OnAudioChannelOpened([this, codec, &board]() {
@@ -464,6 +468,12 @@ void Application::Start(bool reuse_existing_network) {
         if (strcmp(type->valuestring, "tts") == 0) {
             auto state = cJSON_GetObjectItem(root, "state");
             if (strcmp(state->valuestring, "start") == 0) {
+                // The first Opus packets can arrive before the scheduled main
+                // task changes device_state_ to speaking. Clear only stale
+                // audio here, then preserve the new packets through that
+                // state transition.
+                audio_service_.ResetDecoder();
+                tts_start_pending_ = true;
                 Schedule([this]() {
                     aborted_ = false;
                     if (device_state_ == kDeviceStateIdle || device_state_ == kDeviceStateListening) {
@@ -471,6 +481,7 @@ void Application::Start(bool reuse_existing_network) {
                     }
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
+                tts_start_pending_ = false;
                 Schedule([this]() {
                     if (device_state_ == kDeviceStateSpeaking) {
                         if (listening_mode_ == kListeningModeManualStop) {
@@ -760,7 +771,7 @@ void Application::SetDeviceState(DeviceState state) {
                 audio_service_.EnableWakeWordDetection(false);
 #endif
             }
-            audio_service_.ResetDecoder();
+            if (!tts_start_pending_.exchange(false)) audio_service_.ResetDecoder();
             break;
         default:
             // Do nothing
@@ -781,6 +792,14 @@ void Application::SetTtsPlaybackEnabled(bool enabled) {
     // Drop queued cloud voice promptly. This only clears the Opus decoder
     // queues; product alert sounds are synchronously decoded elsewhere.
     if (!enabled) audio_service_.ResetDecoder();
+}
+
+CloudTtsDiagnostics Application::GetCloudTtsDiagnostics() const {
+    return {
+        .received_packets = cloud_tts_received_packets_.load(),
+        .dropped_before_speaking = cloud_tts_dropped_before_speaking_.load(),
+        .queue_rejections = cloud_tts_queue_rejections_.load(),
+    };
 }
 
 std::string Application::GetActivationCode() const {

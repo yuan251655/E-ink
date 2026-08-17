@@ -2,6 +2,8 @@
 
 #include <esp_err.h>
 
+#include "application.h"
+
 namespace photopainter::product {
 
 struct AudioConfigSnapshot {
@@ -10,6 +12,8 @@ struct AudioConfigSnapshot {
     bool output_enabled = false;
     bool playing = false;
     const char* source = "idle";
+    CloudTtsDiagnostics cloud_tts;
+    AudioPlaybackDiagnostics playback;
 };
 
 AudioConfigSnapshot GetAudioConfigSnapshot();

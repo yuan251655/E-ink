@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <chrono>
 #include <mutex>
+#include <atomic>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -37,7 +38,7 @@
 
 #define OPUS_FRAME_DURATION_MS 60
 #define MAX_ENCODE_TASKS_IN_QUEUE 2
-#define MAX_PLAYBACK_TASKS_IN_QUEUE 2
+#define MAX_PLAYBACK_TASKS_IN_QUEUE 4
 #define MAX_DECODE_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
 #define MAX_SEND_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
 #define AUDIO_TESTING_MAX_DURATION_MS 10000
@@ -79,6 +80,16 @@ struct DebugStatistics {
     uint32_t playback_count = 0;
 };
 
+struct AudioPlaybackDiagnostics {
+    std::uint32_t queued_packets = 0;
+    std::uint32_t queue_rejections = 0;
+    std::uint32_t decoded_packets = 0;
+    std::uint32_t decode_failures = 0;
+    std::uint32_t played_frames = 0;
+    std::size_t decode_queue_size = 0;
+    std::size_t playback_queue_size = 0;
+};
+
 class AudioService {
 public:
     AudioService();
@@ -108,6 +119,7 @@ public:
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
     void ResetDecoder();
     void SetModelsList(srmodel_list_t* models_list);
+    AudioPlaybackDiagnostics GetPlaybackDiagnostics();
 
 private:
     AudioCodec* codec_ = nullptr;
@@ -138,6 +150,11 @@ private:
     std::deque<std::unique_ptr<AudioTask>> audio_playback_queue_;
     // For server AEC
     std::deque<uint32_t> timestamp_queue_;
+    std::atomic<std::uint32_t> queued_packets_{0};
+    std::atomic<std::uint32_t> queue_rejections_{0};
+    std::atomic<std::uint32_t> decoded_packets_{0};
+    std::atomic<std::uint32_t> decode_failures_{0};
+    std::atomic<std::uint32_t> played_frames_{0};
 
     bool wake_word_initialized_ = false;
     bool audio_processor_initialized_ = false;

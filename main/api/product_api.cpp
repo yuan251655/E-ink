@@ -608,6 +608,17 @@ void AppendAudioConfigJson(std::string* body, const AudioConfigSnapshot& audio) 
         .append(",\"playing\":").append(audio.playing ? "true" : "false")
         .append(",\"source\":");
     AppendJsonString(body, audio.source);
+    body->append(",\"diagnostics\":{\"cloud_packets\":").append(std::to_string(audio.cloud_tts.received_packets))
+        .append(",\"cloud_dropped_before_speaking\":").append(std::to_string(audio.cloud_tts.dropped_before_speaking))
+        .append(",\"cloud_queue_rejections\":").append(std::to_string(audio.cloud_tts.queue_rejections))
+        .append(",\"queued_packets\":").append(std::to_string(audio.playback.queued_packets))
+        .append(",\"queue_rejections\":").append(std::to_string(audio.playback.queue_rejections))
+        .append(",\"decoded_packets\":").append(std::to_string(audio.playback.decoded_packets))
+        .append(",\"decode_failures\":").append(std::to_string(audio.playback.decode_failures))
+        .append(",\"played_frames\":").append(std::to_string(audio.playback.played_frames))
+        .append(",\"decode_queue_size\":").append(std::to_string(audio.playback.decode_queue_size))
+        .append(",\"playback_queue_size\":").append(std::to_string(audio.playback.playback_queue_size))
+        .append("}");
     body->append("}");
 }
 

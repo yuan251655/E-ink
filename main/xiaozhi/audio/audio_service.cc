@@ -294,6 +294,7 @@ void AudioService::AudioOutputTask() {
             codec_->EnableOutput(true);
         }
         codec_->OutputData(task->pcm);
+        ++played_frames_;
 
         /* Update the last output time */
         last_output_time_ = std::chrono::steady_clock::now();
@@ -336,6 +337,7 @@ void AudioService::OpusCodecTask() {
 
             SetDecodeSampleRate(packet->sample_rate, packet->frame_duration);
             if (opus_decoder_->Decode(std::move(packet->payload), task->pcm)) {
+                ++decoded_packets_;
                 // Resample if the sample rate is different
                 if (opus_decoder_->sample_rate() != codec_->output_sample_rate()) {
                     int target_size = output_resampler_.GetOutputSamples(task->pcm.size());
@@ -348,6 +350,7 @@ void AudioService::OpusCodecTask() {
                 audio_playback_queue_.push_back(std::move(task));
                 audio_queue_cv_.notify_all();
             } else {
+                ++decode_failures_;
                 ESP_LOGE(TAG, "Failed to decode audio");
                 lock.lock();
             }
@@ -446,12 +449,27 @@ bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> pa
         if (wait) {
             audio_queue_cv_.wait(lock, [this]() { return audio_decode_queue_.size() < MAX_DECODE_PACKETS_IN_QUEUE; });
         } else {
+            ++queue_rejections_;
             return false;
         }
     }
     audio_decode_queue_.push_back(std::move(packet));
+    ++queued_packets_;
     audio_queue_cv_.notify_all();
     return true;
+}
+
+AudioPlaybackDiagnostics AudioService::GetPlaybackDiagnostics() {
+    AudioPlaybackDiagnostics diagnostics;
+    diagnostics.queued_packets = queued_packets_.load();
+    diagnostics.queue_rejections = queue_rejections_.load();
+    diagnostics.decoded_packets = decoded_packets_.load();
+    diagnostics.decode_failures = decode_failures_.load();
+    diagnostics.played_frames = played_frames_.load();
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    diagnostics.decode_queue_size = audio_decode_queue_.size();
+    diagnostics.playback_queue_size = audio_playback_queue_.size();
+    return diagnostics;
 }
 
 std::unique_ptr<AudioStreamPacket> AudioService::PopPacketFromSendQueue() {
